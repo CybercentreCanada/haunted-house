@@ -181,5 +181,33 @@ impl<Storage: BlobStorage + 'static> Inner<Storage> {
 
 #[cfg(test)]
 mod test {
+    use crate::storage::{connect, BlobStorageConfig, BlobID};
+    use super::BlobCache;
 
+    #[tokio::test]
+    async fn access_files() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_str().unwrap().to_string() }).await.unwrap();
+        let cache = BlobCache::new(storage, 1024, cache_dir.path().to_owned());
+
+        // Add some data
+        let id = BlobID(uuid::Uuid::new_v4());
+        
+
+        {
+
+            cache.open(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn size_limit() {
+        todo!()
+    }
+
+    #[tokio::test]
+    async fn cycling() {
+        todo!()
+    }
 }

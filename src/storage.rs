@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct BlobID(uuid::Uuid);
+pub struct BlobID(pub uuid::Uuid);
 
 impl ToString for BlobID {
     fn to_string(&self) -> String {
@@ -27,7 +27,9 @@ pub enum BlobStorageConfig {
 pub async fn connect(config: BlobStorageConfig) -> Result<impl BlobStorage> {
     match config {
         BlobStorageConfig::Directory { path } => {
-            Ok(LocalDirectory { path: PathBuf::from(path) })
+            let path = PathBuf::from(path);
+            tokio::fs::create_dir_all(&path).await?;
+            Ok(LocalDirectory { path })
         },
     }
 }
@@ -38,6 +40,8 @@ pub trait BlobStorage: Clone + Send + Sync + 'static {
     async fn size(&self, label: &BlobID) -> Result<Option<usize>>;
     async fn download(&self, label: BlobID, path: PathBuf) -> Result<()>;
     async fn upload(&self, label: BlobID, path: PathBuf) -> Result<()>;
+    async fn put(&self, label: BlobID, data: Vec<u8>) -> Result<()>;
+    async fn get(&self, label: BlobID) -> Result<Vec<u8>>;
 }
 
 
@@ -59,11 +63,22 @@ impl BlobStorage for LocalDirectory {
         }
     }
     
-    async fn download(&self, label: BlobID, path: PathBuf) -> Result<()> {
-        todo!();
+    async fn download(&self, label: BlobID, dest: PathBuf) -> Result<()> {
+        let path = self.path.with_file_name(label.to_string());
+        if let Ok(_) = tokio::fs::hard_link(&path, &dest).await {
+            return Ok(());
+        }
+        tokio::fs::copy(path, dest).await?;
+        return Ok(())
     }
-    async fn upload(&self, label: BlobID, path: PathBuf) -> Result<()> {
-        todo!();
+
+    async fn upload(&self, label: BlobID, source: PathBuf) -> Result<()> {
+        let dest = self.path.with_file_name(label.to_string());
+        if let Ok(_) = tokio::fs::hard_link(&source, &dest).await {
+            return Ok(());
+        }
+        tokio::fs::copy(source, dest).await?;
+        return Ok(())
     }
 }
 
