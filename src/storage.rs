@@ -1,5 +1,4 @@
 
-use std::fs::File;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -7,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct BlobID(pub uuid::Uuid);
 
 impl ToString for BlobID {
@@ -38,9 +37,9 @@ pub async fn connect(config: BlobStorageConfig) -> Result<impl BlobStorage> {
 #[async_trait]
 pub trait BlobStorage: Clone + Send + Sync + 'static {
     async fn size(&self, label: &BlobID) -> Result<Option<usize>>;
-    async fn download(&self, label: BlobID, path: PathBuf) -> Result<()>;
+    async fn download(&self, label: &BlobID, path: PathBuf) -> Result<()>;
     async fn upload(&self, label: BlobID, path: PathBuf) -> Result<()>;
-    async fn put(&self, label: BlobID, data: Vec<u8>) -> Result<()>;
+    async fn put(&self, label: BlobID, data: &[u8]) -> Result<()>;
     async fn get(&self, label: BlobID) -> Result<Vec<u8>>;
 }
 
@@ -50,10 +49,17 @@ struct LocalDirectory {
     path: PathBuf
 }
 
+impl LocalDirectory {
+    fn get_path(&self, label: &BlobID) -> PathBuf {
+        let dest = self.path.with_file_name(label.to_string());
+        return dest;
+    }
+}
+
 #[async_trait]
 impl BlobStorage for LocalDirectory {
     async fn size(&self, label: &BlobID) -> Result<Option<usize>> {
-        let path = self.path.with_file_name(label.to_string());
+        let path = self.get_path(label);
         match tokio::fs::metadata(path).await {
             Ok(meta) => Ok(Some(meta.len() as usize)),
             Err(err) => match err.kind() {
@@ -62,9 +68,9 @@ impl BlobStorage for LocalDirectory {
             },
         }
     }
-    
-    async fn download(&self, label: BlobID, dest: PathBuf) -> Result<()> {
-        let path = self.path.with_file_name(label.to_string());
+
+    async fn download(&self, label: &BlobID, dest: PathBuf) -> Result<()> {
+        let path = self.get_path(label);
         if let Ok(_) = tokio::fs::hard_link(&path, &dest).await {
             return Ok(());
         }
@@ -73,12 +79,23 @@ impl BlobStorage for LocalDirectory {
     }
 
     async fn upload(&self, label: BlobID, source: PathBuf) -> Result<()> {
-        let dest = self.path.with_file_name(label.to_string());
+        let dest = self.get_path(&label);
         if let Ok(_) = tokio::fs::hard_link(&source, &dest).await {
             return Ok(());
         }
         tokio::fs::copy(source, dest).await?;
         return Ok(())
+    }
+
+    async fn put(&self, label: BlobID, data: &[u8]) -> Result<()> {
+        let dest = self.get_path(&label);
+        tokio::fs::write(dest, data).await?;
+        return Ok(())
+    }
+
+    async fn get(&self, label: BlobID) -> Result<Vec<u8>> {
+        let path = self.get_path(&label);
+        Ok(tokio::fs::read(path).await?)
     }
 }
 
