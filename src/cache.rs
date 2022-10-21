@@ -2,14 +2,13 @@ use anyhow::Result;
 use log::{error, info};
 use tempfile::NamedTempFile;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::storage::{BlobStorage, BlobID};
 
-
+#[derive(Debug)]
 pub struct BlobHandle {
     file: NamedTempFile
 }
@@ -331,7 +330,23 @@ mod test {
     #[tokio::test]
     async fn size_limit() {
         init();
-        todo!()
+
+        let storage_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_size = 1024;
+        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_str().unwrap().to_string() }).await.unwrap();
+        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
+
+        {
+            let mut rng = rand::thread_rng();
+            let sample_size = cache_size + 1;
+            let data: Vec<u8> = (0..sample_size).map(|_| rng.gen()).collect();
+            let id = BlobID(uuid::Uuid::new_v4());
+            storage.put(id.clone(), &data).await.unwrap();
+            assert_eq!(cache.open(id).await.unwrap_err().downcast::<crate::error::ErrorKinds>().unwrap(), crate::error::ErrorKinds::BlobTooLargeForCache)
+        }
+
+
     }
 
     #[tokio::test]
