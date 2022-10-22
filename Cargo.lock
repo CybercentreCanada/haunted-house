@@ -27,6 +27,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98161a4e3e2184da77bb14f02184cdd111e83bbbcc9979dfee3c44b9a85f5602"
 
 [[package]]
+name = "assertor"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8bdea8063317deb973cc8ac4c8a5edf54abaaeb1764958d5101b4fe28dcf0fc"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,6 +295,7 @@ name = "haunted-house"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assertor",
  "async-trait",
  "chrono",
  "env_logger",
