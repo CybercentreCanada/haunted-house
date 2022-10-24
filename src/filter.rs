@@ -81,7 +81,8 @@ impl FilterMetadata {
         let mut access_values: Vec<(usize, AccessControl)> = access_lookup.into_iter().map(|(a, b)|(b, a)).collect();
         access_values.sort_by(|(a, _), (b, _)| a.cmp(b));
         let access_values: Vec<AccessControl> = access_values.into_iter().map(|(_, b)|b).collect();
-        handle.write_all(&postcard::to_vec(&access_values)?).await;
+        let buffer = postcard::to_allocvec::<Vec<AccessControl>>(&access_values)?;
+        handle.write_all(&buffer).await;
 
         Ok(FilterMetadata {
             path,
@@ -149,7 +150,7 @@ impl Filter {
         return Ok((mask, to_array(hasher.finalize().to_vec())?))
     }
 
-    pub async fn build(output: &Path, files: Vec<(PathBuf, AccessControl)>) -> Result<Self> {
+    pub async fn build(filter_file: &tokio::fs::File, meta_file: &tokio::fs::File, files: Vec<(PathBuf, AccessControl)>) -> Result<Self> {
         let mut accum: Vec<Vec<u64>> = Default::default();
         let mut meta: HashMap<Box<[u8; 32]>, (u64, AccessControl)> = Default::default();
         let mut next_index: u64 = 1;
@@ -184,7 +185,7 @@ impl Filter {
             }
         }
 
-        let data = FilterMetadata::write(output + meta_file, meta);
+        // let data = FilterMetadata::write(output + meta_file, meta);
 
         todo!();
     }
