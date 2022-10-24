@@ -2,7 +2,8 @@
 
 #[derive(Debug, PartialEq)]
 pub enum ErrorKinds {
-    BlobTooLargeForCache
+    BlobTooLargeForCache,
+    InvalidHashProduced,
 }
 
 impl std::fmt::Display for ErrorKinds {

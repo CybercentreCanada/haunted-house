@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use log::error;
 use serde::{Serialize, Deserialize};
-use tokio::io::{BufReader, AsyncReadExt};
+use sha2::digest::generic_array::{GenericArray, ArrayLength};
+use tokio::io::{BufReader, AsyncReadExt, AsyncWriteExt};
 use sha2::{Sha256, Digest};
 
 use crate::access::AccessControl;
@@ -13,6 +14,9 @@ use crate::access::AccessControl;
 struct FilterMetadata {
     path: PathBuf,
     handle: tokio::fs::File,
+    hashes_offset: u64,
+    access_offset: u64,
+    access: Vec<AccessControl>,
 }
 
 // struct FilterMetadataData {
@@ -57,12 +61,34 @@ impl FilterMetadata {
         }
 
         // Serialize and write the data
-        let handle = tokio::fs::File::open(&path).await?;
+        let mut handle = tokio::fs::File::open(&path).await?;
+        let hashes_offset: u64 = (files.len() as u64 + 1) * 16;
+        let access_offset: u64 = hashes_offset + files.len() as u64 * 32;
 
+        handle.write_u64(hashes_offset).await;
+        handle.write_u64(access_offset).await;
+        for (hash_index, access_index) in files {
+            handle.write_u64(hash_index).await;
+            handle.write_u64(access_index).await;
+        }
+
+        // Write hashes
+        for hash in hashes {
+            handle.write_all(hash.as_ref()).await;
+        }
+
+        // write access
+        let mut access_values: Vec<(usize, AccessControl)> = access_lookup.into_iter().map(|(a, b)|(b, a)).collect();
+        access_values.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let access_values: Vec<AccessControl> = access_values.into_iter().map(|(_, b)|b).collect();
+        handle.write_all(&postcard::to_vec(&access_values)?).await;
 
         Ok(FilterMetadata {
             path,
             handle,
+            hashes_offset,
+            access_offset,
+            access: access_values
         })
     }
 }
@@ -74,9 +100,16 @@ struct Filter {
     meta: FilterMetadata
 }
 
+fn to_array(value: Vec<u8>) -> Result<Box<[u8; 32]>> {
+    Ok(Box::new(match value.try_into() {
+        Ok(hash) => hash,
+        Err(_) => return Err(crate::error::ErrorKinds::InvalidHashProduced.into()),
+    }))
+}
+
 impl Filter {
 
-    async fn build_file(path: &Path) -> Result<(Vec<bool>, Vec<u8>)> {
+    async fn build_file(path: &Path) -> Result<(Vec<bool>, Box<[u8; 32]>)> {
         // Prepare to read
         let mut handle = tokio::fs::File::open(path).await?;
         let mut buffer: Vec<u8> = vec![0; 1 << 20];
@@ -91,7 +124,8 @@ impl Filter {
 
         // Terminate if file too short
         if read <= 2 {
-            return Ok((mask, hasher.finalize().to_vec()))
+            let hash: Box<[u8; 32]> = to_array(hasher.finalize().to_vec())?;
+            return Ok((mask, hash))
         }
 
         // Initialize trigram
@@ -112,12 +146,12 @@ impl Filter {
             index_start = 0;
         }
 
-        return Ok((mask, hasher.finalize().to_vec()))
+        return Ok((mask, to_array(hasher.finalize().to_vec())?))
     }
 
     pub async fn build(output: &Path, files: Vec<(PathBuf, AccessControl)>) -> Result<Self> {
         let mut accum: Vec<Vec<u64>> = Default::default();
-        let mut meta: HashMap<Vec<u8>, (u64, AccessControl)> = Default::default();
+        let mut meta: HashMap<Box<[u8; 32]>, (u64, AccessControl)> = Default::default();
         let mut next_index: u64 = 1;
 
         for (input_file_path, access) in files {
@@ -150,8 +184,7 @@ impl Filter {
             }
         }
 
-        let data = FilterMetadataData::from(meta);
-        BlobID::random();
+        let data = FilterMetadata::write(output + meta_file, meta);
 
         todo!();
     }
