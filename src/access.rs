@@ -10,6 +10,38 @@ pub enum AccessControl {
     Token(String)
 }
 
+impl core::ops::BitAnd<&AccessControl> for &AccessControl {
+    type Output = AccessControl;
+
+    fn bitand(self, rhs: &AccessControl) -> Self::Output {
+        self.and(rhs)
+    }
+}
+
+impl core::ops::BitAnd<AccessControl> for AccessControl {
+    type Output = AccessControl;
+
+    fn bitand(self, rhs: AccessControl) -> Self::Output {
+        self.and(&rhs)
+    }
+}
+
+impl core::ops::BitOr<&AccessControl> for &AccessControl {
+    type Output = AccessControl;
+
+    fn bitor(self, rhs: &AccessControl) -> Self::Output {
+        self.or(rhs)
+    }
+}
+
+impl core::ops::BitOr<AccessControl> for AccessControl {
+    type Output = AccessControl;
+
+    fn bitor(self, rhs: AccessControl) -> Self::Output {
+        self.or(&rhs)
+    }
+}
+
 impl AccessControl {
     pub fn or(&self, other: &AccessControl) -> AccessControl {
         let mut collected = vec![];
@@ -41,6 +73,10 @@ impl AccessControl {
         }
 
         return AccessControl::And(collected).simplify();
+    }
+
+    pub fn iter_and<I: IntoIterator<Item=AccessControl>>(items: I) -> AccessControl {
+        return AccessControl::from_and(items.into_iter().collect())
     }
 
     pub fn from_and(mut items: Vec<AccessControl>) -> AccessControl {
@@ -88,22 +124,28 @@ impl AccessControl {
                         x.dedup();
                         if x.len() > 0 {
                             unfactored.push(x.clone())
+                        } else {
+                            return AccessControl::from_and(common.clone().into_iter().collect());
                         }
                     }
 
                     unfactored.sort();
                     unfactored.dedup();
 
-                    let common = AccessControl::from_or(common.clone().into_iter().collect());
+                    let common = AccessControl::from_and(common.clone().into_iter().collect());
                     let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(|x|AccessControl::from_and(x)).collect();
 
                     if unfactored.len() == 0 {
                         return common;
                     } else if unfactored.len() == 1 {
-                        return AccessControl::from_and(vec![unfactored.pop().unwrap(), common])
+                        return AccessControl::from_or(vec![unfactored.pop().unwrap(), common])
                     } else {
+                        println!("{:?} AND {:?}", unfactored, common);
                         let unfactored = AccessControl::from_or(unfactored);
-                        return AccessControl::from_and(vec![unfactored, common])
+                        println!("\t{:?} AND {:?}", unfactored, common);
+                        let temp = unfactored.and(&common);
+                        println!("\t{:?}", temp);
+                        return temp;
                     }
                 } else {
                     return AccessControl::from_or(operands.into_iter().map(|x|AccessControl::from_and(x.into_iter().collect())).collect());
@@ -138,19 +180,19 @@ impl AccessControl {
                     unfactored.sort();
                     unfactored.dedup();
 
-                    let common = AccessControl::from_and(common.clone().into_iter().collect());
+                    let common = AccessControl::from_or(common.clone().into_iter().collect());
                     let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(|x|AccessControl::from_or(x)).collect();
 
                     if unfactored.len() == 0 {
                         return common;
                     } else if unfactored.len() == 1 {
-                        return AccessControl::from_or(vec![unfactored.pop().unwrap(), common])
+                        return AccessControl::from_and(vec![unfactored.pop().unwrap(), common])
                     } else {
                         let unfactored = AccessControl::from_and(unfactored);
-                        return AccessControl::from_or(vec![unfactored, common])
+                        return AccessControl::from_and(vec![unfactored, common])
                     }
                 } else {
-                    return AccessControl::from_and(operands.into_iter().map(|x|AccessControl::from_and(x.into_iter().collect())).collect());
+                    return AccessControl::from_and(operands.into_iter().map(|x|AccessControl::iter_and(x)).collect());
                 }
             },
             AccessControl::Token(token) => return AccessControl::Token(token),
@@ -184,13 +226,17 @@ mod test {
     #[test]
     fn simplify() {
         let a = AccessControl::Token("A".to_owned());
+        let b = AccessControl::Token("B".to_owned());
+        let c = AccessControl::Token("C".to_owned());
+        let d = AccessControl::Token("D".to_owned());
+
         assert_eq!(a, a.clone().simplify());
 
-        let b = AccessControl::Token("B".to_owned());
         let a_or_b = AccessControl::Or(vec![a.clone(), b.clone()]);
         assert_eq!(a_or_b, a_or_b.clone().simplify());
 
         let a_and_b = AccessControl::And(vec![a.clone(), b.clone()]);
+        let a_and_c = AccessControl::And(vec![a.clone(), c.clone()]);
         assert_eq!(a_and_b, a_and_b.clone().simplify());
 
         assert_ne!(a, b);
@@ -200,5 +246,22 @@ mod test {
         let a_or_a = AccessControl::Or(vec![a.clone(), a.clone()]);
         assert_eq!(a, a_or_a.simplify());
 
+        let expr = AccessControl::And(vec![AccessControl::Or(vec![a.clone(), b.clone()]), a.clone()]);
+        assert_eq!(expr.simplify(), a_and_b);
+
+        let expr = AccessControl::Or(vec![AccessControl::And(vec![a.clone(), b.clone()]), a.clone()]);
+        assert_eq!(expr.simplify(), a);
+
+        let expr = AccessControl::Or(vec![AccessControl::And(vec![a.clone(), b.clone(), c.clone()]), AccessControl::And(vec![a.clone(), c.clone()])]);
+        assert_eq!(expr.simplify(), a_and_c);
+
+        let expr = (&a | &b) & (&b | &a);
+        assert_eq!(expr.simplify(), a_or_b);
+
+        let expr = (&a | &(&b | &a) ) & (&b | &a);
+        assert_eq!(expr.simplify(), a_or_b);
+
+        let expr = (&(&a & &b) & &c) | (&a & &(&b & &d));
+        assert_eq!(expr.simplify(), AccessControl::And(vec![a.clone(), b.clone(), AccessControl::Or(vec![c.clone(), d.clone()])]));
     }
 }
