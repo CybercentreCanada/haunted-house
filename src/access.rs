@@ -7,7 +7,9 @@ use serde::{Serialize, Deserialize};
 pub enum AccessControl {
     Or(Vec<AccessControl>),
     And(Vec<AccessControl>),
-    Token(String)
+    Token(String),
+    Always,
+    // Never,
 }
 
 impl core::ops::BitAnd<AccessControl> for &AccessControl {
@@ -81,20 +83,27 @@ impl AccessControl {
             AccessControl::Or(values) => collected.extend(values.clone()),
             AccessControl::And(values) => collected.push(AccessControl::And(values.clone())),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
+            AccessControl::Always => return AccessControl::Always,
+            // AccessControl::Never => {},
         }
         match other {
             AccessControl::Or(values) => collected.extend(values.clone()),
             AccessControl::And(values) => collected.push(AccessControl::And(values.clone())),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
+            AccessControl::Always => return AccessControl::Always,
+            // AccessControl::Never => {},
         }
 
         collected.sort();
         collected.dedup();
 
-        while collected.len() == 1 {
-            return collected.pop().unwrap();
+        if collected.len() == 0 {
+            AccessControl::Always
+        } else if collected.len() == 1 {
+            collected.pop().unwrap()
+        } else {
+            AccessControl::Or(collected)
         }
-        return AccessControl::Or(collected)
     }
 
     pub fn and(&self, other: &AccessControl) -> AccessControl {
@@ -103,11 +112,15 @@ impl AccessControl {
             AccessControl::Or(values) => collected.push(AccessControl::Or(values.clone())),
             AccessControl::And(values) => collected.extend(values.clone()),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
+            AccessControl::Always => {},
+            // AccessControl::Never => return AccessControl::Never,
         }
         match other {
             AccessControl::Or(values) => collected.push(AccessControl::Or(values.clone())),
             AccessControl::And(values) => collected.extend(values.clone()),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
+            AccessControl::Always => {},
+            // AccessControl::Never => return AccessControl::Never,
         }
 
         collected.sort();
@@ -119,11 +132,11 @@ impl AccessControl {
         return AccessControl::And(collected);
     }
 
-    pub fn iter_and<I: IntoIterator<Item=AccessControl>>(items: I) -> AccessControl {
-        return AccessControl::from_and(items.into_iter().collect())
+    fn set_into_and(mut items: HashSet<AccessControl>) -> AccessControl {
+        return AccessControl::into_and(items.into_iter().collect())
     }
 
-    pub fn from_and(mut items: Vec<AccessControl>) -> AccessControl {
+    fn into_and(mut items: Vec<AccessControl>) -> AccessControl {
         assert!(items.len() > 0);
         items.sort();
         items.dedup();
@@ -133,7 +146,7 @@ impl AccessControl {
         return AccessControl::And(items);
     }
 
-    pub fn from_or(mut items: Vec<AccessControl>) -> AccessControl {
+    pub fn into_or(mut items: Vec<AccessControl>) -> AccessControl {
         assert!(items.len() > 0);
         items.sort();
         items.dedup();
@@ -143,105 +156,108 @@ impl AccessControl {
         return AccessControl::Or(items);
     }
 
-    // pub fn simplify(self) -> AccessControl {
-    //     match self {
-    //         AccessControl::Or(items) => {
-    //             let mut items: Vec<AccessControl> = items.into_iter().map(|x|x.simplify()).collect();
+    pub fn factor(items: Vec<HashSet<AccessControl>>) -> (HashSet<AccessControl>, Vec<Vec<AccessControl>>, bool) {
+        let common = items.iter().cloned().reduce(|a, b| HashSet::from_iter(a.intersection(&b).cloned())).unwrap();
 
-    //             let mut operands: Vec<HashSet<AccessControl>> = vec![];
-    //             while let Some(item) = items.pop() {
-    //                 match item {
-    //                     AccessControl::Or(parts) => items.extend(parts),
-    //                     AccessControl::And(parts) => operands.push(HashSet::from_iter(parts)),
-    //                     AccessControl::Token(value) => operands.push(HashSet::from([AccessControl::Token(value)])),
-    //                 }
-    //             }
+        let mut unfactored = vec![];
+        let mut has_fallthrough = false;
 
-    //             assert!(!operands.is_empty());
-    //             let common = operands.iter().cloned().reduce(|a, b| HashSet::from_iter(a.intersection(&b).cloned())).unwrap();
-    //             if common.len() > 0 {
-    //                 let mut unfactored = vec![];
+        for op in items {
+            let mut x = Vec::from_iter(op.difference(&common).cloned());
+            x.sort();
+            x.dedup();
+            if x.len() > 0 {
+                unfactored.push(x)
+            } else {
+                has_fallthrough = true;
+            }
+        }
 
-    //                 for op in operands {
-    //                     let mut x = Vec::from_iter(op.difference(&common).cloned());
-    //                     x.sort();
-    //                     x.dedup();
-    //                     if x.len() > 0 {
-    //                         unfactored.push(x.clone())
-    //                     } else {
-    //                         return AccessControl::from_and(common.clone().into_iter().collect());
-    //                     }
-    //                 }
+        unfactored.sort();
+        unfactored.dedup();
 
-    //                 unfactored.sort();
-    //                 unfactored.dedup();
+        return (common, unfactored, has_fallthrough)
+    }
 
-    //                 let common = AccessControl::from_and(common.clone().into_iter().collect());
-    //                 let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(|x|AccessControl::from_and(x)).collect();
+    pub fn simplify(self) -> AccessControl {
+        match self {
+            AccessControl::Or(items) => {
+                let mut items: Vec<AccessControl> = items.into_iter().map(|x|x.simplify()).collect();
+                if items.is_empty() {
+                    return AccessControl::Always;
+                }
 
-    //                 if unfactored.len() == 0 {
-    //                     return common;
-    //                 } else if unfactored.len() == 1 {
-    //                     return AccessControl::from_or(vec![unfactored.pop().unwrap(), common])
-    //                 } else {
-    //                     println!("{:?} AND {:?}", unfactored, common);
-    //                     let unfactored = AccessControl::from_or(unfactored);
-    //                     println!("\t{:?} AND {:?}", unfactored, common);
-    //                     let temp = unfactored.and(&common);
-    //                     println!("\t{:?}", temp);
-    //                     return temp;
-    //                 }
-    //             } else {
-    //                 return AccessControl::from_or(operands.into_iter().map(|x|AccessControl::from_and(x.into_iter().collect())).collect());
-    //             }
-    //         },
-    //         AccessControl::And(items) => {
-    //             let mut items: Vec<AccessControl> = items.into_iter().map(|x|x.simplify()).collect();
+                let mut operands: Vec<HashSet<AccessControl>> = vec![];
+                while let Some(item) = items.pop() {
+                    match item {
+                        AccessControl::Or(parts) => items.extend(parts),
+                        AccessControl::And(parts) => operands.push(HashSet::from_iter(parts)),
+                        AccessControl::Token(value) => operands.push(HashSet::from([AccessControl::Token(value)])),
+                        AccessControl::Always => return AccessControl::Always,
+                    }
+                }
 
-    //             let mut operands: Vec<HashSet<AccessControl>> = vec![];
-    //             while let Some(item) = items.pop() {
-    //                 match item {
-    //                     AccessControl::And(parts) => items.extend(parts),
-    //                     AccessControl::Or(parts) => operands.push(HashSet::from_iter(parts)),
-    //                     AccessControl::Token(value) => operands.push(HashSet::from([AccessControl::Token(value)])),
-    //                 }
-    //             }
+                let (common, unfactored, fallthrough) = AccessControl::factor(operands);
+                if fallthrough {
+                    return AccessControl::set_into_and(common);
+                }
 
-    //             assert!(!operands.is_empty());
-    //             let common = operands.iter().cloned().reduce(|a, b| HashSet::from_iter(a.intersection(&b).cloned())).unwrap();
-    //             if common.len() > 0 {
-    //                 let mut unfactored = vec![];
+                let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(AccessControl::into_and).collect();
+        
+                if common.len() == 0 {
+                    return AccessControl::into_or(unfactored);
+                }
 
-    //                 for op in operands {
-    //                     let mut x = Vec::from_iter(op.difference(&common).cloned());
-    //                     x.sort();
-    //                     x.dedup();
-    //                     if x.len() > 0 {
-    //                         unfactored.push(x.clone())
-    //                     }
-    //                 }
+                let common = AccessControl::set_into_and(common);
 
-    //                 unfactored.sort();
-    //                 unfactored.dedup();
+                if unfactored.len() == 0 {
+                    return common;
+                } else if unfactored.len() == 1 {
+                    return unfactored.pop().unwrap() | common
+                } else {
+                    let unfactored = AccessControl::into_or(unfactored);
+                    let temp = unfactored.and(&common);
+                    return temp;
+                }
+            },
+            AccessControl::And(items) => {
+                let mut items: Vec<AccessControl> = items.into_iter().map(|x|x.simplify()).collect();
+                if items.is_empty() {
+                    return AccessControl::Always;
+                }
 
-    //                 let common = AccessControl::from_or(common.clone().into_iter().collect());
-    //                 let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(|x|AccessControl::from_or(x)).collect();
+                let mut operands: Vec<HashSet<AccessControl>> = vec![];
+                while let Some(item) = items.pop() {
+                    match item {
+                        AccessControl::And(parts) => items.extend(parts),
+                        AccessControl::Or(parts) => operands.push(HashSet::from_iter(parts)),
+                        AccessControl::Token(value) => operands.push(HashSet::from([AccessControl::Token(value)])),
+                        AccessControl::Always => {},
+                    }
+                }
 
-    //                 if unfactored.len() == 0 {
-    //                     return common;
-    //                 } else if unfactored.len() == 1 {
-    //                     return AccessControl::from_and(vec![unfactored.pop().unwrap(), common])
-    //                 } else {
-    //                     let unfactored = AccessControl::from_and(unfactored);
-    //                     return AccessControl::from_and(vec![unfactored, common])
-    //                 }
-    //             } else {
-    //                 return AccessControl::from_and(operands.into_iter().map(|x|AccessControl::iter_and(x)).collect());
-    //             }
-    //         },
-    //         AccessControl::Token(token) => return AccessControl::Token(token),
-    //     };
-    // }
+                let (common, unfactored, _) = AccessControl::factor(operands);
+
+                let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(AccessControl::into_or).collect();
+
+                if common.len() == 0 {
+                    return AccessControl::into_and(unfactored);
+                }
+                let common = AccessControl::into_or(common.clone().into_iter().collect());
+
+                if unfactored.len() == 0 {
+                    return common;
+                } else if unfactored.len() == 1 {
+                    return unfactored.pop().unwrap() & common;
+                } else {
+                    let unfactored = AccessControl::into_and(unfactored);
+                    return unfactored & common;
+                }
+            },
+            AccessControl::Token(token) => return AccessControl::Token(token),
+            AccessControl::Always => return AccessControl::Always,
+        };
+    }
 }
 
 
@@ -299,45 +315,48 @@ mod test {
         assert_eq!(a | (b | (c | d)), AccessControl::Or(vec![a.clone(), b.clone(), c.clone(), d.clone()]));
     }
 
-    // #[test]
-    // fn simplify() {
-    //     let a = AccessControl::Token("A".to_owned());
-    //     let b = AccessControl::Token("B".to_owned());
-    //     let c = AccessControl::Token("C".to_owned());
-    //     let d = AccessControl::Token("D".to_owned());
+    #[test]
+    fn simplify() {
+        let a = &AccessControl::Token("A".to_owned());
+        let b = &AccessControl::Token("B".to_owned());
+        let c = &AccessControl::Token("C".to_owned());
+        let d = &AccessControl::Token("D".to_owned());
 
-    //     assert_eq!(a, a.clone().simplify());
+        assert_eq!(a, &a.clone().simplify());
 
-    //     let a_or_b = AccessControl::Or(vec![a.clone(), b.clone()]);
-    //     assert_eq!(a_or_b, a_or_b.clone().simplify());
+        let a_or_b = a | b;
+        assert_eq!(a_or_b, a_or_b.clone().simplify());
 
-    //     let a_and_b = AccessControl::And(vec![a.clone(), b.clone()]);
-    //     let a_and_c = AccessControl::And(vec![a.clone(), c.clone()]);
-    //     assert_eq!(a_and_b, a_and_b.clone().simplify());
+        let a_and_b = a & b;
+        let a_and_c = a & c;
+        assert_eq!(a_and_b, a_and_b.clone().simplify());
 
-    //     assert_ne!(a, b);
-    //     assert_ne!(a, a_or_b);
-    //     assert_ne!(a_and_b, a_or_b);
+        assert_ne!(a, b);
+        assert_ne!(a, &a_or_b);
+        assert_ne!(a_and_b, a_or_b);
 
-    //     let a_or_a = AccessControl::Or(vec![a.clone(), a.clone()]);
-    //     assert_eq!(a, a_or_a.simplify());
+        let a_or_a = AccessControl::Or(vec![a.clone(), a.clone()]);
+        assert_eq!(a, &a_or_a.simplify());
 
-    //     let expr = AccessControl::And(vec![AccessControl::Or(vec![a.clone(), b.clone()]), a.clone()]);
-    //     assert_eq!(expr.simplify(), a_and_b);
+        let expr = AccessControl::And(vec![AccessControl::Or(vec![a.clone(), b.clone()]), a.clone()]);
+        assert_eq!(expr.simplify(), a_and_b);
 
-    //     let expr = AccessControl::Or(vec![AccessControl::And(vec![a.clone(), b.clone()]), a.clone()]);
-    //     assert_eq!(expr.simplify(), a);
+        let expr = AccessControl::Or(vec![AccessControl::And(vec![a.clone(), b.clone()]), a.clone()]);
+        assert_eq!(&expr.simplify(), a);
 
-    //     let expr = AccessControl::Or(vec![AccessControl::And(vec![a.clone(), b.clone(), c.clone()]), AccessControl::And(vec![a.clone(), c.clone()])]);
-    //     assert_eq!(expr.simplify(), a_and_c);
+        let expr = AccessControl::Or(vec![AccessControl::And(vec![a.clone(), b.clone(), c.clone()]), AccessControl::And(vec![a.clone(), c.clone()])]);
+        assert_eq!(expr.simplify(), a_and_c);
 
-    //     let expr = (&a | &b) & (&b | &a);
-    //     assert_eq!(expr.simplify(), a_or_b);
+        let expr = AccessControl::And(vec![a_or_b.clone(), AccessControl::Or(vec![b.clone(), a.clone()])]);
+        assert_eq!(expr.simplify(), a_or_b);
 
-    //     let expr = (&a | &(&b | &a) ) & (&b | &a);
-    //     assert_eq!(expr.simplify(), a_or_b);
+        let expr = AccessControl::And(vec![
+            AccessControl::Or(vec![a.clone(), AccessControl::Or(vec![b.clone(), a.clone()])]), 
+            (b | a)
+        ]);
+        assert_eq!(expr.simplify(), a_or_b);
 
-    //     let expr = (&(&a & &b) & &c) | (&a & &(&b & &d));
-    //     assert_eq!(expr.simplify(), AccessControl::And(vec![a.clone(), b.clone(), AccessControl::Or(vec![c.clone(), d.clone()])]));
-    // }
+        // let expr = (&(&a & &b) & &c) | (&a & &(&b & &d));
+        // assert_eq!(expr.simplify(), AccessControl::And(vec![a.clone(), b.clone(), AccessControl::Or(vec![c.clone(), d.clone()])]));
+    }
 }
