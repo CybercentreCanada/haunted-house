@@ -132,7 +132,7 @@ impl AccessControl {
         return AccessControl::And(collected);
     }
 
-    fn set_into_and(mut items: HashSet<AccessControl>) -> AccessControl {
+    fn set_into_and(items: HashSet<AccessControl>) -> AccessControl {
         return AccessControl::into_and(items.into_iter().collect())
     }
 
@@ -258,6 +258,26 @@ impl AccessControl {
             AccessControl::Always => return AccessControl::Always,
         };
     }
+
+    pub fn parse(data: &str, and_split: &str, or_split: &str) -> AccessControl {
+        let mut anded = vec![];
+        for segment in data.split(and_split) {
+            let mut ored = vec![];
+            for segment in segment.split(or_split) {
+                let segment = segment.trim();
+                if segment.len() > 0 {
+                    ored.push(AccessControl::Token(segment.to_owned()));
+                }
+            }
+            if ored.len() > 0 {
+                anded.push(AccessControl::into_or(ored));
+            }
+        }
+        if anded.len() > 0 {
+            return AccessControl::into_and(anded);
+        }
+        return AccessControl::Always;
+    }
 }
 
 
@@ -358,5 +378,18 @@ mod test {
 
         // let expr = (&(&a & &b) & &c) | (&a & &(&b & &d));
         // assert_eq!(expr.simplify(), AccessControl::And(vec![a.clone(), b.clone(), AccessControl::Or(vec![c.clone(), d.clone()])]));
+    }
+
+    #[test]
+    fn parse() {
+        let a = &AccessControl::Token("A".to_owned());
+        let b = &AccessControl::Token("B".to_owned());
+        let c = &AccessControl::Token("C".to_owned());
+        let x = &AccessControl::Token("Rel:X".to_owned());
+        let y = &AccessControl::Token("Rel:Y".to_owned());
+
+        assert_eq!(AccessControl::parse("A//B//C/Rel:X", "/", ","), a & b & c & x);
+        assert_eq!(AccessControl::parse("A//C/Rel:X", "/", ","), a & c & x);
+        assert_eq!(AccessControl::parse("A//B/Rel:X,Rel:Y", "/", ","), a & b & (x | y));
     }
 }

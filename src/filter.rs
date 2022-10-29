@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use anyhow::Result;
+use anyhow::{Result, Context};
 use log::error;
 use serde::{Serialize, Deserialize};
 use sha2::digest::generic_array::{GenericArray, ArrayLength};
-use tokio::io::{BufReader, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{BufReader, AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use sha2::{Sha256, Digest};
 
 use crate::access::AccessControl;
@@ -12,7 +13,6 @@ use crate::access::AccessControl;
 // type Expiry = chrono::DateTime<chrono::Utc>;
 
 struct FilterMetadata {
-    path: PathBuf,
     handle: tokio::fs::File,
     hashes_offset: u64,
     access_offset: u64,
@@ -23,19 +23,18 @@ struct FilterMetadata {
 //     hashes_offset: u64,
 //     access_offset: u64
 //     files: (u64, u64)[]
-//     hashes: [u8; 32][]
+//     hashes: ([u8; 32], u64)[]
 //     access: AccessControl[]
 // }
 
 impl FilterMetadata {
-    pub async fn write(path: PathBuf, data: HashMap<Box<[u8; 32]>, (u64, AccessControl)>) -> Result<Self> {
+    pub async fn write(path: &Path, data: HashMap<Box<[u8; 32]>, (u64, AccessControl)>) -> Result<Self> {
         // Build data tables
-        let mut hashes: Vec<&Box<[u8; 32]>> = Default::default();
+        let mut hashes: Vec<(&Box<[u8; 32]>, u64)> = Default::default();
         let mut access_lookup: HashMap<AccessControl, usize> = Default::default();
         let mut order: Vec<(u64, usize, &Box<[u8; 32]>)> = Default::default();
 
         for (sha, (item_index, item_access)) in &data {
-            hashes.push(sha);
             let access_size = access_lookup.len();
             let access_index = match access_lookup.entry(item_access.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
@@ -44,37 +43,40 @@ impl FilterMetadata {
                     access_size
                 },
             };
+            hashes.push((sha, access_index as u64));
             order.push((*item_index, access_index, sha))
         }
         hashes.sort();
-        let hashes_lookup: HashMap<&Box<[u8; 32]>, usize> = hashes.iter().enumerate().map(|(index, hash)|{
+        let hashes_lookup: HashMap<&Box<[u8; 32]>, usize> = hashes.iter().enumerate().map(|(index, (hash, _))|{
             (*hash, index)
         }).collect();
 
         // Build a lookup into the tables
         let mut files: Vec<(u64, u64)> = Default::default();
         order.sort();
-        for index in 1..=files.len() {
-            let (_, access_index, sha) = order[index];
+        for (_, access_index, sha) in order {            
             let hash_index = hashes_lookup.get(sha).unwrap();
-            files.push((access_index as u64, *hash_index as u64));
+            files.push((*hash_index as u64, access_index as u64));
         }
 
         // Serialize and write the data
-        let mut handle = tokio::fs::File::open(&path).await?;
-        let hashes_offset: u64 = (files.len() as u64 + 1) * 16;
-        let access_offset: u64 = hashes_offset + files.len() as u64 * 32;
+        let mut handle = tokio::fs::OpenOptions::new().read(true).write(true).open(path).await
+            .context("Could not open meta file to write")?;
 
-        handle.write_u64(hashes_offset).await;
-        handle.write_u64(access_offset).await;
+        let hashes_offset: u64 = (files.len() as u64 + 1) * (8 + 8);
+        let access_offset: u64 = hashes_offset + files.len() as u64 * (32 + 8);
+
+        handle.write_u64(hashes_offset).await?;
+        handle.write_u64(access_offset).await?;
         for (hash_index, access_index) in files {
-            handle.write_u64(hash_index).await;
-            handle.write_u64(access_index).await;
+            handle.write_u64(hash_index).await?;
+            handle.write_u64(access_index).await?;
         }
 
         // Write hashes
-        for hash in hashes {
-            handle.write_all(hash.as_ref()).await;
+        for (hash, access_index) in hashes {
+            handle.write_all(hash.as_ref()).await?;
+            handle.write_u64(access_index).await?;
         }
 
         // write access
@@ -82,21 +84,92 @@ impl FilterMetadata {
         access_values.sort_by(|(a, _), (b, _)| a.cmp(b));
         let access_values: Vec<AccessControl> = access_values.into_iter().map(|(_, b)|b).collect();
         let buffer = postcard::to_allocvec::<Vec<AccessControl>>(&access_values)?;
-        handle.write_all(&buffer).await;
+        handle.write_all(&buffer).await?;
+        handle.flush().await?;
 
         Ok(FilterMetadata {
-            path,
             handle,
             hashes_offset,
             access_offset,
             access: access_values
         })
     }
+
+    pub async fn open(path: &Path) -> Result<Self> {
+        let mut handle = tokio::fs::File::open(path).await?;
+        let hashes_offset = handle.read_u64().await?;
+        let access_offset = handle.read_u64().await?;
+        let file_size = tokio::fs::metadata(path).await?.len();
+        let mut buffer: Vec<u8> = vec![0; (file_size - access_offset) as usize];
+        handle.seek(SeekFrom::Start(access_offset)).await?;
+        handle.read_exact(&mut buffer).await?;
+        return Ok(Self {
+            handle,
+            hashes_offset,
+            access_offset,
+            access: postcard::from_bytes(&buffer)?,
+        })
+    }
+
+    pub async fn get_sha(&mut self, index: u64) -> Result<(Box<[u8; 32]>, u64)> {
+        self.handle.seek(SeekFrom::Start(self.hashes_offset + index * (32 + 8))).await?;
+        let mut buffer: Vec<u8> = vec![0; 32];
+        self.handle.read_exact(&mut buffer).await?;
+        let access_index = self.handle.read_u64().await?;
+        return Ok((to_array(buffer)?, access_index))
+    }
+
+    pub async fn get_sha256_access(&mut self, sha: &Box<[u8; 32]>) -> Result<Option<AccessControl>> {
+
+        let sha_count = (self.access_offset - self.hashes_offset) / (32 + 8);
+        if sha_count == 0 {
+            return Ok(None)
+        }
+
+        let mut first = 0;
+        let mut last = sha_count - 1;
+
+        loop {
+            let center = (last + first)/2;
+            let (center_sha, access) = self.get_sha(center).await?;
+            if first == last {
+                if &center_sha == sha {
+                    return Ok(Some(self.access[access as usize].clone()))
+                } else {
+                    return Ok(None)
+                }
+            }
+            if sha < &center_sha {
+                last = center - 1;
+            } else if sha > &center_sha {
+                first = center + 1;
+            } else {
+                return Ok(Some(self.access[access as usize].clone()))
+            }
+        }
+    }
+
+    pub async fn get_file_info(&mut self, index: u64) -> Result<(Box<[u8; 32]>, AccessControl)> {
+        self.handle.seek(SeekFrom::Start(index * (8 + 8))).await?;
+        let hash_index = self.handle.read_u64().await?;
+        let (hash, access_index) = self.get_sha(hash_index).await?;
+        return Ok((hash, self.access[access_index as usize].clone()));
+    }
+
+    pub async fn read_all(&mut self) -> Result<HashMap<Box<[u8; 32]>, (u64, AccessControl)>> {
+        let mut out: HashMap<Box<[u8; 32]>, (u64, AccessControl)> = Default::default();
+        let entry_count = self.hashes_offset / (8 + 8);
+        for index in 1..entry_count {
+            let (sha, access) = self.get_file_info(index).await?;
+            out.insert(sha, (index, access));
+        }
+        return Ok(out);
+    }
+
 }
 
 
 struct Filter {
-    path: PathBuf,
     handle: tokio::fs::File,
     meta: FilterMetadata
 }
@@ -190,8 +263,12 @@ impl Filter {
         todo!();
     }
 
-    pub fn open(filter: &Path, meta: &Path) -> Result<Self> {
-        todo!()
+    pub async fn open(filter: &Path, meta: &Path) -> Result<Self> {
+        let meta = FilterMetadata::open(meta).await?;
+        Ok(Filter {
+            handle: tokio::fs::File::open(filter).await?,
+            meta,
+        })
     }
 
     pub fn merge(a: &Filter, b: &Filter) -> Result<Self> {
@@ -199,3 +276,62 @@ impl Filter {
     }
 }
 
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use anyhow::{Result, Context};
+    use rand::Rng;
+    use rand::seq::IteratorRandom;
+
+    use crate::access::AccessControl;
+
+    use super::FilterMetadata;
+
+    #[tokio::test]
+    async fn metadata_save_load() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let mut prng = rand::thread_rng();
+
+        let access_options = [
+            AccessControl::parse("A//B//C/Rel:X", "/", ","),
+            AccessControl::parse("A//C/Rel:X", "/", ","),
+            AccessControl::parse("A//B/Rel:X,Rel:Y", "/", ",")
+        ];
+
+        let mut data: HashMap<Box<[u8; 32]>, (u64, AccessControl)> = Default::default();
+        let mut other_data: Vec<(Box<[u8; 32]>, AccessControl)> = Default::default();
+        for index in 1..500 {
+            let sha: Box<[u8; 32]> = Box::new(prng.gen());
+            let access = access_options.iter().choose(&mut prng).unwrap().clone();
+            data.insert(
+                sha.clone(),
+                (index, access.clone())
+            );
+            other_data.push((sha, access));
+        }
+        println!("data rows {}", data.len());
+
+        let views = {
+            let written = FilterMetadata::write(file.path(), data.clone()).await
+                .context("Writing filter failed")?;
+            let read = FilterMetadata::open(file.path()).await
+                .context("Opening filter failed")?;
+            vec![written, read]
+        };
+
+        for mut filter in views {
+            println!("test filter");
+            for (sha, (_, access)) in data.iter() {
+                assert_eq!(filter.get_sha256_access(sha).await.unwrap(), Some(access.clone()));
+            }
+            for index in 1..500 {
+                assert_eq!(filter.get_file_info(index).await.unwrap(), other_data[(index-1) as usize])
+            }
+            assert_eq!(filter.read_all().await.unwrap(), data);
+        }
+
+        return Ok(())
+    }
+}
