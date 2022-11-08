@@ -7,6 +7,7 @@ mod storage;
 mod error;
 mod filter;
 mod access;
+mod ursadb;
 
 fn main() {
     println!("Hello, world!");

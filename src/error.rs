@@ -4,6 +4,10 @@
 pub enum ErrorKinds {
     BlobTooLargeForCache,
     InvalidHashProduced,
+    IndexHasInvalidMagic,
+    IndexHasUnsupportedVersion,
+    IndexHasUnsupportedType,
+    IndexCorruptTable,
 }
 
 impl std::fmt::Display for ErrorKinds {
