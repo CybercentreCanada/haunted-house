@@ -8,6 +8,7 @@ pub enum ErrorKinds {
     IndexHasUnsupportedVersion,
     IndexHasUnsupportedType,
     IndexCorruptTable,
+    VarintIncomplete,
 }
 
 impl std::fmt::Display for ErrorKinds {

@@ -8,6 +8,7 @@ mod error;
 mod filter;
 mod access;
 mod ursadb;
+mod varint;
 
 fn main() {
     println!("Hello, world!");
