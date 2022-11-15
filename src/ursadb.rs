@@ -213,7 +213,7 @@ impl UrsaDBTrigramFilter {
             let net_items: HashSet<u64> = self.get_indices(*addresses.get(trigram).unwrap())?.into_iter().collect();
             items = items.intersection(&net_items).cloned().collect();
         }
-        
+
         return Ok(items.into_iter().collect())
     }
 
@@ -239,7 +239,7 @@ mod test {
         let mut input_data: Vec<u8> = Default::default();
         let mut input = tempfile::NamedTempFile::new()?;
         for _ in 0..10000 {
-            let numb: [u8; 8] = rand::thread_rng().gen();
+            let numb: [u8; 8] = thread_rng().gen();
             input_data.extend(numb);
         }
         input.write_all(&input_data)?;

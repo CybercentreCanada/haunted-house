@@ -10,7 +10,11 @@ mod access;
 mod ursadb;
 mod varint;
 
-fn main() {
-    println!("Hello, world!");
-    // sled::open("./database").unwrap();
+use anyhow::Result;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+
+
+    return Ok(())
 }
