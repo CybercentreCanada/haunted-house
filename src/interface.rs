@@ -1,5 +1,7 @@
 
 
+use std::sync::Arc;
+
 use poem::http::StatusCode;
 use poem::middleware::AddData;
 use poem::{post, EndpointExt};
@@ -10,18 +12,19 @@ use poem::{get, handler, listener::TcpListener, web::Path, IntoResponse, Route, 
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
+use crate::core::HouseCore;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
 
 #[derive(Clone)]
 struct TokenCheck {
-
+    core: Arc<HouseCore>
 }
 
 impl TokenCheck {
-    pub fn new() -> Self {
+    pub fn new(core: Arc<HouseCore>) -> Self {
         Self {
-
+            core
         }
     }
 
@@ -36,11 +39,11 @@ impl TokenCheck {
 
 
 struct WorkerInterface {
-
+    core: Arc<HouseCore>
 }
 
 struct SearcherInterface {
-
+    core: Arc<HouseCore>
 }
 
 
@@ -92,15 +95,15 @@ fn finish_work(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(req
     format!("hello: {}", auth.token())
 }
 
-async fn serve(bind_address: String) -> Result<(), std::io::Error> {
+pub async fn serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std::io::Error> {
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
         .at("/work/", get(get_work))
         .at("/finished/", get(finish_work))
-        .with(AddData::new(TokenCheck::new()));
+        .with(AddData::new(TokenCheck::new(core)));
 
-    Server::new(TcpListener::bind(&bind_address))
+    Server::new(TcpListener::bind(bind_address))
         .run(app)
         .await
 }

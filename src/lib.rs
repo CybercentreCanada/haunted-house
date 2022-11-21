@@ -6,21 +6,25 @@ mod storage;
 mod core;
 mod database;
 mod interface;
+mod auth;
+mod cache;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use auth::Authenticator;
 use pyo3::types::PyModule;
 use pyo3::{Python, pymodule, PyResult, pyclass, pymethods, PyAny, Py};
 use storage::{BlobStorage, LocalDirectory, PythonBlobStore};
 
+use crate::core::HouseCore;
 use crate::database::LocalDatabase;
 
 
 
 #[pyclass]
 struct ServerInterface {
-
-
+    core: Arc<HouseCore>
 }
 
 
@@ -29,7 +33,10 @@ struct ServerInterface {
 struct ServerBuilder {
     index_storage: Option<BlobStorage>,
     file_storage: Option<BlobStorage>,
+    bind_address: String,
+    authenticator: Option<Authenticator>
 }
+
 
 #[pymethods]
 impl ServerBuilder {
@@ -69,18 +76,21 @@ impl ServerBuilder {
             None => LocalDirectory::new_temp()?
         };
 
+        // Initialize authenticator
+        let auth = self.authenticator.take().ok_or(anyhow::format_err!("An authentication module must be configured."))?;
+
         // Initialize database
         let database = LocalDatabase::new()?;
 
         // Start server core
-        let core = HouseCore::new(index_storage, file_storage, database);
+        let core = Arc::new(HouseCore::new(index_storage, file_storage, database, auth)?);
 
         // Start http interface
-        todo!("initialize http interface");
+        tokio::spawn(crate::interface::serve(self.bind_address.clone(), core.clone()));
 
         // return internal interface to core
         Ok(ServerInterface {
-
+            core
         })
     }
 }
