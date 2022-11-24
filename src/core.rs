@@ -5,10 +5,10 @@ use anyhow::Result;
 
 
 pub struct HouseCore {
-    database: Database,
-    file_storage: BlobStorage,
-    index_storage: BlobStorage,
-    authenticator: Authenticator
+    pub database: Database,
+    pub file_storage: BlobStorage,
+    pub index_storage: BlobStorage,
+    pub authenticator: Authenticator
 }
 
 impl HouseCore {

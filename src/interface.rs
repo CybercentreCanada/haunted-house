@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use poem::http::StatusCode;
 use poem::middleware::AddData;
-use poem::{post, EndpointExt};
+use poem::{post, EndpointExt, Response};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
@@ -12,6 +12,7 @@ use poem::{get, handler, listener::TcpListener, web::Path, IntoResponse, Route, 
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
+use crate::auth::Role;
 use crate::core::HouseCore;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -29,11 +30,19 @@ impl TokenCheck {
     }
 
     pub fn authenticate_worker(&self, token: &str) -> Option<WorkerInterface> {
-        todo!()
+        if self.core.authenticator.is_role_assigned(token, Role::Worker) {
+            Some(WorkerInterface { core: self.core.clone() })
+        } else {
+            None
+        }
     }
 
     pub fn authenticate_searcher(&self, token: &str) -> Option<SearcherInterface> {
-        todo!()
+        if self.core.authenticator.is_role_assigned(token, Role::Search) {
+            Some(SearcherInterface { core: self.core.clone() })
+        } else {
+            None
+        }
     }
 }
 
@@ -64,10 +73,14 @@ struct SearchRequestResponse {
 }
 
 #[handler]
-fn add_search(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<SearchRequest>) -> (StatusCode, Json<SearchRequestResponse>) {
-    let interface = back.authenticate_searcher(auth.token());
+fn add_search(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<SearchRequest>) -> Response {
+    let interface = match back.authenticate_searcher(auth.token()) {
+        Some(interface) => interface,
+        None => return StatusCode::FORBIDDEN.into()
+    };
 
-    todo!()
+    todo!();
+    // interface.initialize_search(request)
 }
 
 #[handler]
