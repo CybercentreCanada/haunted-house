@@ -489,6 +489,7 @@ dependencies = [
  "anyhow",
  "assertor",
  "async-trait",
+ "base64",
  "chrono",
  "env_logger",
  "futures",
@@ -944,6 +945,7 @@ checksum = "268be0c73583c183f2b14052337465768c07726936a260f480f0857cb95ba543"
 dependencies = [
  "anyhow",
  "cfg-if",
+ "chrono",
  "indoc",
  "libc",
  "memoffset",

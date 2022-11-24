@@ -90,7 +90,7 @@ pub struct LocalCache {
 
 impl LocalCache {
 
-    fn new(capacity: usize, path: PathBuf) -> Self {
+    pub fn new(capacity: usize, path: PathBuf) -> Self {
         let (daemon, send) = Inner::new(capacity, path);
 
         tokio::spawn(daemon.run());
