@@ -8,6 +8,7 @@ mod database;
 mod interface;
 mod auth;
 mod cache;
+mod filter_input_batch;
 
 
 use std::path::PathBuf;
