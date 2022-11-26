@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::auth::Authenticator;
 use crate::database::Database;
-use crate::filter_input_batch::FilterInputBatch;
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
+use crate::ursadb;
+use bitvec::vec::BitVec;
+use futures::future::select_all;
 use log::error;
 use tokio::sync::{mpsc, oneshot};
 use anyhow::Result;
@@ -56,6 +57,19 @@ impl HouseCore {
     pub async fn update_file_access(&self, hash: &String, access: &AccessControl, index_group: &String) -> Result<bool> {
         todo!()
     }
+
+    pub async fn select_index_to_grow(&self, index_group: &String) -> Result<(bool, String)> {
+        todo!();
+    }
+
+    pub async fn create_index_data(&self, index_group: &String, index_id: String, meta: Vec<(String, AccessControl)>) -> Result<()> {
+        todo!();
+    }
+
+    pub async fn update_index_data(&self, index_group: &String, index_id: String, meta: Vec<(String, AccessControl)>, index_offset: usize) -> Result<()> {
+        todo!();
+    }
+
 }
 
 pub fn generate_index_group(expiry: &Option<DateTime<Utc>>) -> String {
@@ -157,19 +171,107 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 }
 
 
-async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, new_items: HashMap<String, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
+async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_items: HashMap<String, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
     // Check if any of our new items are already handled
-    todo!();
+    {
+        let mut to_remove = vec![];
+        for (hash, (access, responses)) in new_items.iter_mut() {
+            if core.update_file_access(hash, access, &index_group).await? {
+                while let Some(res) = responses.pop() {
+                    _ = res.send(Ok(()));
+                }
+                to_remove.push(hash.clone());
+            }
+        }
+        for key in to_remove {
+            new_items.remove(&key);
+        }
+        if new_items.is_empty() {
+            return Ok(())
+        }
+    }
+    
+    // Buildup the file data 
+    let mut data = vec![];
+    let mut meta = vec![];
+    let mut remaining_responses = vec![];
+    let mut outstanding = Vec::from_iter(new_items.keys().cloned());
+    let mut active: Vec<JoinHandle<(String, Result<BitVec>)>> = Vec::new();
+    while !new_items.is_empty() {
+        while !outstanding.is_empty() && active.len() < 10 {
+            if let Some(hash) = outstanding.pop(){
+                active.push(tokio::spawn(prepare_vector(core.clone(), hash)));
+            }
+        }
 
-    // Buildup the file data on disk
-    todo!();
+        let (result, _, remain) = select_all(active.into_iter()).await;
+        active = remain;
+
+        let (hash, result) = result?;
+        if let Some((access, responses)) = new_items.remove(&hash) {
+            match result {
+                Ok(bits) => {
+                    data.push(bits);
+                    meta.push((hash, access));
+                    remaining_responses.extend(responses);
+                },
+                Err(err) => {
+                    error!("Error gathering file for {hash}: {err}");
+                    for res in responses {
+                        _ = res.send(Err(anyhow::format_err!("Error gathering file {err}")));
+                    }
+                }
+            }
+        }
+    }
 
     // Pick an index to merge into
-    todo!();
-
+    let (is_index_new, index_id) = core.select_index_to_grow(&index_group).await?;
+    
     // Merge into a new index file
-    todo!();
+    let (new_index, index_offset) = if is_index_new {
+        let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len());
+        let new_index_file = core.local_cache.open(final_size).await?;
+        let out_handle = new_index_file.open()?;
+        let ok: Result<()> = tokio::task::spawn_blocking(move || {
+            ursadb::UrsaDBTrigramFilter::build_from_data(out_handle, data)?;
+            Ok(())
+        }).await?;
+        ok?;
+        (new_index_file, 0)
+    } else {
+        let data_size = core.index_storage.size(&index_id).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
+        let index_file = core.local_cache.open(data_size).await?;
+        core.index_storage.download(&index_id, index_file.path()).await?;
+
+        let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len()) + data_size;
+        let new_index_file = core.local_cache.open(final_size).await?;
+        let out_handle = new_index_file.open()?;
+        let ok: Result<usize> = tokio::task::spawn_blocking(move || {
+            let (_, offset) = ursadb::UrsaDBTrigramFilter::merge_in_data(out_handle, index_file.open()?, data)?;
+            Ok(offset)
+        }).await?;
+        let offset = ok?;
+        (new_index_file, offset)
+    };
+    
+    // Upload the new index file
+    new_index.size_to_fit().await?;
+    core.index_storage.upload(index_id.clone(), new_index.path()).await?;
 
     // Add the new values into the database corresponding to this index
-    todo!();
+    if is_index_new {
+        core.create_index_data(&index_group, index_id, meta).await?;
+    } else {
+        core.update_index_data(&index_group, index_id, meta, index_offset).await?;
+    };
+
+    for res in remaining_responses {
+        _ = res.send(Ok(()));
+    }
+    Ok(())
+}
+
+async fn prepare_vector(core: Arc<HouseCore>, hash: String) -> (String, Result<BitVec>) {
+    todo!()
 }

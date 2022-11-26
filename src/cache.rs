@@ -38,6 +38,10 @@ impl FileHandle {
         return self.data.id;
     }
 
+    pub fn path(&self) -> PathBuf {
+        self.data.file.path().to_path_buf()
+    }
+
     pub fn open(&self) -> Result<std::fs::File> {
         Ok(self.data.file.reopen()?)
     }
@@ -54,6 +58,14 @@ impl FileHandle {
         let (send, recv) = oneshot::channel();
         _ = self.data.connection.send(LocalCacheCommand::Resize(self.data.id, new_size, send)).await;
         return Ok(recv.await??)
+    }
+
+    pub async fn size_to_fit(&self) -> Result<()> {
+        let handle = self.open()?;
+        let meta = tokio::task::spawn_blocking(move ||{
+            handle.metadata()
+        }).await??;
+        self.resize(meta.len() as usize).await
     }
 }
 

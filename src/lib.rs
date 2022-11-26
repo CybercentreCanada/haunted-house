@@ -8,7 +8,6 @@ mod database;
 mod interface;
 mod auth;
 mod cache;
-mod filter_input_batch;
 
 
 use std::path::PathBuf;
@@ -16,7 +15,7 @@ use std::sync::Arc;
 
 use auth::Authenticator;
 use chrono::{DateTime, Utc};
-use pyo3::exceptions::{PyValueError, PyRuntimeError};
+use pyo3::exceptions::{PyRuntimeError};
 use pyo3::types::PyModule;
 use pyo3::{Python, pymodule, PyResult, pyclass, pymethods, PyAny, Py, PyObject};
 use storage::{BlobStorage, LocalDirectory, PythonBlobStore};

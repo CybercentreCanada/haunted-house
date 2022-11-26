@@ -9,14 +9,16 @@ use serde::Deserialize;
 use tempfile::TempDir;
 
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct BlobID(pub uuid::Uuid);
+pub type BlobID = String;
 
-impl ToString for BlobID {
-    fn to_string(&self) -> String {
-        self.0.to_string()
-    }
-}
+// #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+// pub struct BlobID(pub uuid::Uuid);
+
+// impl ToString for BlobID {
+//     fn to_string(&self) -> String {
+//         self.0.to_string()
+//     }
+// }
 
 
 #[derive(Deserialize)]
@@ -43,31 +45,31 @@ pub enum BlobStorage {
 }
 
 impl BlobStorage {
-    async fn size(&self, label: &BlobID) -> Result<Option<usize>> {
+    pub async fn size(&self, label: &BlobID) -> Result<Option<usize>> {
         match self {
             BlobStorage::Local(obj) => obj.size(label).await,
             BlobStorage::Python(obj) => obj.size(label).await,
         }
     }
-    async fn download(&self, label: &BlobID, path: PathBuf) -> Result<()> {
+    pub async fn download(&self, label: &BlobID, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.download(label, path).await,
             BlobStorage::Python(obj) => obj.download(label, path).await,
         }
     }
-    async fn upload(&self, label: BlobID, path: PathBuf) -> Result<()> {
+    pub async fn upload(&self, label: BlobID, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.upload(label, path).await,
             BlobStorage::Python(obj) => obj.upload(label, path).await,
         }
     }
-    async fn put(&self, label: BlobID, data: &[u8]) -> Result<()> {
+    pub async fn put(&self, label: BlobID, data: &[u8]) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.put(label, data).await,
             BlobStorage::Python(obj) => obj.put(label, data).await,
         }
     }
-    async fn get(&self, label: BlobID) -> Result<Vec<u8>> {
+    pub async fn get(&self, label: BlobID) -> Result<Vec<u8>> {
         match self {
             BlobStorage::Local(obj) => obj.get(label).await,
             BlobStorage::Python(obj) => obj.get(label).await,

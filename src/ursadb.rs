@@ -4,6 +4,7 @@ use std::os::unix::prelude::FileExt;
 use std::path::{PathBuf, Path};
 
 use anyhow::Result;
+use bitvec::vec::BitVec;
 
 use crate::varint;
 
@@ -82,6 +83,18 @@ impl UrsaDBTrigramFilter {
             out.push(out[out.len() - 1] + diff[index]);
         }
         return Ok(out);
+    }
+
+    pub fn guess_max_size(files: usize) -> usize {
+        todo!();
+    }
+
+    pub fn merge_in_data(mut file: std::fs::File, mut old: std::fs::File, data: Vec<BitVec>) -> Result<(Self, usize)> {
+        todo!();
+    }
+    
+    pub fn build_from_data(mut file: std::fs::File, data: Vec<BitVec>) -> Result<Self> {
+        todo!()
     }
 
     pub fn build(mut file: std::fs::File, input: Vec<PathBuf>) -> Result<Self> {
