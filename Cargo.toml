@@ -29,9 +29,14 @@ itertools = "*"
 poem = "1.3"
 
 rocksdb = "*"
-# sled = "*"
+sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
+
 pyo3 = { version = "0.17", features = ["extension-module", "anyhow", "chrono"] }
 pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"] }
+
+#[dependencies.lmdb-rkv]
+#git = "https://github.com/mozilla/lmdb-rs.git"
+#version = "0.14.0"
 
 [dev-dependencies]
 rand = "*"

@@ -23,6 +23,7 @@ pub struct Config {
 }
 
 pub struct HouseCore {
+    pub runtime: tokio::runtime::Runtime,
     pub database: Database,
     pub file_storage: BlobStorage,
     pub index_storage: BlobStorage,
@@ -33,10 +34,11 @@ pub struct HouseCore {
 }
 
 impl HouseCore {
-    pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, local_cache: LocalCache, authenticator: Authenticator) -> Result<Arc<Self>> {
+    pub fn new(runtime: tokio::runtime::Runtime, index_storage: BlobStorage, file_storage: BlobStorage, database: Database, local_cache: LocalCache, authenticator: Authenticator) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         let core = Arc::new(Self {
+            runtime,
             database,
             file_storage,
             index_storage,
@@ -180,8 +182,8 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
             return Ok(())
         }
     }
-    
-    // Buildup the file data 
+
+    // Buildup the file data
     let mut data = vec![];
     let mut meta = vec![];
     let mut remaining_responses = vec![];
@@ -217,7 +219,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
 
     // Pick an index to merge into
     let (is_index_new, index_id) = core.database.select_index_to_grow(&index_group).await?;
-    
+
     // Merge into a new index file
     let (new_index, index_offset) = if is_index_new {
         let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len());
@@ -244,7 +246,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
         let offset = ok?;
         (new_index_file, offset)
     };
-    
+
     // Upload the new index file
     let size = new_index.size_to_fit().await?;
     core.index_storage.upload(index_id.clone(), new_index.path()).await?;

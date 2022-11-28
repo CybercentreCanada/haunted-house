@@ -5,6 +5,9 @@ mod access;
 mod storage;
 mod core;
 mod database;
+mod database_rocksdb;
+mod database_sqlite;
+mod sqlite_kv;
 mod interface;
 mod auth;
 mod cache;
@@ -15,6 +18,7 @@ use std::sync::Arc;
 
 use auth::{Authenticator, Role};
 use chrono::{DateTime, Utc};
+use database::Database;
 use pyo3::exceptions::{PyRuntimeError};
 use pyo3::types::PyModule;
 use pyo3::{Python, pymodule, PyResult, pyclass, pymethods, PyAny, Py, PyObject};
@@ -22,7 +26,6 @@ use storage::{BlobStorage, LocalDirectory, PythonBlobStore};
 use tokio::sync::oneshot;
 
 use crate::core::HouseCore;
-use crate::database::RocksInterface;
 use crate::access::AccessControl;
 use crate::cache::LocalCache;
 
@@ -118,6 +121,12 @@ impl ServerBuilder {
             None => LocalDirectory::new_temp()?
         };
 
+        // Launch runtime
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
         // Initialize authenticator
         let auth = self.authenticator.take().ok_or(anyhow::format_err!("An authentication module must be configured."))?;
 
@@ -125,13 +134,13 @@ impl ServerBuilder {
         let cache = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
 
         // Initialize database
-        let database = RocksInterface::new(self.index_soft_max.unwrap_or(DEFAULT_SOFT_MAX_SIZE))?;
+        let database = runtime.block_on(Database::new_sqlite(self.index_soft_max.unwrap_or(DEFAULT_SOFT_MAX_SIZE), self.database_path))?;
 
         // Start server core
-        let core = HouseCore::new(index_storage, file_storage, database, cache, auth)?;
+        let core = HouseCore::new(runtime, index_storage, file_storage, database, cache, auth)?;
 
         // Start http interface
-        tokio::spawn(crate::interface::serve(self.bind_address.clone(), core.clone()));
+        core.runtime.spawn(crate::interface::serve(self.bind_address.clone(), core.clone()));
 
         // return internal interface to core
         Ok(ServerInterface {
