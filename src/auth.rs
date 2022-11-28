@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Result;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyTuple, PyBool};
 use pyo3::{Py, PyAny, IntoPy, PyObject, intern, FromPyObject, Python};
@@ -49,6 +51,23 @@ pub enum Authenticator {
 }
 
 impl Authenticator {
+
+    pub fn new_static(assignments: HashMap<String, HashSet<Role>>) -> Result<Self> {
+        // let mut assign: HashMap<String, HashSet<Role>> = Default::default();
+        // for (key, role_names) in assignments.into_iter() {
+        //     let mut roles = HashSet::new();
+        //     for name in role_names {
+        //         roles.insert(name.try_into()?);
+        //     }
+        //     assign.insert(key, roles);
+        // }
+        Ok(Authenticator::Static(assignments))
+    }
+
+    pub fn new_python(object: Py<PyAny>) -> Result<Self> {
+        Ok(Authenticator::Python(PythonAuthenticator::new(object)))
+    }
+
     pub fn is_role_assigned(&self, token: &str, role: Role) -> bool {
         match self {
             Authenticator::Static(data) => match data.get(token) {

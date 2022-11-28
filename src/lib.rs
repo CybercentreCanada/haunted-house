@@ -9,11 +9,11 @@ mod interface;
 mod auth;
 mod cache;
 
-
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use auth::Authenticator;
+use auth::{Authenticator, Role};
 use chrono::{DateTime, Utc};
 use pyo3::exceptions::{PyRuntimeError};
 use pyo3::types::PyModule;
@@ -22,7 +22,7 @@ use storage::{BlobStorage, LocalDirectory, PythonBlobStore};
 use tokio::sync::oneshot;
 
 use crate::core::HouseCore;
-use crate::database::LocalDatabase;
+use crate::database::RocksInterface;
 use crate::access::AccessControl;
 use crate::cache::LocalCache;
 
@@ -34,7 +34,7 @@ struct ServerInterface {
 
 #[pymethods]
 impl ServerInterface {
-    pub fn ingest_file(&self, py: Python, hash: String, access: String, expiry: Option<DateTime<Utc>>) -> PyResult<PyObject> {
+    pub fn ingest_file(&self, py: Python, hash: Vec<u8>, access: String, expiry: Option<DateTime<Utc>>) -> PyResult<PyObject> {
         let access = AccessControl::parse(&access, "/", ",");
         let (send, recv) = oneshot::channel();
         match self.core.ingest_queue.send((hash, access, expiry, send)) {
@@ -52,6 +52,7 @@ impl ServerInterface {
     }
 }
 
+const DEFAULT_SOFT_MAX_SIZE: usize = 50 << 30;
 
 #[pyclass]
 #[derive(Default)]
@@ -61,6 +62,7 @@ struct ServerBuilder {
     bind_address: String,
     authenticator: Option<Authenticator>,
     cache_space: Option<LocalCache>,
+    index_soft_max: Option<usize>,
 }
 
 #[pymethods]
@@ -95,6 +97,16 @@ impl ServerBuilder {
         Ok(())
     }
 
+    fn authentication_object(&mut self, object: Py<PyAny>) -> PyResult<()> {
+        self.authenticator = Some(Authenticator::new_python(object)?);
+        Ok(())
+    }
+
+    fn static_authentication(&mut self, assignments: HashMap<String, HashSet<Role>>) -> PyResult<()> {
+        self.authenticator = Some(Authenticator::new_static(assignments)?);
+        Ok(())
+    }
+
     fn build(&mut self) -> PyResult<ServerInterface> {
         // Initialize blob stores
         let index_storage = match self.index_storage.take() {
@@ -113,7 +125,7 @@ impl ServerBuilder {
         let cache = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
 
         // Initialize database
-        let database = LocalDatabase::new()?;
+        let database = RocksInterface::new(self.index_soft_max.unwrap_or(DEFAULT_SOFT_MAX_SIZE))?;
 
         // Start server core
         let core = HouseCore::new(index_storage, file_storage, database, cache, auth)?;

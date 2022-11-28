@@ -15,7 +15,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 
-type IngestMessage = (String, AccessControl, Option<DateTime<Utc>>, oneshot::Sender<Result<()>>);
+type IngestMessage = (Vec<u8>, AccessControl, Option<DateTime<Utc>>, oneshot::Sender<Result<()>>);
 
 pub struct Config {
     pub batch_limit_size: usize,
@@ -54,22 +54,6 @@ impl HouseCore {
         return Ok(core)
     }
 
-    pub async fn update_file_access(&self, hash: &String, access: &AccessControl, index_group: &String) -> Result<bool> {
-        todo!()
-    }
-
-    pub async fn select_index_to_grow(&self, index_group: &String) -> Result<(bool, String)> {
-        todo!();
-    }
-
-    pub async fn create_index_data(&self, index_group: &String, index_id: String, meta: Vec<(String, AccessControl)>) -> Result<()> {
-        todo!();
-    }
-
-    pub async fn update_index_data(&self, index_group: &String, index_id: String, meta: Vec<(String, AccessControl)>, index_offset: usize) -> Result<()> {
-        todo!();
-    }
-
 }
 
 pub fn generate_index_group(expiry: &Option<DateTime<Utc>>) -> String {
@@ -91,7 +75,7 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
 
     let mut pending_timers: HashMap<String, DateTime<Utc>> = Default::default();
-    let mut pending_batch: HashMap<String, HashMap<String, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
+    let mut pending_batch: HashMap<String, HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
 
     let mut current_batch: Option<JoinHandle<Result<()>>> = None;
     let mut batch_check_timer = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -135,9 +119,15 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 };
                 let (hash, access, expiry, respond) = message;
 
+                // Make sure the hash value is correct
+                if hash.len() != 32 {
+                    _ = respond.send(Err(anyhow::anyhow!("Expected hash to be binary encoded sha256")));
+                    continue
+                }
+
                 // Try to update in place without changing indices
                 let index_group = generate_index_group(&expiry);
-                if core.update_file_access(&hash, &access, &index_group).await? {
+                if core.database.update_file_access(&hash, &access, &index_group).await? {
                     _ = respond.send(Ok(()));
                     continue
                 }
@@ -156,7 +146,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         }
                     },
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        let mut batch: HashMap<String, _> = Default::default();
+                        let mut batch: HashMap<Vec<u8>, _> = Default::default();
                         batch.insert(hash, (access, vec![respond]));
                         entry.insert(batch);
                         pending_timers.insert(index_group, Utc::now());
@@ -171,12 +161,12 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 }
 
 
-async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_items: HashMap<String, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
+async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
     // Check if any of our new items are already handled
     {
         let mut to_remove = vec![];
         for (hash, (access, responses)) in new_items.iter_mut() {
-            if core.update_file_access(hash, access, &index_group).await? {
+            if core.database.update_file_access(hash, access, &index_group).await? {
                 while let Some(res) = responses.pop() {
                     _ = res.send(Ok(()));
                 }
@@ -196,7 +186,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
     let mut meta = vec![];
     let mut remaining_responses = vec![];
     let mut outstanding = Vec::from_iter(new_items.keys().cloned());
-    let mut active: Vec<JoinHandle<(String, Result<BitVec>)>> = Vec::new();
+    let mut active: Vec<JoinHandle<(Vec<u8>, Result<BitVec>)>> = Vec::new();
     while !new_items.is_empty() {
         while !outstanding.is_empty() && active.len() < 10 {
             if let Some(hash) = outstanding.pop(){
@@ -216,7 +206,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
                     remaining_responses.extend(responses);
                 },
                 Err(err) => {
-                    error!("Error gathering file for {hash}: {err}");
+                    error!("Error gathering file for {}: {err}", base64::encode(&hash));
                     for res in responses {
                         _ = res.send(Err(anyhow::format_err!("Error gathering file {err}")));
                     }
@@ -226,7 +216,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
     }
 
     // Pick an index to merge into
-    let (is_index_new, index_id) = core.select_index_to_grow(&index_group).await?;
+    let (is_index_new, index_id) = core.database.select_index_to_grow(&index_group).await?;
     
     // Merge into a new index file
     let (new_index, index_offset) = if is_index_new {
@@ -256,14 +246,14 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
     };
     
     // Upload the new index file
-    new_index.size_to_fit().await?;
+    let size = new_index.size_to_fit().await?;
     core.index_storage.upload(index_id.clone(), new_index.path()).await?;
 
     // Add the new values into the database corresponding to this index
     if is_index_new {
-        core.create_index_data(&index_group, index_id, meta).await?;
+        core.database.create_index_data(&index_group, index_id, meta, size).await?;
     } else {
-        core.update_index_data(&index_group, index_id, meta, index_offset).await?;
+        core.database.update_index_data(&index_group, index_id, meta, index_offset, size).await?;
     };
 
     for res in remaining_responses {
@@ -272,6 +262,6 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
     Ok(())
 }
 
-async fn prepare_vector(core: Arc<HouseCore>, hash: String) -> (String, Result<BitVec>) {
+async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result<BitVec>) {
     todo!()
 }

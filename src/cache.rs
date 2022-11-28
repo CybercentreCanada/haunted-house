@@ -54,13 +54,13 @@ impl FileHandle {
         Arc::strong_count(&self.data)
     }
 
-    pub async fn resize(&self, new_size: usize) -> Result<()> {
+    pub async fn resize(&self, new_size: usize) -> Result<usize> {
         let (send, recv) = oneshot::channel();
         _ = self.data.connection.send(LocalCacheCommand::Resize(self.data.id, new_size, send)).await;
         return Ok(recv.await??)
     }
 
-    pub async fn size_to_fit(&self) -> Result<()> {
+    pub async fn size_to_fit(&self) -> Result<usize> {
         let handle = self.open()?;
         let meta = tokio::task::spawn_blocking(move ||{
             handle.metadata()
@@ -89,7 +89,7 @@ struct CacheEntry {
 enum LocalCacheCommand {
     List(oneshot::Sender<Vec<(HandleId, usize)>>),
     Open(usize, oneshot::Sender<Result<FileHandle>>),
-    Resize(HandleId, usize, oneshot::Sender<Result<()>>),
+    Resize(HandleId, usize, oneshot::Sender<Result<usize>>),
     Capacity(oneshot::Sender<(usize, usize)>),
     Flush(oneshot::Sender<()>),
     HandleDropped(HandleId),
@@ -140,7 +140,7 @@ impl LocalCache {
 
 enum WaitingFile {
     Open(usize, oneshot::Sender<Result<FileHandle>>),
-    Resize(HandleId, usize, usize, oneshot::Sender<Result<()>>)
+    Resize(HandleId, usize, usize, oneshot::Sender<Result<usize>>)
 }
 
 struct Inner {
@@ -208,7 +208,7 @@ impl Inner {
                         let freed = handle.size - new_size;
                         self.committed_capacity -= freed;
                         handle.size = new_size;
-                        respond.send(Ok(()));
+                        respond.send(Ok(new_size));
                         return Ok(())
                     }
 
@@ -323,7 +323,7 @@ impl Inner {
         return Ok(())
     }
 
-    fn do_resize(&mut self, id: Uuid, new_size: usize, respond: oneshot::Sender<Result<()>>) -> Result<()> {
+    fn do_resize(&mut self, id: Uuid, new_size: usize, respond: oneshot::Sender<Result<usize>>) -> Result<()> {
         let handle = match self.open.get_mut(&id) {
             Some(handle) => handle,
             None => {
@@ -334,7 +334,7 @@ impl Inner {
 
         self.committed_capacity += new_size - handle.size;
         handle.size = new_size;
-        respond.send(Ok(()));
+        respond.send(Ok(new_size));
         return Ok(())
     }
 

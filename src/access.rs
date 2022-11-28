@@ -340,7 +340,7 @@ mod test {
         let a = &AccessControl::Token("A".to_owned());
         let b = &AccessControl::Token("B".to_owned());
         let c = &AccessControl::Token("C".to_owned());
-        let d = &AccessControl::Token("D".to_owned());
+        // let d = &AccessControl::Token("D".to_owned());
 
         assert_eq!(a, &a.clone().simplify());
 
