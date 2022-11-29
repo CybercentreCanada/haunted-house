@@ -199,7 +199,7 @@ impl Inner {
                     let handle = match self.open.get_mut(&id) {
                         Some(handle) => handle,
                         None => {
-                            respond.send(Err(anyhow::anyhow!("Bad handle")));
+                            _ = respond.send(Err(anyhow::anyhow!("Bad handle")));
                             return Ok(())
                         },
                     };
@@ -208,7 +208,7 @@ impl Inner {
                         let freed = handle.size - new_size;
                         self.committed_capacity -= freed;
                         handle.size = new_size;
-                        respond.send(Ok(new_size));
+                        _ = respond.send(Ok(new_size));
                         return Ok(())
                     }
 
@@ -319,7 +319,7 @@ impl Inner {
         };
         self.open.insert(id, entry);
         self.committed_capacity += new_size;
-        respond.send(Ok(handle));
+        _ = respond.send(Ok(handle));
         return Ok(())
     }
 
@@ -327,14 +327,14 @@ impl Inner {
         let handle = match self.open.get_mut(&id) {
             Some(handle) => handle,
             None => {
-                respond.send(Err(anyhow::anyhow!("Bad handle")));
+                _ = respond.send(Err(anyhow::anyhow!("Bad handle")));
                 return Ok(())
             },
         };
 
         self.committed_capacity += new_size - handle.size;
         handle.size = new_size;
-        respond.send(Ok(new_size));
+        _ = respond.send(Ok(new_size));
         return Ok(())
     }
 

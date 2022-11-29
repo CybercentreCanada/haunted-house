@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
-use crate::database::Database;
+use crate::database::{Database, IndexGroup, BlobID};
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
-use crate::ursadb;
+use crate::ursadb::{self, UrsaDBTrigramFilter};
 use bitvec::vec::BitVec;
 use futures::future::select_all;
 use log::error;
@@ -58,13 +58,6 @@ impl HouseCore {
 
 }
 
-pub fn generate_index_group(expiry: &Option<DateTime<Utc>>) -> String {
-    match expiry {
-        Some(date) => format!("{}", date.format("%Y-%U")),
-        None => format!("9999-53"),
-    }
-}
-
 async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<IngestMessage>) {
     loop {
         match _ingest_worker(core.clone(), &mut input).await {
@@ -76,8 +69,8 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
 
-    let mut pending_timers: HashMap<String, DateTime<Utc>> = Default::default();
-    let mut pending_batch: HashMap<String, HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
+    let mut pending_timers: HashMap<IndexGroup, DateTime<Utc>> = Default::default();
+    let mut pending_batch: HashMap<IndexGroup, HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
 
     let mut current_batch: Option<JoinHandle<Result<()>>> = None;
     let mut batch_check_timer = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -128,7 +121,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 }
 
                 // Try to update in place without changing indices
-                let index_group = generate_index_group(&expiry);
+                let index_group = IndexGroup::create(&expiry);
                 if core.database.update_file_access(&hash, &access, &index_group).await? {
                     _ = respond.send(Ok(()));
                     continue
@@ -163,7 +156,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 }
 
 
-async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
+async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
     // Check if any of our new items are already handled
     {
         let mut to_remove = vec![];
@@ -218,44 +211,51 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
     }
 
     // Pick an index to merge into
-    let (is_index_new, index_id) = core.database.select_index_to_grow(&index_group).await?;
+    let selected_index = core.database.select_index_to_grow(&index_group).await?;
 
     // Merge into a new index file
-    let (new_index, index_offset) = if is_index_new {
-        let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len());
-        let new_index_file = core.local_cache.open(final_size).await?;
-        let out_handle = new_index_file.open()?;
-        let ok: Result<()> = tokio::task::spawn_blocking(move || {
-            ursadb::UrsaDBTrigramFilter::build_from_data(out_handle, data)?;
-            Ok(())
-        }).await?;
-        ok?;
-        (new_index_file, 0)
-    } else {
-        let data_size = core.index_storage.size(&index_id).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
-        let index_file = core.local_cache.open(data_size).await?;
-        core.index_storage.download(&index_id, index_file.path()).await?;
+    match selected_index {
+        None => {
+            let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len());
+            let new_index_file = core.local_cache.open(final_size).await?;
+            let out_handle = new_index_file.open()?;
+            let ok: Result<()> = tokio::task::spawn_blocking(move || {
+                ursadb::UrsaDBTrigramFilter::build_from_data(out_handle, data)?;
+                Ok(())
+            }).await?;
+            ok?;
 
-        let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len()) + data_size;
-        let new_index_file = core.local_cache.open(final_size).await?;
-        let out_handle = new_index_file.open()?;
-        let ok: Result<usize> = tokio::task::spawn_blocking(move || {
-            let (_, offset) = ursadb::UrsaDBTrigramFilter::merge_in_data(out_handle, index_file.open()?, data)?;
-            Ok(offset)
-        }).await?;
-        let offset = ok?;
-        (new_index_file, offset)
-    };
+            // Upload the new index file
+            let size = new_index_file.size_to_fit().await?;
+            let new_blob = BlobID::new();
+            core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
 
-    // Upload the new index file
-    let size = new_index.size_to_fit().await?;
-    core.index_storage.upload(index_id.clone(), new_index.path()).await?;
+            // Add the new values into the database corresponding to this index
+            core.database.create_index_data(&index_group, new_blob, meta, size).await?;
 
-    // Add the new values into the database corresponding to this index
-    if is_index_new {
-        core.database.create_index_data(&index_group, index_id, meta, size).await?;
-    } else {
-        core.database.update_index_data(&index_group, index_id, meta, index_offset, size).await?;
+        }
+        Some((index_id, old_blob)) => {
+            let data_size = core.index_storage.size(old_blob.as_str()).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
+            let index_file = core.local_cache.open(data_size).await?;
+            core.index_storage.download(old_blob.as_str(), index_file.path()).await?;
+
+            let final_size = ursadb::UrsaDBTrigramFilter::guess_max_size(data.len()) + data_size;
+            let new_index_file = core.local_cache.open(final_size).await?;
+            let out_handle = new_index_file.open()?;
+            let ok: Result<usize> = tokio::task::spawn_blocking(move || {
+                let (_, offset) = ursadb::UrsaDBTrigramFilter::merge_in_data(out_handle, index_file.open()?, data)?;
+                Ok(offset)
+            }).await?;
+            let offset = ok?;
+
+            // Upload the new index file
+            let new_blob = BlobID::new();
+            let size = new_index_file.size_to_fit().await?;
+            core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
+
+            // Add the new values into the database corresponding to this index
+            core.database.update_index_data(&index_group, index_id, old_blob, new_blob, meta, offset, size).await?;
+        }
     };
 
     for res in remaining_responses {
@@ -265,5 +265,21 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: String, mut new_ite
 }
 
 async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result<BitVec>) {
-    todo!()
+    let label = base64::encode(&hash);
+    let stream = match core.file_storage.stream(&label).await {
+        Ok(stream) => stream,
+        Err(err) => return (hash, Err(err)),
+    };
+
+    let result = tokio::task::spawn_blocking(|| {
+        let result = UrsaDBTrigramFilter::build_file(stream);
+        return result
+    }).await;
+
+    let result = match result {
+        Ok(stream) => stream,
+        Err(err) => return (hash, Err(err.into())),
+    };
+
+    return (hash, result)
 }

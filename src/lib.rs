@@ -57,6 +57,11 @@ impl ServerInterface {
 
 const DEFAULT_SOFT_MAX_SIZE: usize = 50 << 30;
 
+enum DatabaseConfig {
+    SQLite(PathBuf)
+}
+
+
 #[pyclass]
 #[derive(Default)]
 struct ServerBuilder {
@@ -66,6 +71,7 @@ struct ServerBuilder {
     authenticator: Option<Authenticator>,
     cache_space: Option<LocalCache>,
     index_soft_max: Option<usize>,
+    database_config: Option<DatabaseConfig>,
 }
 
 #[pymethods]
@@ -134,7 +140,13 @@ impl ServerBuilder {
         let cache = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
 
         // Initialize database
-        let database = runtime.block_on(Database::new_sqlite(self.index_soft_max.unwrap_or(DEFAULT_SOFT_MAX_SIZE), self.database_path))?;
+        let db_config = match self.database_config.take() {
+            Some(config) => config,
+            None => DatabaseConfig::SQLite(tempfile::tempdir()?.into_path().join("house.sqlite"))
+        };
+        let database = match db_config {
+            DatabaseConfig::SQLite(path) => runtime.block_on(Database::new_sqlite(self.index_soft_max.unwrap_or(DEFAULT_SOFT_MAX_SIZE), path.to_str().unwrap()))?
+        };
 
         // Start server core
         let core = HouseCore::new(runtime, index_storage, file_storage, database, cache, auth)?;

@@ -14,7 +14,6 @@ use crate::access::AccessControl;
 
 struct Filter {
     handle: tokio::fs::File,
-    // meta: FilterMetadata
 }
 
 fn to_array(value: Vec<u8>) -> Result<Box<[u8; 32]>> {

@@ -23,10 +23,10 @@ impl SKV {
 
     pub async fn create_collection(&self, name: &str) -> Result<Collection> {
         let mut con = self.connection.acquire().await?;
-        sqlx::query("create table ? if not exists (
+        sqlx::query(&format!("create table if not exists {name} (
             key BLOB PRIMARY KEY,
             value BLOB NOT NULL
-        )").bind(name).execute(&mut con).await?;
+        )")).execute(&mut con).await?;
         Ok(Collection { con, name: name.to_owned() })
     }
 
@@ -42,7 +42,7 @@ impl SKV {
 
     pub async fn remove_collection(&self, name: &str) -> Result<()> {
         let mut con = self.connection.acquire().await?;
-        sqlx::query("drop table if exists ?").bind(name).execute(&mut con).await?;
+        sqlx::query(&format!("drop table if exists {name}")).execute(&mut con).await?;
         Ok(())
     }
 }
@@ -50,15 +50,13 @@ impl SKV {
 impl Collection {
 
     pub async fn list_all(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let result: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT key, value FROM ?")
-            .bind(&self.name)
+        let result: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {}", self.name))
             .fetch_all(&mut self.con).await?;
         return Ok(result)
     }
 
     pub async fn list_inclusive_range(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let result: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT key, value FROM ? where key >= ? AND key <= ?")
-            .bind(&self.name)
+        let result: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {} where key >= ? AND key <= ?", self.name))
             .bind(start)
             .bind(end)
             .fetch_all(&mut self.con).await?;
@@ -66,8 +64,7 @@ impl Collection {
     }
 
     pub async fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        sqlx::query("INSERT INTO ?(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?;")
-            .bind(&self.name)
+        sqlx::query(&format!("INSERT INTO {}(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?;", self.name))
             .bind(key)
             .bind(value)
             .bind(value)
@@ -76,8 +73,7 @@ impl Collection {
     }
 
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut result: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT value FROM ? WHERE key = ? LIMIT 1")
-            .bind(&self.name)
+        let mut result: Vec<(Vec<u8>,)> = sqlx::query_as(&format!("SELECT value FROM {} WHERE key = ? LIMIT 1", self.name))
             .bind(key)
             .fetch_all(&mut self.con).await?;
         if let Some(row) = result.pop() {
@@ -88,55 +84,46 @@ impl Collection {
     }
 
     pub async fn remove(&mut self, key: &[u8]) -> Result<()> {
-        sqlx::query("DELETE FROM ? WHERE key = ?")
-            .bind(&self.name)
+        sqlx::query(&format!("DELETE FROM {} WHERE key = ?", self.name))
             .bind(key)
             .execute(&mut self.con).await?;
         return Ok(())
     }
 
-    pub async fn cas(&mut self, key: &[u8], old: &[u8], value: &[u8]) -> Result<bool> {
-        let result = sqlx::query("UPDATE ? SET value = ? WHERE key = ? AND value = ?")
-            .bind(&self.name)
-            .bind(value)
-            .bind(key)
-            .bind(old)
-            .execute(&mut self.con).await?;
-        return Ok(result.rows_affected() > 0)
+    pub async fn cas(&mut self, key: &[u8], old: Option<&[u8]>, value: &[u8]) -> Result<bool> {
+        match old {
+            Some(old) => {
+                let result = sqlx::query(&format!("UPDATE {} SET value = ? WHERE key = ? AND value = ?", self.name))
+                    .bind(value)
+                    .bind(key)
+                    .bind(old)
+                    .execute(&mut self.con).await?;
+                return Ok(result.rows_affected() > 0)
+            },
+            None => {
+                let result = sqlx::query(&format!("INSERT INTO {}(key,value) VALUES(?,?)", self.name))
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut self.con).await?;
+                return Ok(result.rows_affected() > 0)
+            }
+        }
     }
 }
-
-
-// struct CollectionIterator {
-//     con: PoolConnection<Sqlite>,
-//     name: String,
-// }
-
-// impl CollectionIterator {
-//     pub async fn new(con: PoolConnection<Sqlite>, name: String) -> Result<CollectionIterator> {
-//         let result = sqlx::query_as("SELECT value FROM ? WHERE key = ?")
-//             .bind(&name)
-//             .fetch(&mut con);
-
-//         result
-
-//         todo!();
-//     }
-// }
 
 
 #[cfg(test)]
 mod test {
     use super::SKV;
-    use anyhow::Result;
+    use anyhow::{Result, Context};
     use assertor::{assert_that, VecAssertion};
 
     #[tokio::test]
     async fn set_get() -> Result<()> {
         let store = SKV::open(":memory:").await?;
 
-        let a = store.create_collection("a").await?;
-        let b = store.create_collection("b").await?;
+        let mut a = store.create_collection("a").await.context("create_collection")?;
+        let mut b = store.create_collection("b").await?;
 
         a.set(b"abc", b"123").await?;
         a.set(b"abc1", b"456").await?;
@@ -154,10 +141,20 @@ mod test {
             (b"abc2".to_vec(), b"789".to_vec())
         ]);
 
-        assert!(a.cas(b"abc", b"123", b"000").await?);
-        assert!(!a.cas(b"abc", b"0000", b"---").await?);
+        assert!(a.cas(b"abc", Some(b"123"), b"000").await?);
+        assert!(!a.cas(b"abc", Some(b"0000"), b"---").await?);
         assert_that!(a.list_all().await?).contains_exactly(vec![
             (b"abc".to_vec(), b"000".to_vec()),
+            (b"abc1".to_vec(), b"456".to_vec()),
+            (b"abc2".to_vec(), b"789".to_vec())
+        ]);
+
+        assert_that!(a.list_inclusive_range(b"abc", b"abc").await?).contains_exactly(vec![(b"abc".to_vec(), b"000".to_vec())]);
+        assert_that!(a.list_inclusive_range(b"abc1", b"abc1").await?).contains_exactly(vec![(b"abc1".to_vec(), b"456".to_vec())]);
+        assert_that!(a.list_inclusive_range(b"abc2", b"abc2").await?).contains_exactly(vec![(b"abc2".to_vec(), b"789".to_vec())]);
+        assert_that!(a.list_inclusive_range(b"abc3", b"abc9").await?).contains_exactly(vec![]);
+
+        assert_that!(a.list_inclusive_range(b"abc1", b"abc2").await?).contains_exactly(vec![
             (b"abc1".to_vec(), b"456".to_vec()),
             (b"abc2".to_vec(), b"789".to_vec())
         ]);

@@ -1,5 +1,5 @@
 
 
 # notes
-- break batches 
+- break batches up
 - don't save in expired/nearly expired groups

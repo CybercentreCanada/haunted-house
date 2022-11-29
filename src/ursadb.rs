@@ -18,13 +18,12 @@ pub struct UrsaDBTrigramFilter {
 }
 
 impl UrsaDBTrigramFilter {
-    fn build_file(path: &Path) -> Result<Vec<bool>> {
+    pub fn build_file<IN: std::io::Read>(mut handle: IN) -> Result<BitVec> {
         // Prepare to read
-        let mut handle = std::fs::File::open(path)?;
         let mut buffer: Vec<u8> = vec![0; 1 << 20];
 
         // Prepare accumulators
-        let mut mask: Vec<bool> = vec![false; 1 << 24];
+        let mut mask = BitVec::repeat(false, 1 << 24);
 
         // Read the initial block
         let read = handle.read(&mut buffer)?;
@@ -41,7 +40,7 @@ impl UrsaDBTrigramFilter {
         loop {
             for index in index_start..read {
                 trigram = (trigram & 0x00FFFF) << 8 | (buffer[index] as u32);
-                mask[trigram as usize] = true;
+                mask.set(trigram as usize, true);
             }
 
             let read = handle.read(&mut buffer)?;
@@ -86,24 +85,34 @@ impl UrsaDBTrigramFilter {
     }
 
     pub fn guess_max_size(files: usize) -> usize {
-        todo!();
+        HEADER_SIZE + OFFSET_TABLE_SIZE as usize + files * 8
     }
 
-    pub fn merge_in_data(mut file: std::fs::File, mut old: std::fs::File, data: Vec<BitVec>) -> Result<(Self, usize)> {
-        todo!();
-    }
-    
-    pub fn build_from_data(mut file: std::fs::File, data: Vec<BitVec>) -> Result<Self> {
-        todo!()
-    }
+    // pub fn merge_in_data(mut file: std::fs::File, old: std::fs::File, data: Vec<BitVec>) -> Result<(Self, usize)> {
+    //     let old = Self::open(old)?;
 
-    pub fn build(mut file: std::fs::File, input: Vec<PathBuf>) -> Result<Self> {
-        file.seek(SeekFrom::Start(0))?;
+    //     // Write header
+    //     file.seek(SeekFrom::Start(0))?;
+    //     file.write_all(&0xCA7DA7Au32.to_le_bytes())?;
+    //     file.write_all(&6u32.to_le_bytes())?;
+    //     file.write_all(&0u32.to_le_bytes())?;
+    //     file.write_all(&0u32.to_le_bytes())?;
+
+    //     // Write the bin data, tracking the offsets
+    //     let mut cursor_offset: u64 = HEADER_SIZE as u64;
+    //     let mut offsets: Vec<u64> = vec![cursor_offset];
+
+
+
+    //     todo!();
+    // }
+
+    pub fn build_from_data(mut file: std::fs::File, raw_data: Vec<BitVec>) -> Result<Self> {
+
         let mut data: Vec<Vec<u64>> = vec![];
         data.resize_with(1 << 24, Default::default);
 
-        for (index, file) in input.iter().enumerate() {
-            let matches = Self::build_file(file)?;
+        for (index, matches) in raw_data.iter().enumerate() {
             for (trigram_index, value) in matches.iter().enumerate() {
                 if *value {
                     data[trigram_index].push(index as u64);
@@ -112,6 +121,7 @@ impl UrsaDBTrigramFilter {
         }
 
         // Write header
+        file.seek(SeekFrom::Start(0))?;
         file.write_all(&0xCA7DA7Au32.to_le_bytes())?;
         file.write_all(&6u32.to_le_bytes())?;
         file.write_all(&0u32.to_le_bytes())?;
@@ -139,6 +149,16 @@ impl UrsaDBTrigramFilter {
             file,
             table_offset: cursor_offset
         })
+    }
+
+    pub fn build(mut file: std::fs::File, input: Vec<PathBuf>) -> Result<Self> {
+        let mut data: Vec<BitVec> = vec![];
+
+        for (index, file) in input.iter().enumerate() {
+            data.push(Self::build_file(std::fs::File::open(file)?)?);
+        }
+
+        return Self::build_from_data(file, data)
     }
 
     fn open(file: std::fs::File) -> Result<Self> {
