@@ -24,7 +24,7 @@ struct IndexEntry {
 
 impl IndexEntry {
     fn key(&self) -> String {
-        format!("{}:{}", self.group, self.label)
+        format!("{}:{}", self.group.0, self.label.0)
     }
 }
 
@@ -47,40 +47,48 @@ impl SQLiteInterface {
         Ok(self.kv.create_collection("index-index").await?)
     }
 
-    pub async fn open_index_column(&self, name: &str) -> Result<Collection> {
+    pub async fn open_index_column(&self, name: &str) -> Result<Option<Collection>> {
+        Ok(self.kv.open_collection(&format!("index-{name}")).await?)
+    }
+    
+    pub async fn create_index_column(&self, name: &str) -> Result<Collection> {
         Ok(self.kv.create_collection(&format!("index-{name}")).await?)
     }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, new_index_group: &IndexGroup) -> Result<bool> {
-        // Iterate from the furthest from expiry backwards until we hit the limiting group
-        let index_index_cf = self.open_directory_column()?;
-        let indices = self.db.iterator_cf(&index_index_cf, rocksdb::IteratorMode::End);
-        for index_entry in indices {
-            let (key, _value) = index_entry?;
-            let key = std::str::from_utf8(&key)?;
+        // Get all the groups that expire later than this one
+        let mut index_index = self.open_directory_column().await?;
+        let mut list = index_index.list_inclusive_range(new_index_group.0.as_bytes(), b"99999").await?;
 
-            // Check if we have gone past the group we were looking for
-            if key < new_index_group.as_str() {
-                break
-            }
+        // Run from oldest to newest that fit
+        list.sort_by(|a, b|b.cmp(a));
+
+        for (key, value) in list {
+            let key = std::str::from_utf8(&key)?;
 
             // Check if the index has the hash being update
             let (_index_group, index_name) = key.split_once(":").unwrap();
-            if let Some(column_family) = self.open_index_column(index_name)? {
-                let hash_index = if let Some(slice) = self.db.get_pinned_cf(&column_family, hash)? {
+            if let Some(col) = self.open_index_column(index_name).await? {
+                let hash_index = if let Some(slice) = col.get(hash).await? {
                     slice
                 } else {
                     continue;
                 };
 
-                // Check if the access is correct
-                if let Some(_) = self.db.get_pinned_cf(&column_family, &hash_index)? {
-                    let entry = FileEntry{
-                        access: access.clone(),
-                        hash,
-                    };
-                    self.db.merge_cf(&column_family, hash_index, postcard::to_allocvec(&entry)?)?;
-                    return Ok(true)
+                loop {
+                    // Check if the access is correct
+                    if let Some(buffer) = col.get(&hash_index)? {
+                        let entry = FileEntry{
+                            access: access.clone(),
+                            hash,
+                        };
+
+                        if col.cas(hash_index, buffer, postcard::to_allocvec(&entry)?).await? {
+                            return Ok(true)
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -88,8 +96,8 @@ impl SQLiteInterface {
         return Ok(false)
     }
 
-    pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<(IndexID, Option<BlobID>, BlobID)> {
-        let index_index = self.open_directory_column().await?;
+    pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, BlobID)>> {
+        let mut index_index = self.open_directory_column().await?;
         let mut best: Option<IndexEntry> = None;
 
         let list = index_index.list_inclusive_range(index_group.0.as_bytes(), index_group.0.as_bytes()).await?;
@@ -120,55 +128,57 @@ impl SQLiteInterface {
         }
 
         match best {
-            Some(best) => Ok((best.label, best.label.to_owned())),
-            None => Ok((true, uuid::Uuid::new_v4().to_string())),
+            Some(best) => Ok(Some((best.label, best.current_blob, BlobID::new()))),
+            None => Ok(None),
         }
     }
 
     pub async fn create_index_data(&self, index_group: &String, index_id: String, meta: Vec<(Vec<u8>, AccessControl)>, new_size: usize) -> Result<()> {
-        {
-            let index_index = self.open_directory_column()?;
-            let entry = IndexEntry {
-                group: index_group.clone(),
-                label: index_id.clone(),
-                size: new_size,
-            };
-            self.db.put_cf(&index_index, entry.key(), &postcard::to_allocvec(&entry)?)?;
-        }
-        self.update_index_data(index_group, index_id, meta, 0, new_size).await
+        todo!()
+        // {
+        //     let index_index = self.open_directory_column()?;
+        //     let entry = IndexEntry {
+        //         group: index_group.clone(),
+        //         label: index_id.clone(),
+        //         size: new_size,
+        //     };
+        //     self.db.put_cf(&index_index, entry.key(), &postcard::to_allocvec(&entry)?)?;
+        // }
+        // self.update_index_data(index_group, index_id, meta, 0, new_size).await
     }
 
     pub async fn update_index_data(&self, index_group: &String, index_id: String, meta: Vec<(Vec<u8>, AccessControl)>, index_offset: usize, new_size: usize) -> Result<()> {
-        // Open column family for the index meta data
-        let column_family = match self.open_index_column(&index_id)? {
-            Some(fam) => fam,
-            None => return Err(anyhow::anyhow!("Update on missing index"))
-        };
+        todo!();
+        // // Open column family for the index meta data
+        // let column_family = match self.open_index_column(&index_id)? {
+        //     Some(fam) => fam,
+        //     None => return Err(anyhow::anyhow!("Update on missing index"))
+        // };
 
-        // Add all the new file entries
-        for (index, (hash, access)) in meta.into_iter().enumerate() {
-            let index = index + index_offset;
-            let index = index.to_le_bytes();
-            let mut batch = WriteBatchWithTransaction::<false>::default();
-            batch.put_cf(&column_family, &hash, index);
-            batch.put_cf(&column_family, index, postcard::to_allocvec(&FileEntry {
-                access,
-                hash: &hash,
-            })?);
-            self.db.write(batch)?;
-        }
+        // // Add all the new file entries
+        // for (index, (hash, access)) in meta.into_iter().enumerate() {
+        //     let index = index + index_offset;
+        //     let index = index.to_le_bytes();
+        //     let mut batch = WriteBatchWithTransaction::<false>::default();
+        //     batch.put_cf(&column_family, &hash, index);
+        //     batch.put_cf(&column_family, index, postcard::to_allocvec(&FileEntry {
+        //         access,
+        //         hash: &hash,
+        //     })?);
+        //     self.db.write(batch)?;
+        // }
 
-        // Update size in index table
-        {
-            let index_index = self.open_directory_column()?;
-            let entry = IndexEntry {
-                group: index_group.clone(),
-                label: index_id,
-                size: new_size,
-            };
-            self.db.merge(entry.key(), &postcard::to_allocvec(&entry)?)?;
-        }
-        return Ok(())
+        // // Update size in index table
+        // {
+        //     let index_index = self.open_directory_column()?;
+        //     let entry = IndexEntry {
+        //         group: index_group.clone(),
+        //         label: index_id,
+        //         size: new_size,
+        //     };
+        //     self.db.merge(entry.key(), &postcard::to_allocvec(&entry)?)?;
+        // }
+        // return Ok(())
     }
 
 }

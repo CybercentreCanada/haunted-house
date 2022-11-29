@@ -4,15 +4,24 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::database_rocksdb::RocksInterface;
+// use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
 
 
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexGroup(pub String);
 
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexID(pub String);
 
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobID(pub String);
+
+impl BlobID {
+    pub fn new() -> Self {
+        BlobID(uuid::Uuid::new_v4().to_string())
+    }
+}
 
 pub enum Database {
     // Rocks(RocksInterface),
@@ -36,7 +45,7 @@ impl Database {
         }
     }
 
-    pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<(IndexID, Option<BlobID>, BlobID)> {
+    pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, BlobID)>> {
         match self {
             // Database::Rocks(local) => local.select_index_to_grow(index_group).await,
             Database::SQLite(local) => local.select_index_to_grow(index_group).await,
