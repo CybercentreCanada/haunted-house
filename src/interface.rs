@@ -1,6 +1,7 @@
 
 
 use std::sync::Arc;
+use anyhow::Result;
 
 use poem::http::StatusCode;
 use poem::middleware::AddData;
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::core::HouseCore;
+use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
 
@@ -55,37 +57,57 @@ struct SearcherInterface {
     core: Arc<HouseCore>
 }
 
+impl SearcherInterface {
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+        self.core.initialize_search(req).await
+    }
+
+    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+        self.core.search_status(code).await
+    }
+}
+
 
 #[derive(Deserialize)]
-struct SearchRequest {
-    access: AccessControl,
-    yara_signature: String,
-    start_date: Option<chrono::DateTime<chrono::Utc>>,
-    end_date: Option<chrono::DateTime<chrono::Utc>>,
+pub struct SearchRequest {
+    pub access: AccessControl,
+    pub query: Query,
+    pub yara_signature: String,
+    pub start_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 
 #[derive(Serialize)]
-struct SearchRequestResponse {
+pub struct SearchRequestResponse {
     code: String,
     finished: bool,
     errors: Vec<String>,
+    pending_indices: u64,
+    pending_candidates: u64,
+    hits: Vec<String>,
 }
 
 #[handler]
-fn add_search(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<SearchRequest>) -> Response {
+async fn add_search(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<SearchRequest>) -> Result<Response> {
     let interface = match back.authenticate_searcher(auth.token()) {
         Some(interface) => interface,
-        None => return StatusCode::FORBIDDEN.into()
+        None => return Ok(StatusCode::FORBIDDEN.into())
     };
 
-    todo!();
-    // interface.initialize_search(request)
+    let status: SearchRequestResponse = interface.initialize_search(request).await?;
+    Ok(Json(status).into_response())
 }
 
 #[handler]
-fn search_status(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Path(code): Path<String>) -> (StatusCode, Json<SearchRequestResponse>) {
-    todo!()
+async fn search_status(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Path(code): Path<String>) -> Result<Response> {
+    let interface = match back.authenticate_searcher(auth.token()) {
+        Some(interface) => interface,
+        None => return Ok(StatusCode::FORBIDDEN.into())
+    };
+
+    let status: SearchRequestResponse = interface.search_status(code).await?;
+    Ok(Json(status).into_response())
 }
 
 #[derive(Deserialize)]

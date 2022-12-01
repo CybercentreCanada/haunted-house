@@ -8,10 +8,10 @@ mod database;
 mod database_rocksdb;
 mod database_sqlite;
 mod sqlite_kv;
-mod sqlite_kvd;
 mod interface;
 mod auth;
 mod cache;
+mod query;
 mod filter;
 
 use std::collections::{HashMap, HashSet};
@@ -53,7 +53,7 @@ impl ServerStatus {
     fn ingest_buffer(&self) -> usize {
         self.ingest_buffer
     }
-    
+
     #[getter]
     fn ingest_batch_active(&self) -> bool {
         self.ingest_batch_active

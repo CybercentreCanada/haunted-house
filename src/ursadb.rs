@@ -10,7 +10,7 @@ use crate::varint;
 
 
 const HEADER_SIZE: usize = 4 * 4;
-const OFFSET_TABLE_SIZE: u64 = (1 << 24 + 1) * 8;
+const OFFSET_TABLE_SIZE: u64 = ((1 << 24) + 1) * 8;
 
 pub struct UrsaDBTrigramFilter {
     file: std::fs::File,
@@ -68,7 +68,7 @@ impl UrsaDBTrigramFilter {
         return bytes;
     }
 
-    pub fn decode_indices(mut data: Vec<u8>) -> Result<Vec<u64>> {
+    pub fn decode_indices(data: Vec<u8>) -> Result<Vec<u64>> {
         let data = &mut &data[..];
         let mut diff = Vec::new();
         while !data.is_empty() {
@@ -105,8 +105,10 @@ impl UrsaDBTrigramFilter {
         for trigram in 0..(1<<24) {
             let mut indices = old.get_bucket_indices(trigram)?;
             for (local_index, vec) in data.iter().enumerate() {
-                if let Some(val) = vec.get(trigram as usize) && *val {
-                    indices.push(index_offset + local_index as u64);
+                if let Some(val) = vec.get(trigram as usize) {
+                    if *val {
+                        indices.push(index_offset + local_index as u64);
+                    }
                 }
             }
             if indices.len() > 0 {
@@ -122,6 +124,7 @@ impl UrsaDBTrigramFilter {
             file.write_all(&offset.to_le_bytes())?
         }
 
+        file.flush()?;
         return Ok(Self{
             file,
             table_offset: cursor_offset
@@ -166,6 +169,7 @@ impl UrsaDBTrigramFilter {
             file.write_all(&offset.to_le_bytes())?
         }
 
+        file.flush()?;
         return Ok(Self{
             file,
             table_offset: cursor_offset
@@ -272,6 +276,9 @@ impl UrsaDBTrigramFilter {
     }
 
     fn get_indices(&self, (start, end): (u64, u64)) -> Result<Vec<u64>> {
+        if start == end {
+            return Ok(vec![])
+        }
         let mut buffer = vec![0; (end-start).try_into()?];
         self.file.read_exact_at(&mut buffer, start)?;
         Ok(Self::decode_indices(buffer)?)
@@ -305,12 +312,24 @@ mod test {
         input.flush()?;
 
         let filter = tempfile::tempfile()?;
-        let filter = UrsaDBTrigramFilter::build(filter, vec![input.path().to_path_buf()])?;
 
-        for _ in 0..10 {
-            let index = rand::thread_rng().gen_range(0..input_data.len()-50);
-            let search = Vec::from(&input_data[index..index+50]);
-            assert_eq!(filter.search(&vec![search]).unwrap(), vec![0u64]);
+        let filter = {
+            let filter = UrsaDBTrigramFilter::build(filter, vec![input.path().to_path_buf()])?;
+            for _ in 0..10 {
+                let index = rand::thread_rng().gen_range(0..input_data.len()-50);
+                let search = Vec::from(&input_data[index..index+50]);
+                assert_eq!(filter.search(&vec![search]).unwrap(), vec![0u64]);
+            }
+            filter.file
+        };
+
+        {
+            let filter = UrsaDBTrigramFilter::open(filter).unwrap();
+            for _ in 0..10 {
+                let index = rand::thread_rng().gen_range(0..input_data.len()-50);
+                let search = Vec::from(&input_data[index..index+50]);
+                assert_eq!(filter.search(&vec![search]).unwrap(), vec![0u64]);
+            }
         }
 
         return Ok(())

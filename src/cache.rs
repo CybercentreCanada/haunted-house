@@ -61,11 +61,15 @@ impl FileHandle {
     }
 
     pub async fn size_to_fit(&self) -> Result<usize> {
+        self.resize(self.size().await?).await
+    }
+
+    pub async fn size(&self) -> Result<usize> {
         let handle = self.open()?;
         let meta = tokio::task::spawn_blocking(move ||{
             handle.metadata()
         }).await??;
-        self.resize(meta.len() as usize).await
+        return Ok(meta.len() as usize)
     }
 }
 

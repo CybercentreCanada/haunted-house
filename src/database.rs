@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::AccessControl;
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
+use crate::interface::{SearchRequest, SearchRequestResponse};
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
@@ -17,6 +18,10 @@ impl IndexGroup {
             Some(date) => format!("{}", date.format("%Y0%j")),
             None => format!("99990999"),
         })
+    }
+
+    pub fn min() -> IndexGroup {
+        IndexGroup(format!(""))
     }
 
     pub fn max() -> IndexGroup {
@@ -84,6 +89,12 @@ impl BlobID {
     }
 }
 
+impl std::fmt::Display for BlobID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 pub enum Database {
     // Rocks(RocksInterface),
     SQLite(SQLiteInterface),
@@ -136,5 +147,18 @@ impl Database {
             Database::SQLite(local) => local.list_indices().await,
         }
     }
+
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+        match self {
+            Database::SQLite(local) => local.initialize_search(req).await
+        }
+    }
+
+    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+        match self {
+            Database::SQLite(local) => local.search_status(code).await
+        }
+    }
+
 }
 

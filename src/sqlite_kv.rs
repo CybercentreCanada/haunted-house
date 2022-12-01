@@ -37,7 +37,7 @@ impl SKV {
     pub async fn create_collection(&self, name: &str) -> Result<Collection> {
         let mut con = self.connection.acquire().await?;
         sqlx::query(&format!("create table if not exists {name} (
-            key BLOB PRIMARY KEY,
+            key TEXT PRIMARY KEY,
             value BLOB NOT NULL
         )")).execute(&mut con).await?;
         Ok(Collection { con, name: name.to_owned() })
@@ -62,23 +62,42 @@ impl SKV {
 
 impl Collection {
 
+    fn key(key: &[u8]) -> String {
+        hex::encode(key)
+    }
+
+    fn decode(input: Vec<(String, Vec<u8>)>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = vec![];
+        for (key, value) in input {
+            out.push((hex::decode(key)?, value))
+        }
+        return Ok(out)
+    }
+
     pub async fn list_all(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let result: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {}", self.name))
+        let result: Vec<(String, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {}", self.name))
             .fetch_all(&mut self.con).await?;
-        return Ok(result)
+        return Ok(Self::decode(result)?)
     }
 
     pub async fn list_inclusive_range(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let result: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {} where key >= ? AND key <= ?", self.name))
-            .bind(start)
-            .bind(end)
-            .fetch_all(&mut self.con).await?;
-        return Ok(result)
+        let result: Vec<(String, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {} where key >= ? AND key <= ?", self.name))
+        .bind(Self::key(start))
+        .bind(Self::key(end))
+        .fetch_all(&mut self.con).await?;
+        return Ok(Self::decode(result)?)
+    }
+
+    pub async fn list_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let result: Vec<(String, Vec<u8>)> = sqlx::query_as(&format!("SELECT key, value FROM {} where key GLOB ?", self.name))
+        .bind(Self::key(prefix) + "*")
+        .fetch_all(&mut self.con).await?;
+        return Ok(Self::decode(result)?)
     }
 
     pub async fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         sqlx::query(&format!("INSERT INTO {}(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?;", self.name))
-            .bind(key)
+            .bind(Self::key(key))
             .bind(value)
             .bind(value)
             .execute(&mut self.con).await?;
@@ -87,7 +106,7 @@ impl Collection {
 
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut result: Vec<(Vec<u8>,)> = sqlx::query_as(&format!("SELECT value FROM {} WHERE key = ? LIMIT 1", self.name))
-            .bind(key)
+            .bind(Self::key(key))
             .fetch_all(&mut self.con).await?;
         if let Some(row) = result.pop() {
             Ok(Some(row.0))
@@ -96,11 +115,11 @@ impl Collection {
         }
     }
 
-    pub async fn remove(&mut self, key: &[u8]) -> Result<()> {
-        sqlx::query(&format!("DELETE FROM {} WHERE key = ?", self.name))
-            .bind(key)
+    pub async fn remove(&mut self, key: &[u8]) -> Result<bool> {
+        let res = sqlx::query(&format!("DELETE FROM {} WHERE key = ?", self.name))
+            .bind(Self::key(key))
             .execute(&mut self.con).await?;
-        return Ok(())
+        return Ok(res.rows_affected() > 0)
     }
 
     pub async fn cas(&mut self, key: &[u8], old: Option<&[u8]>, value: &[u8]) -> Result<bool> {
@@ -108,14 +127,14 @@ impl Collection {
             Some(old) => {
                 let result = sqlx::query(&format!("UPDATE {} SET value = ? WHERE key = ? AND value = ?", self.name))
                     .bind(value)
-                    .bind(key)
+                    .bind(Self::key(key))
                     .bind(old)
                     .execute(&mut self.con).await?;
                 return Ok(result.rows_affected() > 0)
             },
             None => {
                 let result = sqlx::query(&format!("INSERT INTO {}(key,value) VALUES(?,?)", self.name))
-                    .bind(key)
+                    .bind(Self::key(key))
                     .bind(value)
                     .execute(&mut self.con).await?;
                 return Ok(result.rows_affected() > 0)

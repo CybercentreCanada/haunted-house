@@ -50,7 +50,6 @@ async def main():
                             hash = bytes(await server.upload(file))
                             print(base64.b64encode(hash))
                             await server.ingest_file(hash, "", None)
-                            await asyncio.sleep(1)
 
                             await print_status()
         finally:

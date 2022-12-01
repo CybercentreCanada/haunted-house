@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::auth::Authenticator;
 use crate::database::{Database, IndexGroup, BlobID};
+use crate::interface::{SearchRequestResponse, SearchRequest};
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
@@ -73,6 +74,15 @@ impl HouseCore {
         self.ingest_queue.send(IngestMessage::Status(send))?;
         return Ok(recv.await?);
     }
+
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+        todo!("Launch watcher task");
+        self.database.initialize_search(req).await
+    }
+
+    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+        self.database.search_status(code).await
+    }
 }
 
 async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<IngestMessage>) {
@@ -93,6 +103,8 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     let mut batch_check_timer = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
+
+
         // Check if its time to launch an index building job
         if let Some(job) = &mut current_batch {
             if job.is_finished() {
@@ -129,7 +141,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     Some(message) => message,
                     None => break
                 };
-                
+
                 match message {
                     IngestMessage::IngestMessage(hash, access, expiry, respond) => {
                         // Make sure the hash value is correct
@@ -272,7 +284,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new
             // Upload the new index file
             let size = new_index_file.size_to_fit().await?;
             let new_blob = BlobID::new();
-            debug!("Ingest {} upload new index file as {}", index_group.as_str(), new_blob.as_str());
+            debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
             core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
 
             // Add the new values into the database corresponding to this index
@@ -285,6 +297,7 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new
             let index_file = core.local_cache.open(data_size).await?;
             debug!("Ingest {} downloading {}", index_group.as_str(), old_blob.as_str());
             core.index_storage.download(old_blob.as_str(), index_file.path()).await?;
+            debug!("Ingest {index_group} downloaded {old_blob} ({} bytes)", index_file.size().await?);
 
             debug!("Ingest {} creating local scratch space", index_group.as_str());
             let final_size = UrsaDBTrigramFilter::guess_max_size(data.len()) + data_size;
@@ -295,11 +308,11 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new
                 UrsaDBTrigramFilter::merge_in_data(out_handle, index_file.open()?, data, new_data_offset)?;
                 return Ok(())
             }).await?;
-            
+
             // Upload the new index file
             let new_blob = BlobID::new();
             let size = new_index_file.size_to_fit().await?;
-            debug!("Ingest {} upload new index file as {}", index_group.as_str(), new_blob.as_str());
+            debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
             core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
 
             // Add the new values into the database corresponding to this index

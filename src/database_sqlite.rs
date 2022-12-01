@@ -1,10 +1,14 @@
+use std::collections::{HashSet, BTreeSet};
+
 use anyhow::Result;
 use log::{error, info, debug};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
 use crate::database::{IndexGroup, BlobID, IndexID};
+use crate::interface::{SearchRequest, SearchRequestResponse};
 use crate::sqlite_kv::{SKV, Collection};
+use crate::query::Query;
 
 
 pub struct SQLiteInterface {
@@ -128,8 +132,8 @@ impl SQLiteInterface {
         let mut index_index = self.open_directory_column().await?;
         let mut best: Option<IndexEntry> = None;
 
-        let list = index_index.list_inclusive_range(index_group.as_bytes(), index_group.as_bytes()).await?;
-        debug!("selecting index to expand from {} options", list.len());
+        let list = index_index.list_prefix(index_group.as_bytes()).await?;
+        debug!("selecting index to expand from {} options prefix {}", list.len(), index_group);
 
         for (_key, value) in list {
             let value: IndexEntry = match postcard::from_bytes(&value) {
@@ -212,12 +216,12 @@ impl SQLiteInterface {
                     entry.current_blob = blob_id.clone();
                     (entry, Some(&buffer[..]))
                 },
-                None => (IndexEntry{ 
-                    group: index_group.clone(), 
-                    label: index_id.clone(), 
-                    current_blob: blob_id.clone(), 
-                    size_bytes: new_size as u64, 
-                    size_entries: new_entries 
+                None => (IndexEntry{
+                    group: index_group.clone(),
+                    label: index_id.clone(),
+                    current_blob: blob_id.clone(),
+                    size_bytes: new_size as u64,
+                    size_entries: new_entries
                 }, None),
             };
 
@@ -238,4 +242,40 @@ impl SQLiteInterface {
             .collect())
     }
 
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+        let start = match req.start_date {
+            Some(value) => IndexGroup::create(&Some(value)),
+            None => IndexGroup::min(),
+        };
+        let end = match req.end_date {
+            Some(value) => IndexGroup::create(&Some(value)),
+            None => IndexGroup::max(),
+        };
+
+
+
+        todo!();
+    }
+
+    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+        todo!()
+    }
+
+}
+
+
+#[derive(Serialize, Deserialize)]
+struct SearchRecord {
+    key: String,
+    yara_signature: String,
+    query: Query,
+    pending_indices: Vec<BlobID>,
+    pending_files: BTreeSet<Vec<u8>>,
+    hit_files: BTreeSet<Vec<u8>>
+}
+
+#[derive(Serialize, Deserialize)]
+struct AssignmentRecord {
+    time: chrono::DateTime<chrono::Utc>,
+    node: String,
 }
