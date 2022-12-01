@@ -88,24 +88,45 @@ impl UrsaDBTrigramFilter {
         HEADER_SIZE + OFFSET_TABLE_SIZE as usize + files * 8
     }
 
-    // pub fn merge_in_data(mut file: std::fs::File, old: std::fs::File, data: Vec<BitVec>) -> Result<(Self, usize)> {
-    //     let old = Self::open(old)?;
+    pub fn merge_in_data(mut file: std::fs::File, old: std::fs::File, data: Vec<BitVec>, index_offset: u64) -> Result<Self> {
+        let old = Self::open(old)?;
 
-    //     // Write header
-    //     file.seek(SeekFrom::Start(0))?;
-    //     file.write_all(&0xCA7DA7Au32.to_le_bytes())?;
-    //     file.write_all(&6u32.to_le_bytes())?;
-    //     file.write_all(&0u32.to_le_bytes())?;
-    //     file.write_all(&0u32.to_le_bytes())?;
+        // Write header
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&0xCA7DA7Au32.to_le_bytes())?;
+        file.write_all(&6u32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
 
-    //     // Write the bin data, tracking the offsets
-    //     let mut cursor_offset: u64 = HEADER_SIZE as u64;
-    //     let mut offsets: Vec<u64> = vec![cursor_offset];
+        // Write the bin data, tracking the offsets
+        let mut cursor_offset: u64 = HEADER_SIZE as u64;
+        let mut offsets: Vec<u64> = vec![cursor_offset];
 
+        for trigram in 0..(1<<24) {
+            let mut indices = old.get_bucket_indices(trigram)?;
+            for (local_index, vec) in data.iter().enumerate() {
+                if let Some(val) = vec.get(trigram as usize) && *val {
+                    indices.push(index_offset + local_index as u64);
+                }
+            }
+            if indices.len() > 0 {
+                let bytes: Vec<u8> = Self::encode_indices(indices);
+                cursor_offset += bytes.len() as u64;
+                file.write_all(&bytes)?;
+            }
+            offsets.push(cursor_offset);
+        }
 
+        // Write the offsets
+        for offset in offsets {
+            file.write_all(&offset.to_le_bytes())?
+        }
 
-    //     todo!();
-    // }
+        return Ok(Self{
+            file,
+            table_offset: cursor_offset
+        })
+    }
 
     pub fn build_from_data(mut file: std::fs::File, raw_data: Vec<BitVec>) -> Result<Self> {
 
@@ -197,15 +218,6 @@ impl UrsaDBTrigramFilter {
         return Ok(filter)
     }
 
-    fn get_bucket_range(&self, index: u32) -> Result<(u64, u64)> {
-        let mut buf: [u8; 8 * 2] = [0; 8 * 2];
-        self.file.read_exact_at(&mut buf, self.table_offset + index as u64 * 8)?;
-        Ok((
-            u64::from_le_bytes(buf[0..8].try_into()?),
-            u64::from_le_bytes(buf[8..16].try_into()?),
-        ))
-    }
-
     fn search(&self, targets: &Vec<Vec<u8>>) -> Result<Vec<u64>> {
         // Get the trigrams we are interested in
         let mut trigrams: Vec<u32> = Default::default();
@@ -250,10 +262,24 @@ impl UrsaDBTrigramFilter {
         return Ok(items.into_iter().collect())
     }
 
+    fn get_bucket_range(&self, index: u32) -> Result<(u64, u64)> {
+        let mut buf: [u8; 8 * 2] = [0; 8 * 2];
+        self.file.read_exact_at(&mut buf, self.table_offset + index as u64 * 8)?;
+        Ok((
+            u64::from_le_bytes(buf[0..8].try_into()?),
+            u64::from_le_bytes(buf[8..16].try_into()?),
+        ))
+    }
+
     fn get_indices(&self, (start, end): (u64, u64)) -> Result<Vec<u64>> {
         let mut buffer = vec![0; (end-start).try_into()?];
         self.file.read_exact_at(&mut buffer, start)?;
         Ok(Self::decode_indices(buffer)?)
+    }
+
+    fn get_bucket_indices(&self, index: u32) -> Result<Vec<u64>> {
+        let (start, end) = self.get_bucket_range(index)?;
+        self.get_indices((start, end))
     }
 }
 

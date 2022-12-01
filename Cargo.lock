@@ -38,6 +38,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98161a4e3e2184da77bb14f02184cdd111e83bbbcc9979dfee3c44b9a85f5602"
 
 [[package]]
+name = "arc-swap"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "983cd8b9d4b02a6dc6ffa557262eb5858a27a0038ffffe21a0f133eaa819a164"
+
+[[package]]
 name = "assertor"
 version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -608,17 +614,18 @@ dependencies = [
  "anyhow",
  "assertor",
  "async-trait",
- "base64",
  "bitvec",
  "chrono",
  "env_logger",
  "futures",
+ "hex",
  "itertools",
  "log",
  "poem",
  "postcard",
  "pyo3",
  "pyo3-asyncio",
+ "pyo3-log",
  "rand",
  "serde",
  "serde_json",
@@ -1229,6 +1236,17 @@ checksum = "0f6cb136e222e49115b3c51c32792886defbfb0adead26a688142b346a0b9ffc"
 dependencies = [
  "libc",
  "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-log"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5695ccff5060c13ca1751cf8c857a12da9b0bf0378cb071c5e0326f7c7e4c1b"
+dependencies = [
+ "arc-swap",
+ "log",
+ "pyo3",
 ]
 
 [[package]]

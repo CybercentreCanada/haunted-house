@@ -1,5 +1,8 @@
+// pub use crate::sqlite_kvd::{SKV, Collection};
+
+use log::info;
 use sqlx::{Sqlite, SqlitePool};
-use sqlx::pool::PoolConnection;
+use sqlx::pool::{PoolConnection, PoolOptions};
 
 use anyhow::Result;
 
@@ -15,7 +18,17 @@ pub struct Collection {
 impl SKV {
 
     pub async fn open(path: &str) -> Result<SKV> {
-        let pool = SqlitePool::connect(&format!("sqlite:{path}")).await?;
+        let url = format!("sqlite:{path}");
+        info!("Loading SKV at {url}");
+
+        let pool = PoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_lazy(&url)?;
+        info!("SQLite connected.");
+        pool.acquire().await?;
+        info!("SQLite ready.");
+
+        // let pool = SqlitePool::connect_with(options).await?;
         Ok(SKV {
             connection: pool
         })

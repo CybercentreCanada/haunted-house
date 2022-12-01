@@ -102,7 +102,7 @@ pub struct LocalCache {
 
 impl LocalCache {
 
-    pub fn new(capacity: usize, path: PathBuf) -> Self {
+    pub async fn new(capacity: usize, path: PathBuf) -> Self {
         let (daemon, send) = Inner::new(capacity, path);
 
         tokio::spawn(daemon.run());
@@ -384,7 +384,7 @@ mod test {
 
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let cache = LocalCache::new(cache_size, cache_dir.path().to_owned());
+        let cache = LocalCache::new(cache_size, cache_dir.path().to_owned()).await;
         let sample_size = 128;
 
         // Add some data
@@ -409,7 +409,7 @@ mod test {
 
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let cache = LocalCache::new(cache_size, cache_dir.path().to_owned());
+        let cache = LocalCache::new(cache_size, cache_dir.path().to_owned()).await;
 
         let oversize = cache_size + 1;
         assert_eq!(cache.open(oversize).await.unwrap_err().downcast::<crate::error::ErrorKinds>().unwrap(), crate::error::ErrorKinds::BlobTooLargeForCache);
@@ -428,7 +428,7 @@ mod test {
         init();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let cache = LocalCache::new(cache_size, cache_dir.path().to_owned());
+        let cache = LocalCache::new(cache_size, cache_dir.path().to_owned()).await;
         let sample_size = 512;
 
         //

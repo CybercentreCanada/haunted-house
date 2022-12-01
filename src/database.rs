@@ -14,8 +14,8 @@ pub struct IndexGroup(String);
 impl IndexGroup {
     pub fn create(expiry: &Option<DateTime<Utc>>) -> IndexGroup {
         IndexGroup(match expiry {
-            Some(date) => format!("{}", date.format("%Y-%j")),
-            None => format!("9999-999"),
+            Some(date) => format!("{}", date.format("%Y0%j")),
+            None => format!("99990999"),
         })
     }
 
@@ -32,12 +32,18 @@ impl IndexGroup {
     }
 }
 
+impl std::fmt::Display for IndexGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct IndexID(String);
 
 impl IndexID {
     pub fn new() -> Self {
-        IndexID(uuid::Uuid::new_v4().to_string())
+        IndexID(format!("{:x}", uuid::Uuid::new_v4().as_u128()))
     }
 
     pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
@@ -55,12 +61,18 @@ impl From<&str> for IndexID {
     }
 }
 
+impl std::fmt::Display for IndexID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct BlobID(String);
 
 impl BlobID {
     pub fn new() -> Self {
-        BlobID(uuid::Uuid::new_v4().to_string())
+        Self(format!("{:x}", uuid::Uuid::new_v4().as_u128()))
     }
 
     pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
@@ -83,8 +95,12 @@ impl Database {
     //     Ok(Database::Rocks(RocksInterface::new(index_soft_max)?))
     // }
 
-    pub async fn new_sqlite(index_soft_max: usize, path: &str) -> Result<Self> {
+    pub async fn new_sqlite(index_soft_max: u64, path: &str) -> Result<Self> {
         Ok(Database::SQLite(SQLiteInterface::new(index_soft_max, path).await?))
+    }
+
+    pub async fn new_sqlite_temp(index_soft_max: u64) -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new_temp(index_soft_max).await?))
     }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {
@@ -94,24 +110,30 @@ impl Database {
         }
     }
 
-    pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID)>> {
+    pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, u64)>> {
         match self {
             // Database::Rocks(local) => local.select_index_to_grow(index_group).await,
             Database::SQLite(local) => local.select_index_to_grow(index_group).await,
         }
     }
 
-    pub async fn create_index_data(&self, index_group: &IndexGroup, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, new_size: usize) -> Result<()> {
+    pub async fn create_index_data(&self, index_group: &IndexGroup, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, new_size: u64) -> Result<()> {
         match self {
             // Database::Rocks(local) => local.create_index_data(index_group, index_id, old_blob_id, blob_id, meta, new_size).await,
             Database::SQLite(local) => local.create_index_data(index_group, blob_id, meta, new_size).await,
         }
     }
 
-    pub async fn update_index_data(&self, index_group: &IndexGroup, index_id: IndexID, old_blob_id: BlobID, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, index_offset: usize, new_size: usize) -> Result<()> {
+    pub async fn update_index_data(&self, index_group: &IndexGroup, index_id: IndexID, old_blob_id: BlobID, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, index_offset: u64, new_size: u64) -> Result<()> {
         match self {
             // Database::Rocks(local) => local.update_index_data(index_group, index_id, old_blob_id, blob_id, meta, index_offset, new_size).await,
             Database::SQLite(local) => local.update_index_data(index_group, index_id, &old_blob_id, &blob_id, meta, index_offset, new_size).await,
+        }
+    }
+
+    pub async fn list_indices(&self) -> Result<Vec<(IndexGroup, IndexID)>> {
+        match self {
+            Database::SQLite(local) => local.list_indices().await,
         }
     }
 }
