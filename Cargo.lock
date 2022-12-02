@@ -635,6 +635,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "uuid",
+ "weak-self",
 ]
 
 [[package]]
@@ -2119,6 +2120,12 @@ name = "wasm-bindgen-shared"
 version = "0.2.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c38c045535d93ec4f0b4defec448e4291638ee608530863b1e2ba115d4fff7f"
+
+[[package]]
+name = "weak-self"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1adf4fa83841b67d540af7c28ee0326fc298337fd4cc99b71c148caa7a830de0"
 
 [[package]]
 name = "web-sys"

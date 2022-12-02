@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
+use weak_self::WeakSelf;
 
 
 #[derive(Debug)]
@@ -39,7 +40,7 @@ impl Default for Config {
 }
 
 pub struct HouseCore {
-    // pub runtime: tokio::runtime::Runtime,
+    weak_self: WeakSelf<Self>, 
     pub database: Database,
     pub file_storage: BlobStorage,
     pub index_storage: BlobStorage,
@@ -53,8 +54,8 @@ impl HouseCore {
     pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, local_cache: LocalCache, authenticator: Authenticator, config: Config) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
-        let core = Arc::new(Self {
-            // runtime,
+        let mut core = Arc::new(Self {
+            weak_self: WeakSelf::new(),
             database,
             file_storage,
             index_storage,
@@ -63,6 +64,7 @@ impl HouseCore {
             ingest_queue: send_ingest,
             config
         });
+        core.weak_self.init(&core);
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
 
@@ -76,8 +78,11 @@ impl HouseCore {
     }
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
-        todo!("Launch watcher task");
-        self.database.initialize_search(req).await
+        let res = self.database.initialize_search(req).await?;
+        if let Some(core) = self.weak_self.get().upgrade() {
+            tokio::spawn(search_watcher(core, res.code.clone()));
+        }
+        return Ok(res)
     }
 
     pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
@@ -346,4 +351,9 @@ async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result
     };
 
     return (hash, result)
+}
+
+
+async fn search_watcher(core: Arc<HouseCore>, search_code: String){
+    todo!()
 }

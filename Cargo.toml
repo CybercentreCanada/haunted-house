@@ -20,7 +20,7 @@ log = "*"
 env_logger = "0.9"
 bitvec = "*"
 hex = "*"
-
+weak-self = "*"
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

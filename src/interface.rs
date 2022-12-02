@@ -80,12 +80,12 @@ pub struct SearchRequest {
 
 #[derive(Serialize)]
 pub struct SearchRequestResponse {
-    code: String,
-    finished: bool,
-    errors: Vec<String>,
-    pending_indices: u64,
-    pending_candidates: u64,
-    hits: Vec<String>,
+    pub code: String,
+    pub finished: bool,
+    pub errors: Vec<String>,
+    pub pending_indices: u64,
+    pub pending_candidates: u64,
+    pub hits: Vec<String>,
 }
 
 #[handler]
