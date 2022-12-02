@@ -79,9 +79,9 @@ impl HouseCore {
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
         let res = self.database.initialize_search(req).await?;
-        if let Some(core) = self.weak_self.get().upgrade() {
-            tokio::spawn(search_watcher(core, res.code.clone()));
-        }
+        // if let Some(core) = self.weak_self.get().upgrade() {
+        //     tokio::spawn(search_watcher(core, res.code.clone()));
+        // }
         return Ok(res)
     }
 
@@ -90,11 +90,11 @@ impl HouseCore {
     }
 
     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
-        todo!()
+        self.database.get_work(req).await
     }
 
     pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
-        todo!()
+        self.database.finish_work(req).await
     }
 }
 

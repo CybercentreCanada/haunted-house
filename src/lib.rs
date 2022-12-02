@@ -5,7 +5,6 @@ mod access;
 mod storage;
 mod core;
 mod database;
-mod database_rocksdb;
 mod database_sqlite;
 mod sqlite_kv;
 mod interface;

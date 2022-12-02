@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
 use crate::database::{IndexGroup, BlobID, IndexID};
-use crate::interface::{SearchRequest, SearchRequestResponse};
+use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult};
 use crate::sqlite_kv::{SKV, Collection};
 use crate::query::Query;
 
@@ -72,6 +72,14 @@ impl SQLiteInterface {
 
     async fn open_search_column(&self) -> Result<Collection<SearchRecord>> {
         Ok(self.kv.create_collection("searches").await?)
+    }
+
+    async fn open_filter_task_column(&self) -> Result<Collection<FilterTask>> {
+        Ok(self.kv.create_collection("filter_tasks").await?)
+    }
+
+    async fn open_active_task_column(&self) -> Result<Collection<String>> {
+        Ok(self.kv.create_collection("active_tasks").await?)
     }
 
     async fn open_garbage_column(&self) -> Result<Collection<String>> {
@@ -265,10 +273,10 @@ impl SQLiteInterface {
             hit_files: Default::default(),
         }).await?;
 
-        let mut collection = self.kv.create_collection("search_tasks").await?;
+        let mut collection = self.open_filter_task_column().await?;
 
         for index in pending {
-            collection.set(format!("{index}-{code}").as_bytes(), &SearchTask::Filter {
+            collection.set(format!("{index}-{code}").as_bytes(), &FilterTask {
                 code: code.clone(), query: req.query.clone(), filter: index
             }).await?
         }
@@ -293,6 +301,14 @@ impl SQLiteInterface {
         })
     }
 
+    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+        todo!();
+    }
+
+    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
+        todo!();
+    }
+
 }
 
 
@@ -308,9 +324,12 @@ struct SearchRecord {
 
 
 #[derive(Serialize, Deserialize)]
-enum SearchTask {
-    Filter{code: String, query: Query, filter: BlobID}
+struct FilterTask{
+    code: String,
+    query: Query,
+    filter: BlobID
 }
+
 
 // #[derive(Serialize, Deserialize)]
 // struct AssignmentRecord {

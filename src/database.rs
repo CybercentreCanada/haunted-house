@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::AccessControl;
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
-use crate::interface::{SearchRequest, SearchRequestResponse};
+use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult};
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
@@ -157,6 +157,18 @@ impl Database {
     pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
         match self {
             Database::SQLite(local) => local.search_status(code).await
+        }
+    }
+
+    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+        match self {
+            Database::SQLite(local) => local.get_work(req).await
+        }
+    }
+
+    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.finish_work(req).await
         }
     }
 
