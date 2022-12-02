@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use poem::http::StatusCode;
 use poem::middleware::AddData;
-use poem::{post, EndpointExt, Response};
+use poem::{post, EndpointExt, Response, Endpoint, Middleware, Request, FromRequest};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
@@ -19,38 +19,100 @@ use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
 
-#[derive(Clone)]
-struct TokenCheck {
-    core: Arc<HouseCore>
+struct TokenMiddleware {
+    core: Arc<HouseCore>,
 }
 
-impl TokenCheck {
-    pub fn new(core: Arc<HouseCore>) -> Self {
-        Self {
-            core
-        }
-    }
-
-    pub fn authenticate_worker(&self, token: &str) -> Option<WorkerInterface> {
-        if self.core.authenticator.is_role_assigned(token, Role::Worker) {
-            Some(WorkerInterface { core: self.core.clone() })
-        } else {
-            None
-        }
-    }
-
-    pub fn authenticate_searcher(&self, token: &str) -> Option<SearcherInterface> {
-        if self.core.authenticator.is_role_assigned(token, Role::Search) {
-            Some(SearcherInterface { core: self.core.clone() })
-        } else {
-            None
-        }
+impl TokenMiddleware {
+    fn new(core: Arc<HouseCore>) -> Self {
+        Self{core}
     }
 }
+
+impl<E: Endpoint> Middleware<E> for TokenMiddleware {
+    type Output = TokenMiddlewareImpl<E>;
+
+    fn transform(&self, ep: E) -> Self::Output {
+        TokenMiddlewareImpl { ep, core: self.core.clone() }
+    }
+}
+
+struct TokenMiddlewareImpl<E> {
+    ep: E,
+    core: Arc<HouseCore>,
+}
+
+
+#[poem::async_trait]
+impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
+    type Output = E::Output;
+
+    async fn call(&self, mut req: Request) -> poem::Result<Self::Output> {
+        let roles = match BearerToken::from_request_without_body(&req).await {
+            Ok(token) => self.core.authenticator.get_roles(token.token())?,
+            Err(_) => Default::default()
+        };
+
+        if roles.contains(&Role::Worker) {
+            req.extensions_mut().insert(WorkerInterface::new(self.core.clone()));
+        }
+
+        if roles.contains(&Role::Search) {
+            req.extensions_mut().insert(SearcherInterface::new(self.core.clone()));
+        }
+
+        // call the next endpoint.
+        self.ep.call(req).await
+    }
+}
+
+
+// #[derive(Clone)]
+// struct TokenCheck {
+//     core: Arc<HouseCore>
+// }
+
+// impl TokenCheck {
+//     pub fn new(core: Arc<HouseCore>) -> Self {
+//         Self {
+//             core
+//         }
+//     }
+
+//     pub fn authenticate_worker(&self, token: &str) -> Option<WorkerInterface> {
+//         if self.core.authenticator.is_role_assigned(token, Role::Worker) {
+//             Some(WorkerInterface { core: self.core.clone() })
+//         } else {
+//             None
+//         }
+//     }
+
+//     pub fn authenticate_searcher(&self, token: &str) -> Option<SearcherInterface> {
+//         if self.core.authenticator.is_role_assigned(token, Role::Search) {
+//             Some(SearcherInterface { core: self.core.clone() })
+//         } else {
+//             None
+//         }
+//     }
+// }
 
 
 struct WorkerInterface {
     core: Arc<HouseCore>
+}
+
+impl WorkerInterface {
+    pub fn new(core: Arc<HouseCore>) -> Self {
+        Self{core}
+    }
+
+    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+        self.core.get_work(req).await
+    }
+
+    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
+        self.core.finish_work(req).await
+    }
 }
 
 struct SearcherInterface {
@@ -58,6 +120,10 @@ struct SearcherInterface {
 }
 
 impl SearcherInterface {
+    pub fn new(core: Arc<HouseCore>) -> Self {
+        Self{core}
+    }
+
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
         self.core.initialize_search(req).await
     }
@@ -89,45 +155,38 @@ pub struct SearchRequestResponse {
 }
 
 #[handler]
-async fn add_search(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<SearchRequest>) -> Result<Response> {
-    let interface = match back.authenticate_searcher(auth.token()) {
-        Some(interface) => interface,
-        None => return Ok(StatusCode::FORBIDDEN.into())
-    };
-
-    let status: SearchRequestResponse = interface.initialize_search(request).await?;
-    Ok(Json(status).into_response())
+async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<SearchRequest>) -> Result<Json<SearchRequestResponse>> {
+    Ok(Json(interface.initialize_search(request).await?))
 }
 
 #[handler]
-async fn search_status(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Path(code): Path<String>) -> Result<Response> {
-    let interface = match back.authenticate_searcher(auth.token()) {
-        Some(interface) => interface,
-        None => return Ok(StatusCode::FORBIDDEN.into())
-    };
+async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>) -> Result<Json<SearchRequestResponse>> {
+    Ok(Json(interface.search_status(code).await?))
+}
 
-    let status: SearchRequestResponse = interface.search_status(code).await?;
-    Ok(Json(status).into_response())
+#[derive(Serialize)]
+pub struct WorkPackage {
+
 }
 
 #[derive(Deserialize)]
-struct WorkRequest {
+pub struct WorkRequest {
 
 }
 
 #[handler]
-fn get_work(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<WorkRequest>) -> String {
-    format!("hello: {}", auth.token())
+async fn get_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkRequest>) -> Result<Json<WorkPackage>> {
+    Ok(Json(interface.get_work(request).await?))
 }
 
 #[derive(Deserialize)]
-struct WorkResult {
+pub struct WorkResult {
 
 }
 
 #[handler]
-fn finish_work(TypedHeader(auth): BearerToken, back: Data<&TokenCheck>, Json(request): Json<WorkResult>) -> String {
-    format!("hello: {}", auth.token())
+async fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> Result<()> {
+    Ok(interface.finish_work(request).await?)
 }
 
 pub async fn serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std::io::Error> {
@@ -136,7 +195,7 @@ pub async fn serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std
         .at("/search/:code", get(search_status))
         .at("/work/", get(get_work))
         .at("/finished/", get(finish_work))
-        .with(AddData::new(TokenCheck::new(core)));
+        .with(TokenMiddleware::new(core));
 
     Server::new(TcpListener::bind(bind_address))
         .run(app)

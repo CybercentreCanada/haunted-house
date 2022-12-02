@@ -70,23 +70,27 @@ impl SQLiteInterface {
         })
     }
 
-    pub async fn open_garbage_column(&self) -> Result<Collection<String>> {
+    async fn open_search_column(&self) -> Result<Collection<SearchRecord>> {
+        Ok(self.kv.create_collection("searches").await?)
+    }
+
+    async fn open_garbage_column(&self) -> Result<Collection<String>> {
         Ok(self.kv.create_collection("garbage_blobs").await?)
     }
 
-    pub async fn open_directory_column(&self) -> Result<Collection<IndexEntry>> {
+    async fn open_directory_column(&self) -> Result<Collection<IndexEntry>> {
         Ok(self.kv.create_collection("index_index").await?)
     }
 
-    pub async fn open_index_column(&self, name: &IndexID) -> Result<Option<Collection<FileEntry>>> {
+    async fn open_index_column(&self, name: &IndexID) -> Result<Option<Collection<FileEntry>>> {
         Ok(self.kv.open_collection(&format!("index_{}", name.as_str())).await?)
     }
 
-    pub async fn create_index_column(&self, name: &IndexID) -> Result<Collection<FileEntry>> {
+    async fn create_index_column(&self, name: &IndexID) -> Result<Collection<FileEntry>> {
         Ok(self.kv.create_collection(&format!("index_{}", name.as_str())).await?)
     }
 
-    pub async fn update_file_access(&self, hash: Vec<u8>, access: &AccessControl, new_index_group: &IndexGroup) -> Result<bool> {
+    pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, new_index_group: &IndexGroup) -> Result<bool> {
         // Get all the groups that expire later than this one
         let mut index_index = self.open_directory_column().await?;
         let mut list = index_index.list_inclusive_prefix_range(new_index_group.as_bytes(), IndexGroup::max().as_bytes()).await?;
@@ -113,7 +117,7 @@ impl SQLiteInterface {
 
                         let entry = FileEntry{
                             access: access.or(&old.access).simplify(),
-                            hash: hash.clone(),
+                            hash: Vec::from(hash),
                         };
 
                         if col.cas(hash_index, &Some(old), &entry).await? {
@@ -250,7 +254,7 @@ impl SQLiteInterface {
             .map(|(_, value)|value.current_blob)
             .collect();
 
-        let mut collection = self.kv.create_collection("searches").await?;
+        let mut collection = self.open_search_column().await?;
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
         collection.set(code.as_bytes(), &SearchRecord{
             code: code.clone(),
@@ -259,13 +263,13 @@ impl SQLiteInterface {
             pending_indices: pending.clone(),
             pending_files: Default::default(),
             hit_files: Default::default(),
-        });
+        }).await?;
 
         let mut collection = self.kv.create_collection("search_tasks").await?;
 
         for index in pending {
-            collection.set(format!("{index}-{code}").as_bytes(), &SearchTask::Filter { 
-                code: code.clone(), query: req.query.clone(), filter: index 
+            collection.set(format!("{index}-{code}").as_bytes(), &SearchTask::Filter {
+                code: code.clone(), query: req.query.clone(), filter: index
             }).await?
         }
 
@@ -273,7 +277,20 @@ impl SQLiteInterface {
     }
 
     pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
-        todo!()
+        let mut collection = self.open_search_column().await?;
+        let search = match collection.get(code.as_bytes()).await? {
+            Some(search) => search,
+            None => return Err(anyhow::anyhow!("Search code not found"))
+        };
+
+        Ok(SearchRequestResponse{
+            code,
+            finished: search.pending_indices.is_empty() && search.pending_files.is_empty(),
+            errors: vec![],
+            pending_indices: search.pending_indices.len() as u64,
+            pending_candidates: search.pending_files.len() as u64,
+            hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
+        })
     }
 
 }

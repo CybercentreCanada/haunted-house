@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::auth::Authenticator;
 use crate::database::{Database, IndexGroup, BlobID};
-use crate::interface::{SearchRequestResponse, SearchRequest};
+use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage};
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
@@ -40,7 +40,7 @@ impl Default for Config {
 }
 
 pub struct HouseCore {
-    weak_self: WeakSelf<Self>, 
+    weak_self: WeakSelf<Self>,
     pub database: Database,
     pub file_storage: BlobStorage,
     pub index_storage: BlobStorage,
@@ -87,6 +87,14 @@ impl HouseCore {
 
     pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
         self.database.search_status(code).await
+    }
+
+    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+        todo!()
+    }
+
+    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
+        todo!()
     }
 }
 

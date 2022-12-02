@@ -197,9 +197,9 @@ mod test {
 
         assert!(b.list_all().await?.is_empty());
         assert_that!(a.list_all().await?).contains_exactly(vec![
-            (b"abc".to_vec(), v123),
-            (b"abc1".to_vec(), v456),
-            (b"abc2".to_vec(), v789)
+            (b"abc".to_vec(), v123.clone()),
+            (b"abc1".to_vec(), v456.clone()),
+            (b"abc2".to_vec(), v789.clone())
         ]);
 
         let v000 = "000".to_owned();
@@ -208,14 +208,14 @@ mod test {
         assert!(a.cas(b"abc", &Some("123".to_string()), &v000).await?);
         assert!(!a.cas(b"abc", &Some("0000".to_string()), &vdash).await?);
         assert_that!(a.list_all().await?).contains_exactly(vec![
-            (b"abc".to_vec(), v000),
-            (b"abc1".to_vec(), v456),
-            (b"abc2".to_vec(), v789)
+            (b"abc".to_vec(), v000.clone()),
+            (b"abc1".to_vec(), v456.clone()),
+            (b"abc2".to_vec(), v789.clone())
         ]);
 
-        assert_that!(a.list_inclusive_prefix_range(b"abc", b"abc").await?).contains_exactly(vec![(b"abc".to_vec(), v000)]);
-        assert_that!(a.list_inclusive_prefix_range(b"abc1", b"abc1").await?).contains_exactly(vec![(b"abc1".to_vec(), v456)]);
-        assert_that!(a.list_inclusive_prefix_range(b"abc2", b"abc2").await?).contains_exactly(vec![(b"abc2".to_vec(), v789)]);
+        // assert_that!(a.list_prefix(b"abc").await?).contains_exactly(vec![(b"abc".to_vec(), v000)]);
+        assert_that!(a.list_inclusive_prefix_range(b"abc1", b"abc1").await?).contains_exactly(vec![(b"abc1".to_vec(), v456.clone())]);
+        assert_that!(a.list_inclusive_prefix_range(b"abc2", b"abc2").await?).contains_exactly(vec![(b"abc2".to_vec(), v789.clone())]);
         assert_that!(a.list_inclusive_prefix_range(b"abc3", b"abc9").await?).contains_exactly(vec![]);
 
         assert_that!(a.list_inclusive_prefix_range(b"abc1", b"abc2").await?).contains_exactly(vec![
@@ -223,12 +223,12 @@ mod test {
             (b"abc2".to_vec(), v789)
         ]);
 
-        a.set(b"abb-10", &vdash).await?;
         a.set(b"abd-10", &vdash).await?;
+        a.set(b"abe-10", &vdash).await?;
 
-        assert_that!(a.list_inclusive_prefix_range(b"abb", b"abd").await?).contains_exactly(vec![
-            (b"abb-10".to_vec(), vdash),
-            (b"abd-10".to_vec(), vdash)
+        assert_that!(a.list_inclusive_prefix_range(b"abd", b"abe").await?).contains_exactly(vec![
+            (b"abd-10".to_vec(), vdash.clone()),
+            (b"abe-10".to_vec(), vdash)
         ]);
 
         return Ok(())

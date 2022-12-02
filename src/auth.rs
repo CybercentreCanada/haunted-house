@@ -6,7 +6,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyTuple, PyBool};
 use pyo3::{Py, PyAny, IntoPy, PyObject, intern, FromPyObject, Python};
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
 pub enum Role {
     Search,
     Worker
@@ -68,6 +68,16 @@ impl Authenticator {
         Ok(Authenticator::Python(PythonAuthenticator::new(object)))
     }
 
+    pub fn get_roles(&self, token: &str) -> Result<HashSet<Role>> {
+        match self {
+            Authenticator::Static(data) => Ok(match data.get(token) {
+                Some(roles) => roles.clone(),
+                None => Default::default()
+            }),
+            Authenticator::Python(obj) => obj.get_roles(token),
+        }
+    }
+
     pub fn is_role_assigned(&self, token: &str, role: Role) -> bool {
         match self {
             Authenticator::Static(data) => match data.get(token) {
@@ -88,6 +98,17 @@ pub struct PythonAuthenticator {
 impl PythonAuthenticator {
     pub fn new(object: Py<PyAny>) -> Self {
         Self {object}
+    }
+
+    pub fn get_roles(&self, token: &str) -> Result<HashSet<Role>> {
+        // Invoke method
+        Ok(Python::with_gil(|py| {
+            // calling the py_sleep method like a normal function returns a coroutine
+            let args = PyTuple::new(py, &[token.to_string()]);
+            let result = self.object.call_method1(py, "get_roles", args)?;
+            let result: HashSet<Role> = result.extract(py).unwrap_or_default();
+            anyhow::Ok(result)
+        })?)
     }
 
     pub fn is_role_assigned(&self, token: &str, role: Role) -> bool {
