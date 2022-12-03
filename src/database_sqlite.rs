@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path};
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use futures::{TryStreamExt};
 use log::{debug};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use sqlx::pool::PoolOptions;
 use crate::access::AccessControl;
 use crate::core::SearchCache;
 use crate::database::{IndexGroup, BlobID, IndexID};
-use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult, FilterTask, YaraTask};
+use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, FilterTask, YaraTask};
 use crate::query::Query;
 
 impl<'r> Decode<'r, sqlx::Sqlite> for IndexGroup {
@@ -55,7 +55,8 @@ impl sqlx::Type<sqlx::Sqlite> for BlobID {
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    index_soft_max: u64,
+    index_soft_bytes_max: u64,
+    index_soft_entries_max: u64,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -102,7 +103,7 @@ struct SearchRecord {
 
 
 impl SQLiteInterface {
-    pub async fn new(index_soft_max: u64, url: &str) -> Result<Self> {
+    pub async fn new(index_soft_entries_max: u64, index_soft_bytes_max: u64, url: &str) -> Result<Self> {
 
         let url = if url == "memory" {
             format!("sqlite::memory:")
@@ -123,16 +124,17 @@ impl SQLiteInterface {
 
         Ok(Self {
             db: pool,
-            index_soft_max,
+            index_soft_entries_max,
+            index_soft_bytes_max,
             _temp_dir: None,
         })
     }
 
-    pub async fn new_temp(index_soft_max: u64) -> Result<Self> {
+    pub async fn new_temp(index_soft_entries_max: u64, index_soft_bytes_max: u64) -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let path = tempdir.path().join("house.db");
 
-        let mut obj = Self::new(index_soft_max, path.to_str().unwrap()).await?;
+        let mut obj = Self::new(index_soft_entries_max, index_soft_bytes_max, path.to_str().unwrap()).await?;
         obj._temp_dir = Some(tempdir);
 
         Ok(obj)
@@ -145,7 +147,7 @@ impl SQLiteInterface {
 
         sqlx::query(&format!("create table if not exists index_index (
             label TEXT PRIMARY KEY,
-            group TEXT NOT NULL,
+            expiry_group TEXT NOT NULL,
             data BLOB NOT NULL
         )")).execute(&mut con).await?;
 
@@ -157,27 +159,35 @@ impl SQLiteInterface {
         sqlx::query(&format!("create table if not exists filter_tasks (
             query BLOB NOT NULL,
             search TEXT NOT NULL,
-            FOREIGN KEY(search) REFERENCES searches(code),
             filter_id TEXT NOT NULL,
             filter_blob TEXT NOT NULL,
             assigned_worker TEXT,
-            assign_time TEXT
-        ) PRIMARY KEY(search, filter_blob)
+            assign_time TEXT,
+            FOREIGN KEY(search) REFERENCES searches(code),
+            PRIMARY KEY(search, filter_blob)
+        ) 
         ")).execute(&mut con).await?;
         sqlx::query(&format!("CREATE INDEX filter_assigned_work_index ON filter_tasks(assigned_worker)")).execute(&mut con).await?;
         sqlx::query(&format!("CREATE INDEX filter_filter_index ON filter_tasks(filter_blob)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists yara_tasks (
             search TEXT NOT NULL,
-            FOREIGN KEY(search) REFERENCES searches(code),
             hash BLOB NOT NULL,
             assigned_worker TEXT,
-            assign_time TEXT
-        ) PRIMARY KEY(search, hash)
-        ")).execute(&mut con).await?;
+            assign_time TEXT,
+            FOREIGN KEY(search) REFERENCES searches(code),
+            PRIMARY KEY(search, hash)
+        ) 
+        ")).execute(&mut con).await.context("Error creating table yara_tasks")?;
 
         sqlx::query(&format!("CREATE INDEX yara_assigned_work_index ON yara_tasks(assigned_worker)")).execute(&mut con).await?;
         sqlx::query(&format!("CREATE INDEX yara_search_index ON yara_tasks(search)")).execute(&mut con).await?;
+
+        sqlx::query(&format!("create table if not exists garbage (
+            blob_id TEXT PRIMARY KEY,
+            time TEXT NOT NULL
+        )")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX garbage_blob_id ON garbage(time)")).execute(&mut con).await?;
 
         return Ok(())
     }
@@ -207,8 +217,8 @@ impl SQLiteInterface {
         
         // Get all the groups that expire later than this one
         let list: Vec<(IndexID, IndexGroup)> = query_as("
-            SELECT label, group FROM index_index 
-            WHERE ? <= group SORT BY group DEC")
+            SELECT label, expiry_group FROM index_index 
+            WHERE ? <= expiry_group ORDER BY expiry_group DESC")
             .bind(new_index_group.as_str())
             .fetch_all(&mut conn).await?;
 
@@ -251,7 +261,7 @@ impl SQLiteInterface {
         // Get all the groups that expire later than this one
         let list: Vec<(IndexID, Vec<u8>)> = query_as("
             SELECT label, data FROM index_index 
-            WHERE group = ?")
+            WHERE expiry_group = ?")
             .bind(index_group.as_str())
             .fetch_all(&mut conn).await?;
 
@@ -260,8 +270,13 @@ impl SQLiteInterface {
         for (key, value) in list {
             let value: IndexEntry = postcard::from_bytes(&value)?;
 
-            if value.size_bytes >= self.index_soft_max {
-                debug!("index {} chunk over size {}/{} skipping", key, value.size_bytes, self.index_soft_max);
+            if value.size_bytes >= self.index_soft_bytes_max {
+                debug!("index {} chunk over size {}/{} skipping", key, value.size_bytes, self.index_soft_bytes_max);
+                continue;
+            }
+
+            if value.size_entries >= self.index_soft_entries_max {
+                debug!("index {} chunk over capacity {}/{} skipping", key, value.size_entries, self.index_soft_entries_max);
                 continue;
             }
 
@@ -304,11 +319,11 @@ impl SQLiteInterface {
                 .bind(hash).bind(index).bind(&postcard::to_allocvec(&access)?)
                 .execute(&mut conn).await?;
         }
-        debug!("create {index_group} {index_id} file records updated");
+        debug!("update {index_group} {index_id} file records updated");
 
         // Update size in index table
         loop {
-            debug!("update {index_group} {index_id} index directory");
+            debug!("update {index_group} {index_id} get old index entry");
             // Get
             let old: Option<(Vec<u8>, )> = sqlx::query_as(
                 "SELECT data FROM index_index WHERE label = ?")
@@ -318,6 +333,7 @@ impl SQLiteInterface {
             // modify
             let entry = match &old {
                 Some((old, )) => {
+                    debug!("update {index_group} {index_id} update index entry");
                     let old: IndexEntry = postcard::from_bytes(old)?;
                     if &old.current_blob != old_blob_id {
                         return Err(anyhow::anyhow!("Blob replaced"));
@@ -328,32 +344,39 @@ impl SQLiteInterface {
                     entry.current_blob = blob_id.clone();
                     entry
                 },
-                None => IndexEntry{
-                    current_blob: blob_id.clone(),
-                    size_bytes: new_size as u64,
-                    size_entries: new_entries,
-                    group: index_group.clone(),
-                    label: index_id.clone(),
+                None => {
+                    debug!("update {index_group} {index_id} define index entry");
+                    IndexEntry{
+                        current_blob: blob_id.clone(),
+                        size_bytes: new_size as u64,
+                        size_entries: new_entries,
+                        group: index_group.clone(),
+                        label: index_id.clone(),
+                    }
                 },
             };
             let entry = postcard::to_allocvec(&entry)?;
 
             // write
             let mut trans = conn.begin().await?;
+            debug!("update {index_group} {index_id} add old blob to garbage collection");
             sqlx::query("INSERT OR IGNORE INTO garbage(blob_id) VALUES(?)")
                 .bind(old_blob_id.as_str())
                 .execute(&mut trans).await?;
 
+            debug!("update {index_group} {index_id} insert new index entry");
             let res = match old {
-                Some(old) => sqlx::query(
+                Some((old, )) => sqlx::query(
                     "UPDATE index_index SET data = ? WHERE label = ? AND data = ?")
-                    .bind(entry).bind(index_id.as_str()).bind(old.0)
+                    .bind(entry).bind(index_id.as_str()).bind(old)
                     .execute(&mut trans).await?,
                 None => sqlx::query(
-                    "UPDATE index_index SET data = ? WHERE label = ?")
-                    .bind(entry).bind(index_id.as_str())
+                    "INSERT OR REPLACE INTO index_index(data, label, expiry_group) VALUES(?, ?, ?)")
+                    .bind(entry).bind(index_id.as_str()).bind(index_group.as_str())
                     .execute(&mut trans).await?,
             };
+
+            debug!("update {index_group} {index_id} try to finalize");
             if res.rows_affected() > 0 {
                 trans.commit().await?;
                 return Ok(())
@@ -364,7 +387,7 @@ impl SQLiteInterface {
     pub async fn list_indices(&self) -> Result<Vec<(IndexGroup, IndexID)>> {
         let mut conn = self.db.acquire().await?;
         let list: Vec<(IndexGroup, IndexID)> = query_as("
-            SELECT group, label FROM index_index")
+            SELECT expiry_group, label FROM index_index")
             .fetch_all(&mut conn).await?;
         Ok(list)
     }
@@ -384,7 +407,7 @@ impl SQLiteInterface {
         let mut conn = self.db.acquire().await?;
         let pending: Vec<(Vec<u8>, )> = query_as("
             SELECT data FROM index_index 
-            WHERE ? <= group AND group <= ?")
+            WHERE ? <= expiry_group AND expiry_group <= ?")
             .bind(start.as_str()).bind(end.as_str())
             .fetch_all(&mut conn).await?;
         let pending: Vec<(BlobID, IndexID)> = pending.into_iter()
@@ -472,7 +495,8 @@ impl SQLiteInterface {
 
     async fn get_search(&self, code: &String) -> Result<Option<SearchRecord>> {
         let search: Option<(Vec<u8>, )> = sqlx::query_as(
-            "SELECT data FROM searches WHERE assigned_worker IS NULL LIMIT 1")
+            "SELECT data FROM searches WHERE code = ? LIMIT 1")
+            .bind(&code)
             .fetch_optional(&self.db).await?;
 
         Ok(match search {
@@ -653,8 +677,51 @@ impl SQLiteInterface {
         return Ok(())
     }
 
-    pub async fn finish_yara_work(&self, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
-        todo!();
+    pub async fn finish_yara_work(&self, code: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
+
+        // Store confirmed hashes into search object
+        loop {
+            // Get the old record value
+            let buffer: Option<(Vec<u8>, )> = sqlx::query_as(
+                "SELECT data FROM searches WHERE code = ? LIMIT 1")
+                .bind(&code)
+                .fetch_optional(&mut conn).await?;
+            let buffer = match buffer {
+                Some(buffer) => buffer.0,
+                None => return Err(anyhow::anyhow!("results on missing search.")),
+            };
+            let mut search: SearchRecord = postcard::from_bytes(&buffer)?;
+
+            // Update the record
+            let before_count = search.hit_files.len();
+            search.hit_files.extend(hashes.iter().cloned());
+
+            if before_count == search.hit_files.len() {
+                break;
+            }
+
+            // Apply the update
+            let res = sqlx::query(
+                "UPDATE searchs SET data = ? WHERE code = ? AND data = ?")
+                .bind(&postcard::to_allocvec(&search)?)
+                .bind(&code)
+                .bind(&buffer)
+                .execute(&mut conn).await?;
+            if res.rows_affected() > 0 {
+                break;
+            }
+        }
+
+        // remove finished yara jobs
+        for hash in hashes {
+            sqlx::query(
+                "DELETE FROM yara_tasks WHERE search = ? AND hash = ?")
+                .bind(&code)
+                .bind(hash)
+                .execute(&mut conn).await?;    
+        }
+        return Ok(())
     }
 
 }

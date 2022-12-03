@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use anyhow::Result;
 
+use log::error;
 use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
@@ -11,7 +12,6 @@ use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
 
-use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::core::HouseCore;
 use crate::database::{BlobID, IndexID};
@@ -110,8 +110,8 @@ impl WorkerInterface {
         self.core.get_work(req).await
     }
 
-    pub fn finish_work(&self, req: WorkResult) {
-        self.core.finish_work(req);
+    pub fn finish_work(&self, req: WorkResult) -> Result<()> {
+        self.core.finish_work(req)
     }
 }
 
@@ -204,11 +204,17 @@ pub struct WorkResult {
 }
 
 #[handler]
-fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> () {
-    interface.finish_work(request);
+fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> Result<()> {
+    interface.finish_work(request)
 }
 
-pub async fn serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std::io::Error> {
+pub async fn serve(bind_address: String, core: Arc<HouseCore>) {
+    if let Err(err) = _serve(bind_address, core).await {
+        error!("Error with http interface: {err}");
+    }
+}
+
+pub async fn _serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std::io::Error> {
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))

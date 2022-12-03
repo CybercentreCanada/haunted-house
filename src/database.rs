@@ -119,12 +119,12 @@ impl Database {
     //     Ok(Database::Rocks(RocksInterface::new(index_soft_max)?))
     // }
 
-    pub async fn new_sqlite(index_soft_max: u64, path: &str) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new(index_soft_max, path).await?))
+    pub async fn new_sqlite(index_soft_entries_max: u64, index_soft_bytes_max: u64, path: &str) -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new(index_soft_entries_max, index_soft_bytes_max, path).await?))
     }
 
-    pub async fn new_sqlite_temp(index_soft_max: u64) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new_temp(index_soft_max).await?))
+    pub async fn new_sqlite_temp(index_soft_entries_max: u64, index_soft_bytes_max: u64) -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new_temp(index_soft_entries_max, index_soft_bytes_max).await?))
     }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {

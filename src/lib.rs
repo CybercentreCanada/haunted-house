@@ -20,7 +20,7 @@ use anyhow::Context;
 use auth::{Authenticator, Role};
 use chrono::{DateTime, Utc};
 use database::Database;
-use log::{info, debug};
+use log::{info};
 use pyo3::exceptions::{PyRuntimeError};
 use pyo3::types::PyModule;
 use pyo3::{Python, pymodule, PyResult, pyclass, pymethods, PyAny, Py, PyObject};
@@ -115,7 +115,8 @@ impl ServerInterface {
     }
 }
 
-const DEFAULT_SOFT_MAX_SIZE: u64 = 50 << 30;
+const DEFAULT_SOFT_MAX_BYTES_SIZE: u64 = 50 << 30;
+const DEFAULT_SOFT_MAX_ENTRIES_SIZE: u64 = 50 << 30;
 
 enum DatabaseConfig {
     SQLite(PathBuf),
@@ -132,7 +133,8 @@ struct ServerBuilder {
     bind_address: String,
     authenticator: Option<Authenticator>,
     cache_space: Option<(PathBuf, usize)>,
-    index_soft_max: Option<u64>,
+    index_soft_entries_max: Option<u64>,
+    index_soft_bytes_max: Option<u64>,
     database_config: Option<DatabaseConfig>,
     config: Config,
 }
@@ -188,8 +190,16 @@ impl ServerBuilder {
         self.config.batch_limit_size = size;
     }
 
-    fn batch_limit_seconds(&mut self, seconds: i64) {
+    fn batch_limit_seconds(&mut self, seconds: u64) {
         self.config.batch_limit_seconds = seconds;
+    }
+
+    fn index_soft_bytes_max(&mut self, size: u64) {
+        self.index_soft_bytes_max = Some(size);
+    }
+
+    fn index_soft_entries_max(&mut self, size: u64) {
+        self.index_soft_entries_max = Some(size);
     }
 
     fn build(&mut self, py: Python) -> PyResult<PyObject> {
@@ -213,7 +223,8 @@ impl ServerBuilder {
             Some(config) => config,
             None => DatabaseConfig::SQLiteTemp()
         };
-        let soft_max = self.index_soft_max.unwrap_or(DEFAULT_SOFT_MAX_SIZE);
+        let soft_entries_max = self.index_soft_entries_max.unwrap_or(DEFAULT_SOFT_MAX_ENTRIES_SIZE);
+        let soft_bytes_max = self.index_soft_bytes_max.unwrap_or(DEFAULT_SOFT_MAX_BYTES_SIZE);
         let bind_address = self.bind_address.clone();
         let config = self.config.clone();
 
@@ -224,8 +235,8 @@ impl ServerBuilder {
             // Initialize database
             info!("Connecting to database.");
             let database = match db_config {
-                DatabaseConfig::SQLite(path) => Database::new_sqlite(soft_max, path.to_str().unwrap()).await?,
-                DatabaseConfig::SQLiteTemp() => Database::new_sqlite_temp(soft_max).await?,
+                DatabaseConfig::SQLite(path) => Database::new_sqlite(soft_entries_max, soft_bytes_max, path.to_str().unwrap()).await?,
+                DatabaseConfig::SQLiteTemp() => Database::new_sqlite_temp(soft_entries_max, soft_bytes_max).await?,
             };
 
             // Start server core

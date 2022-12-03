@@ -7,10 +7,10 @@ use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkRe
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
-use crate::ursadb::UrsaDBTrigramFilter;
+use crate::filter::TrigramFilter;
 use bitvec::vec::BitVec;
 use futures::future::select_all;
-use log::{error, debug};
+use log::{error, debug, info};
 use tokio::sync::{mpsc, oneshot};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -27,13 +27,13 @@ pub enum IngestMessage {
 #[derive(Clone)]
 pub struct Config {
     pub batch_limit_size: usize,
-    pub batch_limit_seconds: i64,
+    pub batch_limit_seconds: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            batch_limit_seconds: chrono::Duration::hours(1).num_seconds(),
+            batch_limit_seconds: chrono::Duration::hours(1).num_seconds() as u64,
             batch_limit_size: 100,
         }
     }
@@ -56,7 +56,7 @@ impl HouseCore {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
         let (send_search, receive_search) = mpsc::unbounded_channel();
 
-        let mut core = Arc::new(Self {
+        let core = Arc::new(Self {
             weak_self: WeakSelf::new(),
             database,
             file_storage,
@@ -94,8 +94,11 @@ impl HouseCore {
         self.database.get_work(req).await
     }
 
-    pub fn finish_work(&self, req: WorkResult) {
-        self.search_watchers.send(req);
+    pub fn finish_work(&self, req: WorkResult) -> Result<()> {
+        match self.search_watchers.send(req){
+            Ok(()) => Ok(()),
+            Err(err) => Err(anyhow::anyhow!("result processor error: {err}")),
+        }
     }
 }
 
@@ -103,7 +106,10 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
     loop {
         match _ingest_worker(core.clone(), &mut input).await {
             Err(err) => error!("Crash in ingestion system: {err}"),
-            Ok(()) => break
+            Ok(()) => {
+                info!("Ingest worker stopped.");
+                break;
+            }
         }
     }
 }
@@ -113,8 +119,8 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     let mut pending_timers: HashMap<IndexGroup, DateTime<Utc>> = Default::default();
     let mut pending_batch: HashMap<IndexGroup, HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
 
-    let mut current_batch: Option<JoinHandle<Result<()>>> = None;
-    let mut batch_check_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut current_batch: Option<JoinHandle<()>> = None;
+    let mut batch_check_timer = tokio::time::interval(std::time::Duration::from_millis(50.max(1000 * core.config.batch_limit_seconds/2)));
 
     loop {
 
@@ -122,9 +128,6 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
         // Check if its time to launch an index building job
         if let Some(job) = &mut current_batch {
             if job.is_finished() {
-                if let Err(err) = job.await? {
-                    error!("Error building index batch: {err}");
-                }
                 current_batch = None;
             }
         }
@@ -137,7 +140,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     Some(start) => start.clone(),
                     None => Utc::now(),
                 };
-                if at_size_limit || (Utc::now() - batch_start).num_seconds() > core.config.batch_limit_seconds {
+                if at_size_limit || (Utc::now() - batch_start).num_seconds() > core.config.batch_limit_seconds as i64 {
                     let key = key.clone();
                     if let Some(values) = pending_batch.remove(&key) {
                         current_batch = Some(tokio::spawn(run_batch_ingest(core.clone(), key, values)));
@@ -212,8 +215,13 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     return Ok(())
 }
 
+async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) {
+    if let Err(err) = _run_batch_ingest(core, index_group, new_items).await {
+        error!("Error building index batch: {err}");
+    }
+}
 
-async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
+async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
     debug!("Ingest {} batch {} items", index_group.as_str(), new_items.len());
     // Check if any of our new items are already handled
     {
@@ -285,12 +293,12 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new
     match selected_index {
         None => {
             debug!("Ingest {} building a new index", index_group.as_str());
-            let final_size = UrsaDBTrigramFilter::guess_max_size(data.len());
+            let final_size = TrigramFilter::guess_max_size(data.len());
             let new_index_file = core.local_cache.open(final_size).await?;
             let out_handle = new_index_file.open()?;
             debug!("Ingest {} build filter file", index_group.as_str());
             let ok: Result<()> = tokio::task::spawn_blocking(move || {
-                UrsaDBTrigramFilter::build_from_data(out_handle, data)?;
+                TrigramFilter::build_from_data(out_handle, data)?;
                 Ok(())
             }).await?;
             ok?;
@@ -314,12 +322,12 @@ async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new
             debug!("Ingest {index_group} downloaded {old_blob} ({} bytes)", index_file.size().await?);
 
             debug!("Ingest {} creating local scratch space", index_group.as_str());
-            let final_size = UrsaDBTrigramFilter::guess_max_size(data.len()) + data_size;
+            let final_size = TrigramFilter::guess_max_size(data.len()) + data_size;
             let new_index_file = core.local_cache.open(final_size).await?;
             let out_handle = new_index_file.open()?;
-            debug!("Ingest {} building new index file", index_group.as_str());
+            debug!("Ingest {} merging data into index file", index_group.as_str());
             let _: Result<()> = tokio::task::spawn_blocking(move || {
-                UrsaDBTrigramFilter::merge_in_data(out_handle, index_file.open()?, data, new_data_offset)?;
+                TrigramFilter::merge_in_data(out_handle, index_file.open()?, data, new_data_offset)?;
                 return Ok(())
             }).await?;
 
@@ -350,7 +358,7 @@ async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result
     };
 
     let result = tokio::task::spawn_blocking(|| {
-        let result = UrsaDBTrigramFilter::build_file(stream);
+        let result = TrigramFilter::build_file(stream);
         return result
     }).await;
 
@@ -386,7 +394,7 @@ async fn search_watcher(core: Arc<HouseCore>, mut results: mpsc::UnboundedReceiv
 
         let (send, recv) = mpsc::unbounded_channel();
         let search = message.search.clone();
-        send.send(message);
+        _ = send.send(message);
         workers.insert(search.clone(), send);
         tokio::spawn(single_search_watcher(core.clone(), search, recv));
     }
