@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
@@ -48,11 +48,13 @@ pub struct HouseCore {
     pub authenticator: Authenticator,
     pub config: Config,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
+    search_watchers: mpsc::UnboundedSender<WorkResult>
 }
 
 impl HouseCore {
     pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, local_cache: LocalCache, authenticator: Authenticator, config: Config) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
+        let (send_search, receive_search) = mpsc::unbounded_channel();
 
         let mut core = Arc::new(Self {
             weak_self: WeakSelf::new(),
@@ -62,11 +64,13 @@ impl HouseCore {
             local_cache,
             authenticator,
             ingest_queue: send_ingest,
-            config
+            config,
+            search_watchers: send_search,
         });
         core.weak_self.init(&core);
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
+        tokio::spawn(search_watcher(core.clone(), receive_search));
 
         return Ok(core)
     }
@@ -79,9 +83,6 @@ impl HouseCore {
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
         let res = self.database.initialize_search(req).await?;
-        // if let Some(core) = self.weak_self.get().upgrade() {
-        //     tokio::spawn(search_watcher(core, res.code.clone()));
-        // }
         return Ok(res)
     }
 
@@ -93,8 +94,8 @@ impl HouseCore {
         self.database.get_work(req).await
     }
 
-    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
-        self.database.finish_work(req).await
+    pub fn finish_work(&self, req: WorkResult) {
+        self.search_watchers.send(req);
     }
 }
 
@@ -362,6 +363,71 @@ async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result
 }
 
 
-async fn search_watcher(core: Arc<HouseCore>, search_code: String){
-    todo!()
+async fn search_watcher(core: Arc<HouseCore>, mut results: mpsc::UnboundedReceiver<WorkResult>){
+
+    let mut workers: HashMap<String, mpsc::UnboundedSender<WorkResult>> = Default::default();
+
+    loop {
+        workers.retain(|_, sender|!sender.is_closed());
+
+        let message = match results.recv().await {
+            Some(result) => result,
+            None => return,
+        };
+
+        let message = if let Some(sock) = workers.get(&message.search) {
+            match sock.send(message) {
+                Ok(()) => continue,
+                Err(err) => err.0,
+            }
+        } else {
+            message
+        };
+
+        let (send, recv) = mpsc::unbounded_channel();
+        let search = message.search.clone();
+        send.send(message);
+        workers.insert(search.clone(), send);
+        tokio::spawn(single_search_watcher(core.clone(), search, recv));
+    }
+}
+
+async fn single_search_watcher(core: Arc<HouseCore>, code: String, results: mpsc::UnboundedReceiver<WorkResult>){
+    if let Err(err) = _single_search_watcher(core, code, results).await {
+        error!("{err}");
+    }
+}
+
+pub struct SearchCache {
+    pub seen: HashSet<Vec<u8>>,
+    pub access: Option<HashSet<String>>,
+}
+
+async fn _single_search_watcher(core: Arc<HouseCore>, code: String, mut messages: mpsc::UnboundedReceiver<WorkResult>) -> Result<()> {
+
+    let mut cache = SearchCache{
+        seen: Default::default(),
+        access: None
+    };
+
+    loop {
+        tokio::select! {
+            results = messages.recv() => {
+                let results = match results {
+                    Some(results) => results,
+                    None => break,
+                };
+        
+                // Update filter results
+                for (index, blob, file_ids) in results.filter {
+                    core.database.finish_filter_work(&code, &mut cache, index, blob, file_ids).await?;
+                }
+        
+                // Update yara results
+                core.database.finish_yara_work(&results.search, results.yara).await?;
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+        }
+    }
+    return Ok(())
 }

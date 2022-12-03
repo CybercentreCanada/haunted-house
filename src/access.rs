@@ -278,6 +278,29 @@ impl AccessControl {
         }
         return AccessControl::Always;
     }
+
+    pub fn can_access(&self, fields: &HashSet<String>) -> bool {
+        match self {
+            AccessControl::Or(sub) => {
+                for ac in sub {
+                    if ac.can_access(fields) {
+                        return true;
+                    }
+                }
+                false
+            },
+            AccessControl::And(sub) => {
+                for ac in sub {
+                    if !ac.can_access(fields) {
+                        return false;
+                    }
+                }
+                true
+            },
+            AccessControl::Token(token) => fields.contains(token),
+            AccessControl::Always => true,
+        }
+    }
 }
 
 

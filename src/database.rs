@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
+use crate::core::SearchCache;
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult};
@@ -18,6 +19,10 @@ impl IndexGroup {
             Some(date) => format!("{}", date.format("%Y0%j")),
             None => format!("99990999"),
         })
+    }
+
+    pub fn from(data: &str) -> Self {
+        Self(data.to_owned())
     }
 
     pub fn min() -> IndexGroup {
@@ -51,6 +56,10 @@ impl IndexID {
         IndexID(format!("{:x}", uuid::Uuid::new_v4().as_u128()))
     }
 
+    pub fn from(data: &str) -> Self {
+        Self(data.to_owned())
+    }
+
     pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
         self.0.as_bytes()
     }
@@ -72,12 +81,16 @@ impl std::fmt::Display for IndexID {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
 pub struct BlobID(String);
 
 impl BlobID {
     pub fn new() -> Self {
         Self(format!("{:x}", uuid::Uuid::new_v4().as_u128()))
+    }
+
+    pub fn from(data: &str) -> Self {
+        Self(data.to_owned())
     }
 
     pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
@@ -166,9 +179,15 @@ impl Database {
         }
     }
 
-    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
+    pub async fn finish_filter_work(&self, search: &String, cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.finish_work(req).await
+            Database::SQLite(local) => local.finish_filter_work(search, cache, index, blob, file_ids).await
+        }
+    }
+
+    pub async fn finish_yara_work(&self, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.finish_yara_work(search, hashes).await
         }
     }
 

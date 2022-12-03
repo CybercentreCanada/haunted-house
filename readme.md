@@ -6,3 +6,4 @@
 - add tracing
 - add garbage collecting
 - use blob cache for index
+- keep a cache of which indices are assigned to what worker

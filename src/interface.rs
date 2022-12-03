@@ -1,20 +1,20 @@
 
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use anyhow::Result;
 
-use poem::http::StatusCode;
-use poem::middleware::AddData;
-use poem::{post, EndpointExt, Response, Endpoint, Middleware, Request, FromRequest};
+use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
-use poem::{get, handler, listener::TcpListener, web::Path, IntoResponse, Route, Server};
+use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::core::HouseCore;
+use crate::database::{BlobID, IndexID};
 use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -110,8 +110,8 @@ impl WorkerInterface {
         self.core.get_work(req).await
     }
 
-    pub async fn finish_work(&self, req: WorkResult) -> Result<()> {
-        self.core.finish_work(req).await
+    pub fn finish_work(&self, req: WorkResult) {
+        self.core.finish_work(req);
     }
 }
 
@@ -136,7 +136,7 @@ impl SearcherInterface {
 
 #[derive(Deserialize)]
 pub struct SearchRequest {
-    pub access: AccessControl,
+    pub access: HashSet<String>,
     pub query: Query,
     pub yara_signature: String,
     pub start_date: Option<chrono::DateTime<chrono::Utc>>,
@@ -165,13 +165,30 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
 }
 
 #[derive(Serialize)]
-pub struct WorkPackage {
+pub struct FilterTask {
+    pub search: String,
+    pub filter_id: IndexID,
+    pub filter_blob: BlobID,
+    pub query: Query,
+}
 
+#[derive(Serialize)]
+pub struct YaraTask {
+    pub search: String,
+    pub yara_rule: String,
+    pub hashes: Vec<Vec<u8>>, 
+}
+
+#[derive(Serialize)]
+pub struct WorkPackage {
+    pub filter: Vec<FilterTask>,
+    pub yara: Vec<YaraTask>
 }
 
 #[derive(Deserialize)]
 pub struct WorkRequest {
-
+    pub worker: String,
+    pub cached_filters: HashSet<BlobID>
 }
 
 #[handler]
@@ -181,12 +198,14 @@ async fn get_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<W
 
 #[derive(Deserialize)]
 pub struct WorkResult {
-
+    pub search: String,
+    pub filter: Vec<(IndexID, BlobID, Vec<u64>)>,
+    pub yara: Vec<Vec<u8>>
 }
 
 #[handler]
-async fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> Result<()> {
-    Ok(interface.finish_work(request).await?)
+fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> () {
+    interface.finish_work(request);
 }
 
 pub async fn serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std::io::Error> {
