@@ -6,7 +6,6 @@ mod storage;
 mod core;
 mod database;
 mod database_sqlite;
-mod sqlite_kv;
 mod interface;
 mod auth;
 mod cache;
