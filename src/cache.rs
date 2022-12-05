@@ -21,7 +21,7 @@ struct FileHandleInner {
     connection: mpsc::Sender<LocalCacheCommand>,
 }
 
-
+#[clippy::has_significant_drop]
 #[derive(Debug, Clone)]
 pub struct FileHandle {
     data: Arc<FileHandleInner>

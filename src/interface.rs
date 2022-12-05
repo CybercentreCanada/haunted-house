@@ -2,9 +2,10 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use anyhow::Result;
 
-use log::error;
+use log::{error, debug};
 use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
@@ -67,34 +68,43 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
 }
 
 
-// #[derive(Clone)]
-// struct TokenCheck {
-//     core: Arc<HouseCore>
-// }
+struct LoggerMiddleware;
 
-// impl TokenCheck {
-//     pub fn new(core: Arc<HouseCore>) -> Self {
-//         Self {
-//             core
-//         }
-//     }
+impl<E: Endpoint> Middleware<E> for LoggerMiddleware {
+    type Output = LoggerMiddlewareImpl<E>;
 
-//     pub fn authenticate_worker(&self, token: &str) -> Option<WorkerInterface> {
-//         if self.core.authenticator.is_role_assigned(token, Role::Worker) {
-//             Some(WorkerInterface { core: self.core.clone() })
-//         } else {
-//             None
-//         }
-//     }
+    fn transform(&self, ep: E) -> Self::Output {
+        LoggerMiddlewareImpl { ep }
+    }
+}
 
-//     pub fn authenticate_searcher(&self, token: &str) -> Option<SearcherInterface> {
-//         if self.core.authenticator.is_role_assigned(token, Role::Search) {
-//             Some(SearcherInterface { core: self.core.clone() })
-//         } else {
-//             None
-//         }
-//     }
-// }
+struct LoggerMiddlewareImpl<E> {
+    ep: E,
+}
+
+
+#[poem::async_trait]
+impl<E: Endpoint> Endpoint for LoggerMiddlewareImpl<E> {
+    type Output = E::Output;
+
+    async fn call(&self, req: Request) -> poem::Result<Self::Output> {
+        let start = Instant::now();
+        let uri = req.uri().clone();
+        match self.ep.call(req).await {
+            Ok(resp) => {
+                debug!("request for {uri} handled ({} ms)", start.elapsed().as_millis());
+                Ok(resp)
+            },
+            Err(err) => {
+                error!("error handling {uri} ({} ms) {err}", start.elapsed().as_millis());
+                Err(err)
+            },
+        }
+    }
+}
+
+
+
 
 
 struct WorkerInterface {
@@ -112,6 +122,10 @@ impl WorkerInterface {
 
     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
         self.core.finish_work(req)
+    }
+
+    pub async fn work_error(&self, req: WorkError) -> Result<()> {
+        self.core.work_error(req).await
     }
 }
 
@@ -178,7 +192,7 @@ pub struct YaraTask {
     pub id: i64,
     pub search: String,
     pub yara_rule: String,
-    pub hashes: Vec<Vec<u8>>, 
+    pub hashes: Vec<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,22 +212,33 @@ async fn get_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<W
     Ok(Json(interface.get_work(request).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum WorkResultValue {
     Filter(IndexID, BlobID, Vec<u64>),
     Yara(Vec<Vec<u8>>),
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct WorkResult {
     pub id: i64,
     pub search: String,
     pub value: WorkResultValue
 }
 
+#[derive(Serialize, Deserialize)]
+pub enum WorkError {
+    Yara(i64, String),
+    Filter(i64, String),
+}
+
 #[handler]
 fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> Result<()> {
     interface.finish_work(request)
+}
+
+#[handler]
+async fn work_error(Data(interface): Data<&WorkerInterface>, Json(error): Json<WorkError>) -> Result<()> {
+    interface.work_error(error).await
 }
 
 pub async fn serve(bind_address: String, core: Arc<HouseCore>) {
@@ -227,8 +252,10 @@ pub async fn _serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), st
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
         .at("/work/", get(get_work))
-        .at("/finished/", get(finish_work))
-        .with(TokenMiddleware::new(core));
+        .at("/work/finished/", post(finish_work))
+        .at("/work/error/", post(work_error))
+        .with(TokenMiddleware::new(core))
+        .with(LoggerMiddleware);
 
     Server::new(TcpListener::bind(bind_address))
         .run(app)

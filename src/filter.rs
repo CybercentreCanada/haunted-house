@@ -6,6 +6,7 @@ use std::path::{PathBuf};
 use anyhow::Result;
 use bitvec::vec::BitVec;
 
+use crate::query::Query;
 use crate::varint;
 
 
@@ -188,7 +189,7 @@ impl TrigramFilter {
         return Self::build_from_data(file, data)
     }
 
-    fn open(file: std::fs::File) -> Result<Self> {
+    pub fn open(file: std::fs::File) -> Result<Self> {
         // Read header
         let mut buf: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
         file.read_exact_at(&mut buf, 0)?;
@@ -278,10 +279,21 @@ impl TrigramFilter {
         return Ok(items.into_iter().collect())
     }
 
+    pub fn run_query(&self, query: Query) -> Result<HashSet<u64>> {
+        match query {
+            Query::Or(parts) => {
+
+            },
+            Query::And(_) => todo!(),
+            Query::String(_) => todo!(),
+            Query::Literal(_) => todo!(),
+        }
+    }
+
     fn get_bucket_range(&self, index: u32) -> Result<(u64, u64)> {
         if index as usize + 1 < self.table.len() {
             Ok((self.table[index as usize], self.table[index as usize + 1]))
-        } else { 
+        } else {
             Err(anyhow::anyhow!("Bad bucket range"))
         }
     }

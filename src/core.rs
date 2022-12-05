@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::auth::Authenticator;
 use crate::database::{Database, IndexGroup, BlobID};
-use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue};
+use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue, WorkError};
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
@@ -99,6 +99,10 @@ impl HouseCore {
             Ok(()) => Ok(()),
             Err(err) => Err(anyhow::anyhow!("result processor error: {err}")),
         }
+    }
+
+    pub async fn work_error(&self, err: WorkError) -> Result<()> {
+        self.database.work_error(err).await
     }
 }
 
@@ -317,6 +321,8 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
             debug!("Ingest {} merging into filter {} {}", index_group.as_str(), index_id.as_str(), old_blob.as_str());
             let data_size = core.index_storage.size(old_blob.as_str()).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
             let index_file = core.local_cache.open(data_size).await?;
+            let index_file_handle = index_file.open()?;
+
             debug!("Ingest {} downloading {}", index_group.as_str(), old_blob.as_str());
             core.index_storage.download(old_blob.as_str(), index_file.path()).await?;
             debug!("Ingest {index_group} downloaded {old_blob} ({} bytes)", index_file.size().await?);
@@ -327,7 +333,7 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
             let out_handle = new_index_file.open()?;
             debug!("Ingest {} merging data into index file", index_group.as_str());
             let _: Result<()> = tokio::task::spawn_blocking(move || {
-                TrigramFilter::merge_in_data(out_handle, index_file.open()?, data, new_data_offset)?;
+                TrigramFilter::merge_in_data(out_handle, index_file_handle, data, new_data_offset)?;
                 return Ok(())
             }).await?;
 
@@ -425,7 +431,7 @@ async fn _single_search_watcher(core: Arc<HouseCore>, code: String, mut messages
                     Some(results) => results,
                     None => break,
                 };
-        
+
                 match results.value {
                     WorkResultValue::Filter(index, blob, file_ids) => {
                         core.database.finish_filter_work(results.id, &code, &mut cache, index, blob, file_ids).await?;

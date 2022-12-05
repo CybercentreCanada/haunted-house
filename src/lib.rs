@@ -8,6 +8,7 @@ mod database;
 mod database_sqlite;
 mod interface;
 mod auth;
+mod blob_cache;
 mod cache;
 mod query;
 mod filter;

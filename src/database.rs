@@ -7,7 +7,7 @@ use crate::access::AccessControl;
 use crate::core::SearchCache;
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
-use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult};
+use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult, WorkError};
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
@@ -81,7 +81,7 @@ impl std::fmt::Display for IndexID {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
 pub struct BlobID(String);
 
 impl BlobID {
@@ -188,6 +188,12 @@ impl Database {
     pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
         match self {
             Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
+        }
+    }
+
+    pub async fn work_error(&self, err: WorkError) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.work_error(err).await
         }
     }
 
