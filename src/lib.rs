@@ -11,6 +11,7 @@ mod auth;
 mod cache;
 mod query;
 mod filter;
+mod worker;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,6 +33,8 @@ use tokio::sync::oneshot;
 use crate::core::{IngestMessage, Config, HouseCore};
 use crate::access::AccessControl;
 use crate::cache::LocalCache;
+use crate::worker::WorkerBuilder;
+
 
 #[pyclass]
 struct ServerStatus {
@@ -225,7 +228,11 @@ impl ServerBuilder {
         };
         let soft_entries_max = self.index_soft_entries_max.unwrap_or(DEFAULT_SOFT_MAX_ENTRIES_SIZE);
         let soft_bytes_max = self.index_soft_bytes_max.unwrap_or(DEFAULT_SOFT_MAX_BYTES_SIZE);
-        let bind_address = self.bind_address.clone();
+        let bind_address = if self.bind_address.is_empty() {
+            "localhost:8080".to_owned()
+        } else {
+            self.bind_address.clone()
+        };
         let config = self.config.clone();
 
         Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
@@ -266,5 +273,6 @@ fn haunted_house(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     pyo3_asyncio::tokio::init(builder);
 
     m.add_class::<ServerBuilder>()?;
+    m.add_class::<WorkerBuilder>()?;
     Ok(())
 }

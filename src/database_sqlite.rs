@@ -6,7 +6,7 @@ use futures::{TryStreamExt};
 use log::{debug};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
-use sqlx::pool::PoolOptions;
+use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
 use crate::core::SearchCache;
@@ -149,14 +149,15 @@ impl SQLiteInterface {
             label TEXT PRIMARY KEY,
             expiry_group TEXT NOT NULL,
             data BLOB NOT NULL
-        )")).execute(&mut con).await?;
+        )")).execute(&mut con).await.context("error creating table index_index")?;
 
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
             data BLOB NOT NULL
-        )")).execute(&mut con).await?;
+        )")).execute(&mut con).await.context("error creating table searches")?;
 
         sqlx::query(&format!("create table if not exists filter_tasks (
+            id INTEGER PRIMARY KEY,
             query BLOB NOT NULL,
             search TEXT NOT NULL,
             filter_id TEXT NOT NULL,
@@ -164,29 +165,29 @@ impl SQLiteInterface {
             assigned_worker TEXT,
             assign_time TEXT,
             FOREIGN KEY(search) REFERENCES searches(code),
-            PRIMARY KEY(search, filter_blob)
+            UNIQUE (search, filter_blob)
         ) 
-        ")).execute(&mut con).await?;
+        ")).execute(&mut con).await.context("error creating table filter_tasks")?;
         sqlx::query(&format!("CREATE INDEX filter_assigned_work_index ON filter_tasks(assigned_worker)")).execute(&mut con).await?;
         sqlx::query(&format!("CREATE INDEX filter_filter_index ON filter_tasks(filter_blob)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists yara_tasks (
+            id INTEGER PRIMARY KEY,
             search TEXT NOT NULL,
-            hash BLOB NOT NULL,
+            hashes BLOB NOT NULL,
+            hash_count INTEGER NOT NULL,
             assigned_worker TEXT,
             assign_time TEXT,
-            FOREIGN KEY(search) REFERENCES searches(code),
-            PRIMARY KEY(search, hash)
+            FOREIGN KEY(search) REFERENCES searches(code)
         ) 
         ")).execute(&mut con).await.context("Error creating table yara_tasks")?;
-
         sqlx::query(&format!("CREATE INDEX yara_assigned_work_index ON yara_tasks(assigned_worker)")).execute(&mut con).await?;
         sqlx::query(&format!("CREATE INDEX yara_search_index ON yara_tasks(search)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists garbage (
             blob_id TEXT PRIMARY KEY,
             time TEXT NOT NULL
-        )")).execute(&mut con).await?;
+        )")).execute(&mut con).await.context("error creating table garbage")?;
         sqlx::query(&format!("CREATE INDEX garbage_blob_id ON garbage(time)")).execute(&mut con).await?;
 
         return Ok(())
@@ -452,12 +453,14 @@ impl SQLiteInterface {
             None => return Err(anyhow::anyhow!("Search code not found"))
         };
 
-        let (pending_indices, ): (i64, ) = sqlx::query_as("SELECT COUNT(filter_blob) FROM filter_tasks WHERE search = ? GROUP BY search")
+        let (pending_indices, ): (i64, ) = sqlx::query_as(
+            "SELECT COUNT(filter_blob) FROM filter_tasks WHERE search = ?")
             .bind(&code)
-            .fetch_one(&mut conn).await?;
-        let (pending_files, ): (i64, ) = sqlx::query_as("SELECT COUNT(hash) FROM yara_tasks WHERE search = ? GROUP BY search")
+            .fetch_one(&mut conn).await.context("Couldn't list filter tasks for search")?;
+        let (pending_files, ): (i64, ) = sqlx::query_as(
+            "SELECT SUM(hash_count) FROM yara_tasks WHERE search = ?")
             .bind(&code)
-            .fetch_one(&mut conn).await?;
+            .fetch_one(&mut conn).await.context("Couldn't list yara tasks for search")?;
 
         Ok(SearchRequestResponse{
             code,
@@ -481,14 +484,14 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
-    async fn claim_yara_task(&self, search: &String, hash: &[u8], worker: &String) -> Result<bool> {
+    async fn claim_yara_task(&self, id: i64, worker: &String) -> Result<bool> {
         let mut conn = self.db.acquire().await?;
         let req = sqlx::query(
             "UPDATE yara_tasks SET assigned_worker = ?, assigned_time = ? 
-            WHERE search = ? AND hash = ?")
+            WHERE id = ?")
             .bind(worker.as_str())
             .bind(chrono::Utc::now().to_rfc3339())
-            .bind(search).bind(hash)
+            .bind(id)
             .execute(&mut conn).await?;
         return Ok(req.rows_affected() > 0)
     }
@@ -505,21 +508,50 @@ impl SQLiteInterface {
         })
     }
 
+    async fn get_yara_task(&self, conn: &mut PoolConnection<sqlx::Sqlite>, worker: &String) -> Result<Vec<YaraTask>> {
+        let search: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, search, hashes FROM yara_tasks WHERE assigned_worker IS NULL LIMIT 1")
+            .fetch_optional(conn).await?;
+
+        let (id, search, hashes) = match search {
+            Some(row) => row,
+            None => return Ok(vec![]),
+        };
+
+        let record = match self.get_search(&search).await? {
+            Some(record) => record,
+            None => return Ok(vec![])
+        };
+
+        let hashes: Vec<Vec<u8>> = postcard::from_bytes(&hashes)?;
+        if self.claim_yara_task(id, &worker).await? {
+            Ok(vec![YaraTask {
+                id,
+                search,
+                yara_rule: record.yara_signature,
+                hashes
+            }])
+        } else {
+            Ok(vec![])
+        }
+    }
+
     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
         let mut conn = self.db.acquire().await?;
         // Look for related filter jobs
         let mut filter_tasks = {
             // : dyn Stream<> 
             let mut raw = sqlx::query(
-                "SELECT query, search, filter_id, filter_blob FROM filter_tasks WHERE assigned_worker IS NULL")
+                "SELECT id, query, search, filter_id, filter_blob FROM filter_tasks WHERE assigned_worker IS NULL")
                 .fetch(&mut conn);
 
             let mut filters = vec![];
             while let Some(row) = raw.try_next().await? {
-                let query: Vec<u8> = row.get(0);
-                let search: String = row.get(1);
-                let filter_id: IndexID = row.get(2);
-                let filter_blob: BlobID = row.get(3);
+                let id: i64 = row.get(0);
+                let query: Vec<u8> = row.get(1);
+                let search: String = row.get(2);
+                let filter_id: IndexID = row.get(3);
+                let filter_blob: BlobID = row.get(4);
                 let query: Query = postcard::from_bytes(&query)?;
 
                 if !req.cached_filters.contains(&filter_blob) {
@@ -528,6 +560,7 @@ impl SQLiteInterface {
 
                 if self.claim_filter_task(&search, &filter_blob, &req.worker).await? {
                     filters.push(FilterTask {
+                        id,
                         search,
                         filter_id,
                         filter_blob,
@@ -539,7 +572,7 @@ impl SQLiteInterface {
         };
         
         // Add a job from a new filter
-        while filter_tasks.len() < 10 {
+        while filter_tasks.len() < 2 {
             let filter: Option<(BlobID, IndexID)> = sqlx::query_as(
                 "SELECT filter_blob, filter_id FROM filter_tasks WHERE assigned_worker IS NULL LIMIT 1")
                 .fetch_optional(&mut conn).await?;
@@ -549,16 +582,17 @@ impl SQLiteInterface {
                 None => break,
             };
 
-            let raw: Vec<(Vec<u8>, String)> = sqlx::query_as(
-                "SELECT query, search FROM filter_tasks WHERE assigned_worker IS NULL AND filter_blob = ?")
+            let raw: Vec<(i64, Vec<u8>, String)> = sqlx::query_as(
+                "SELECT id, query, search FROM filter_tasks WHERE assigned_worker IS NULL AND filter_blob = ?")
                 .bind(filter_blob.as_str())
                 .fetch_all(&mut conn).await?;
 
-            for (query, search) in raw {
+            for (id, query, search) in raw {
                 let query: Query = postcard::from_bytes(&query)?;
 
                 if self.claim_filter_task(&search, &filter_blob, &req.worker).await? {
                     filter_tasks.push(FilterTask {
+                        id,
                         search,
                         filter_id: filter_id.clone(),
                         filter_blob: filter_blob.clone(),
@@ -569,42 +603,7 @@ impl SQLiteInterface {
         }
         
         // Grab some yara jobs
-        let mut yara_tasks = vec![];
-        while yara_tasks.len() < 100 {
-            let search: Option<(String, )> = sqlx::query_as(
-                "SELECT search FROM yara_tasks WHERE assigned_worker IS NULL LIMIT 1")
-                .fetch_optional(&mut conn).await?;
-
-            let search = match search {
-                Some(search) => search.0,
-                None => break,
-            };
-
-            let record = match self.get_search(&search).await? {
-                Some(record) => record,
-                None => continue
-            };
-
-            let raw: Vec<(Vec<u8>, )> = sqlx::query_as(
-                "SELECT hash FROM yara_tasks WHERE assigned_worker IS NULL AND search = ? LIMIT 100")
-                .bind(&search)
-                .fetch_all(&mut conn).await?;
-
-            let mut hashes = vec![];
-            for (hash, ) in raw {
-                if self.claim_yara_task(&search, &hash, &req.worker).await? {
-                    hashes.push(hash)
-                }
-            }
-
-            if hashes.len() > 0 {
-                yara_tasks.push(YaraTask {
-                    search,
-                    yara_rule: record.yara_signature,
-                    hashes
-                });
-            }
-        }
+        let yara_tasks = self.get_yara_task(&mut conn, &req.worker).await?;
 
         return Ok(WorkPackage{
             filter: filter_tasks,
@@ -612,7 +611,7 @@ impl SQLiteInterface {
         })
     }
 
-    pub async fn finish_filter_work(&self, code: &String, search_cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
+    pub async fn finish_filter_work(&self, id: i64, code: &String, search_cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
         let mut conn = self.db.acquire().await?;
         let table_name = filter_table_name(&index);
 
@@ -633,6 +632,7 @@ impl SQLiteInterface {
         };
 
         // Get the information about the filter entry
+        let mut found_hashes = vec![];
         for index in file_ids {
             // Load the hash and access
             let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!(
@@ -655,29 +655,32 @@ impl SQLiteInterface {
             };
 
             // Filter on access
-            if !access.can_access(search_access) {
-                continue
+            if access.can_access(search_access) {
+                found_hashes.push(hash);
             }
-            
-            // Create yara job
+        }
+
+        // Create yara job
+        if !found_hashes.is_empty() {
+            let hashes_data = postcard::to_allocvec(&found_hashes)?;
             sqlx::query(
-                "INSERT INTO yara_tasks(search, hash) VALUES(?,?)")
+                "INSERT INTO yara_tasks(search, hashes, hash_count) VALUES(?,?,?)")
                 .bind(&code)
-                .bind(hash)
+                .bind(hashes_data)
+                .bind(found_hashes.len() as i64)
                 .execute(&mut conn).await?;
         }
 
         // Drop finished filter job
         sqlx::query(
-            "DELETE FROM filter_tasks WHERE search = ? filter_blob = ?")
-            .bind(&code)
-            .bind(blob.as_str())
+            "DELETE FROM filter_tasks WHERE id = ?")
+            .bind(id)
             .execute(&mut conn).await?;
 
         return Ok(())
     }
 
-    pub async fn finish_yara_work(&self, code: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+    pub async fn finish_yara_work(&self, id: i64, code: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
         let mut conn = self.db.acquire().await?;
 
         // Store confirmed hashes into search object
@@ -714,13 +717,10 @@ impl SQLiteInterface {
         }
 
         // remove finished yara jobs
-        for hash in hashes {
-            sqlx::query(
-                "DELETE FROM yara_tasks WHERE search = ? AND hash = ?")
-                .bind(&code)
-                .bind(hash)
-                .execute(&mut conn).await?;    
-        }
+        sqlx::query(
+            "DELETE FROM yara_tasks WHERE id = ?")
+            .bind(id)
+            .execute(&mut conn).await?;    
         return Ok(())
     }
 

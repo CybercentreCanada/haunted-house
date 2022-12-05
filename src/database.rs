@@ -179,15 +179,15 @@ impl Database {
         }
     }
 
-    pub async fn finish_filter_work(&self, search: &String, cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
+    pub async fn finish_filter_work(&self, id: i64, search: &String, cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.finish_filter_work(search, cache, index, blob, file_ids).await
+            Database::SQLite(local) => local.finish_filter_work(id, search, cache, index, blob, file_ids).await
         }
     }
 
-    pub async fn finish_yara_work(&self, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+    pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.finish_yara_work(search, hashes).await
+            Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
         }
     }
 

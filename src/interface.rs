@@ -164,28 +164,30 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
     Ok(Json(interface.search_status(code).await?))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FilterTask {
+    pub id: i64,
     pub search: String,
     pub filter_id: IndexID,
     pub filter_blob: BlobID,
     pub query: Query,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct YaraTask {
+    pub id: i64,
     pub search: String,
     pub yara_rule: String,
     pub hashes: Vec<Vec<u8>>, 
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct WorkPackage {
     pub filter: Vec<FilterTask>,
     pub yara: Vec<YaraTask>
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct WorkRequest {
     pub worker: String,
     pub cached_filters: HashSet<BlobID>
@@ -197,10 +199,16 @@ async fn get_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<W
 }
 
 #[derive(Deserialize)]
+pub enum WorkResultValue {
+    Filter(IndexID, BlobID, Vec<u64>),
+    Yara(Vec<Vec<u8>>),
+}
+
+#[derive(Deserialize)]
 pub struct WorkResult {
+    pub id: i64,
     pub search: String,
-    pub filter: Vec<(IndexID, BlobID, Vec<u64>)>,
-    pub yara: Vec<Vec<u8>>
+    pub value: WorkResultValue
 }
 
 #[handler]

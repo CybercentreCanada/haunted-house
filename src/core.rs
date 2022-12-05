@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::auth::Authenticator;
 use crate::database::{Database, IndexGroup, BlobID};
-use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage};
+use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue};
 use crate::storage::BlobStorage;
 use crate::cache::LocalCache;
 use crate::access::AccessControl;
@@ -426,13 +426,14 @@ async fn _single_search_watcher(core: Arc<HouseCore>, code: String, mut messages
                     None => break,
                 };
         
-                // Update filter results
-                for (index, blob, file_ids) in results.filter {
-                    core.database.finish_filter_work(&code, &mut cache, index, blob, file_ids).await?;
-                }
-        
-                // Update yara results
-                core.database.finish_yara_work(&results.search, results.yara).await?;
+                match results.value {
+                    WorkResultValue::Filter(index, blob, file_ids) => {
+                        core.database.finish_filter_work(results.id, &code, &mut cache, index, blob, file_ids).await?;
+                    }
+                    WorkResultValue::Yara(files) => {
+                        core.database.finish_yara_work(results.id, &results.search, files).await?;
+                    }
+                };
             },
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
         }
