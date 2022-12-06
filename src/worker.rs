@@ -327,9 +327,9 @@ async fn _do_filter_task(data: Arc<WorkerData>, filter_task: FilterTask) -> Resu
     let index_file = index_blob.open()?;
 
     // Run query
-    let file_ids = tokio::task::spawn_blocking(|| -> Result<Vec<u64>> {
+    let file_ids = tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {
         let index = TrigramFilter::open(index_file)?;
-        Ok(index.run_query(filter_task.query)?)
+        Ok(index.run_query(&filter_task.query)?.into_iter().collect())
     }).await??;
 
     // Report finding
@@ -356,5 +356,5 @@ async fn do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> (TaskId, Re
 }
 
 async fn _do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()> {
-    todo!("yara task not implemented")
+    todo!("yara task not implemented");
 }

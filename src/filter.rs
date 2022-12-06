@@ -235,7 +235,54 @@ impl TrigramFilter {
         return Ok(filter)
     }
 
-    fn search(&self, targets: &Vec<Vec<u8>>) -> Result<Vec<u64>> {
+    pub fn run_query(&self, query: &Query) -> Result<HashSet<u64>> {
+        match query {
+            Query::Or(parts) => {
+                let (mut accumulated, remain) = match parts.split_first() {
+                    Some((first, remain)) => {
+                        (self.run_query(first)?, remain)
+                    },
+                    None => return Ok(Default::default()),
+                };
+                for sub_query in remain {
+                    accumulated.extend(self.run_query(sub_query)?);
+                }
+                Ok(accumulated)
+            },
+            Query::And(parts) => {
+                let (mut accumulated, remain) = match parts.split_first() {
+                    Some((first, remain)) => {
+                        (self.run_query(first)?, remain)
+                    },
+                    None => return Ok(Default::default()),
+                };
+                for sub_query in remain {
+                    accumulated = accumulated.intersection(&self.run_query(sub_query)?).cloned().collect();
+                }
+                Ok(accumulated)
+            },
+            Query::String(string) => self.buffer_query(string.as_bytes()),
+            Query::Literal(data) => self.buffer_query(data),
+        }
+    }
+
+    pub fn buffer_query(&self, target: &[u8]) -> Result<HashSet<u64>> {
+        // Get the trigrams we are interested in
+        let mut trigrams: Vec<u32> = Default::default();
+        if target.len() < 3 {
+            return Ok(Default::default());
+        }
+        let mut trigram: u32 = (target[0] as u32) << 8 | (target[1] as u32);
+        for index in 2..target.len() {
+            trigram = (trigram & 0x00FFFF) << 8 | (target[index] as u32);
+            trigrams.push(trigram);
+        }
+        trigrams.sort();
+        trigrams.dedup();
+        self.trigram_query(&mut trigrams)
+    }
+
+    fn multi_buffer_query(&self, targets: &Vec<Vec<u8>>) -> Result<HashSet<u64>> {
         // Get the trigrams we are interested in
         let mut trigrams: Vec<u32> = Default::default();
         for segment in targets {
@@ -250,8 +297,12 @@ impl TrigramFilter {
         }
         trigrams.sort();
         trigrams.dedup();
+        self.trigram_query(&mut trigrams)
+    }
+
+    fn trigram_query(&self, trigrams: &mut Vec<u32>) -> Result<HashSet<u64>> {
         if trigrams.len() == 0 {
-            return Ok(vec![]);
+            return Ok(Default::default());
         }
 
         // Get the block ranges
@@ -276,18 +327,7 @@ impl TrigramFilter {
             items = items.intersection(&net_items).cloned().collect();
         }
 
-        return Ok(items.into_iter().collect())
-    }
-
-    pub fn run_query(&self, query: Query) -> Result<HashSet<u64>> {
-        match query {
-            Query::Or(parts) => {
-
-            },
-            Query::And(_) => todo!(),
-            Query::String(_) => todo!(),
-            Query::Literal(_) => todo!(),
-        }
+        return Ok(items)
     }
 
     fn get_bucket_range(&self, index: u32) -> Result<(u64, u64)> {
@@ -341,7 +381,7 @@ mod test {
             for _ in 0..10 {
                 let index = rand::thread_rng().gen_range(0..input_data.len()-50);
                 let search = Vec::from(&input_data[index..index+50]);
-                assert_eq!(filter.search(&vec![search]).unwrap(), vec![0u64]);
+                assert_eq!(filter.buffer_query(&search).unwrap(), [0u64].into());
             }
             filter.file
         };
@@ -354,7 +394,7 @@ mod test {
             for _ in 0..10 {
                 let index = rand::thread_rng().gen_range(0..input_data.len()-50);
                 let search = Vec::from(&input_data[index..index+50]);
-                assert_eq!(filter.search(&vec![search]).unwrap(), vec![0u64]);
+                assert_eq!(filter.buffer_query(&search).unwrap(), [0u64].into());
             }
         }
 
