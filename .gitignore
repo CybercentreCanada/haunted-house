@@ -1,4 +1,4 @@
 /target
-.lvenv
-.wvenv
 .venv
+.direnv
+.mypy_cache

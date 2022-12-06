@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,19 +5,17 @@ use anyhow::{Context, Result};
 
 
 use log::{info, error, warn};
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::{pyclass, PyResult, pymethods, Py, PyAny, Python, PyObject};
 use reqwest::StatusCode;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 
-use crate::blob_cache::BlobCache;
+use crate::blob_cache::{BlobCache, BlobHandle};
 use crate::filter::TrigramFilter;
 use crate::interface::{WorkPackage, FilterTask, YaraTask, WorkRequest, WorkResult, WorkResultValue, WorkError};
 use crate::storage::{BlobStorage, LocalDirectory, PythonBlobStore};
-use crate::cache::LocalCache;
 
 
 #[pyclass]
@@ -28,7 +25,7 @@ pub struct WorkerBuilder {
     file_storage: Option<BlobStorage>,
     api_token: Option<String>,
     server_address: Option<String>,
-    cache_space: Option<(PathBuf, usize)>,
+    cache_space: Option<(PathBuf, usize, usize)>,
 }
 
 #[pymethods]
@@ -58,8 +55,8 @@ impl WorkerBuilder {
         Ok(())
     }
 
-    fn cache_directory(&mut self, path: PathBuf, capacity: usize) -> PyResult<()> {
-        self.cache_space = Some((path, capacity));
+    fn cache_directory(&mut self, path: PathBuf, index_capacity: usize, file_capacity: usize) -> PyResult<()> {
+        self.cache_space = Some((path, index_capacity, file_capacity));
         Ok(())
     }
 
@@ -88,7 +85,7 @@ impl WorkerBuilder {
         let token = self.api_token.take().ok_or(anyhow::format_err!("An api token must be configured."))?;
 
         // Get cache
-        let cache = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
+        let (cache_dir, index_cache_size, file_cache_size) = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
 
         let address = match &self.server_address {
             Some(address) => address.clone(),
@@ -97,11 +94,12 @@ impl WorkerBuilder {
 
         Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
             // Define cache directory
-            let index_cache = BlobCache::new(index_storage, cache.1, cache.0);
+            let index_cache = BlobCache::new(index_storage, index_cache_size, cache_dir.clone());
+            let file_cache = BlobCache::new(file_storage, file_cache_size, cache_dir);
 
 
             let (sender, recv) = mpsc::unbounded_channel();
-            let data = Arc::new(WorkerData::new(sender.clone(), file_storage, index_cache, address, token)?);
+            let data = Arc::new(WorkerData::new(sender.clone(), file_cache, index_cache, address, token)?);
 
             tokio::spawn(async {
                 if let Err(err) = worker_manager(data, recv).await {
@@ -129,10 +127,9 @@ struct WorkerHandle {
 struct WorkerData {
     // connection: mpsc::UnboundedSender<WorkerMessage>,
     hostname: String,
-    file_storage: BlobStorage,
+    file_cache: BlobCache,
     index_cache: BlobCache,
     address: String,
-    token: String,
     client: reqwest::Client,
 }
 
@@ -144,7 +141,7 @@ enum TaskId {
 
 impl WorkerData {
 
-    fn new(connection: mpsc::UnboundedSender<WorkerMessage>, file_storage: BlobStorage, index_cache: BlobCache, address: String, token: String) -> Result<Self> {
+    fn new(connection: mpsc::UnboundedSender<WorkerMessage>, file_cache: BlobCache, index_cache: BlobCache, address: String, token: String) -> Result<Self> {
         // Build our default header list
         let mut headers = reqwest::header::HeaderMap::new();
         let mut auth_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
@@ -162,10 +159,9 @@ impl WorkerData {
                 Ok(host) => host,
                 Err(_) => return Err(anyhow::anyhow!("Hostname has bad characters?")),
             },
-            file_storage,
+            file_cache,
             index_cache,
             address,
-            token,
             client,
         })
     }
@@ -173,9 +169,8 @@ impl WorkerData {
     async fn get_work_package(&self) -> Result<WorkPackage> {
         let work_request = WorkRequest {
             worker: self.hostname.clone(),
-            cached_filters: Default::default(),
+            cached_filters: self.index_cache.current_open().await?,
         };
-        warn!("TODO track local index blob cache.");
 
         // Try to get a work package
         let resp = self.client.get(format!("{}/work/", self.address))
@@ -355,6 +350,44 @@ async fn do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> (TaskId, Re
     }
 }
 
+
+
 async fn _do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()> {
-    todo!("yara task not implemented");
+
+    let (file_send, mut file_recv) = mpsc::unbounded_channel::<(Vec<u8>, BlobHandle)>();
+
+    // Run the interaction with yara in a blocking thread
+    let filtered = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
+        // Compile the yara rules
+        let compiler = yara::Compiler::new()?
+            .add_rules_str(&yara_task.yara_rule)?;
+        let rules = compiler.compile_rules()?;
+
+        // Try
+        let mut selected = vec![];
+        while let Some((hash, handle)) = file_recv.blocking_recv() {
+            let result = rules.scan_file(handle.path(), 60 * 30)?;
+            if !result.is_empty() {
+                selected.push(hash);
+            }
+        }
+        return Ok(selected);
+    }).await??;
+
+    // Load the files and send them to the worker
+    for hash in yara_task.hashes {
+        // download the file
+        let hash_string = hex::encode(&hash);
+        match data.file_cache.open(hash_string.clone()).await {
+            Ok(blob) => file_send.send((hash, blob))?,
+            Err(err) => info!("File not available: {hash_string} {err}"),
+        }
+    }
+
+    // Report the result to the broker
+    data.report_result(WorkResult {
+        id: yara_task.id,
+        search: yara_task.search,
+        value: WorkResultValue::Yara(filtered),
+    }).await
 }

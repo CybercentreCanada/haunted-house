@@ -30,6 +30,8 @@ sha2 = "*"
 itertools = "*"
 weak-self = "*"
 gethostname = "0.4"
+yara = { version = "0.16", features= ["vendored"] }
+
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -40,7 +42,6 @@ poem = { version = "1.3", features = ["anyhow"] }
 reqwest = { version = "0.11", features = ["json"] }
 
 sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
-#deadpool-sqlite = "0.5"
 
 pyo3 = { version = "0.17", features = ["extension-module", "anyhow", "chrono"] }
 pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"] }

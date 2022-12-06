@@ -30,6 +30,10 @@ impl BlobHandle {
         }
     }
 
+    pub fn path(&self) -> PathBuf {
+        self.data.file.path().to_owned()
+    }
+
     pub fn open(&self) -> Result<std::fs::File> {
         Ok(self.data.file.reopen()?)
     }

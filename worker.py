@@ -19,7 +19,7 @@ async def main():
     with tempfile.TemporaryDirectory() as tempdir:
         builder = WorkerBuilder()
         builder.api_token('password')
-        builder.cache_directory(tempdir, 100 << 30)
+        builder.cache_directory(tempdir, 100 << 30, 2 << 30)
         worker = await builder.start()
 
         while True:

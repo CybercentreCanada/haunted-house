@@ -607,6 +607,7 @@ impl SQLiteInterface {
         // Grab some yara jobs
         let yara_tasks = self.get_yara_task(&mut conn, &req.worker).await?;
 
+        debug!("Returning work bundle with {} filters {} yara batches", filter_tasks.len(), yara_tasks.len());
         return Ok(WorkPackage{
             filter: filter_tasks,
             yara: yara_tasks,
