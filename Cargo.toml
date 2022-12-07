@@ -21,6 +21,7 @@ postcard = { version = "1.0.2", features = ["alloc"] }
 anyhow = "1"
 uuid = { version = "*", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+parse_duration = "2"
 tempfile = "3"
 log = "*"
 env_logger = "0.9"

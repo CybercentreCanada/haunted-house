@@ -89,10 +89,6 @@ impl BlobID {
         Self(format!("{:x}", uuid::Uuid::new_v4().as_u128()))
     }
 
-    pub fn from(data: &str) -> Self {
-        Self(data.to_owned())
-    }
-
     pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
         self.0.as_bytes()
     }
@@ -107,6 +103,9 @@ impl std::fmt::Display for BlobID {
         f.write_str(&self.0)
     }
 }
+
+impl From<String> for BlobID { fn from(value: String) -> Self { Self(value) } }
+impl From<&str> for BlobID { fn from(value: &str) -> Self { Self(value.to_owned()) } }
 
 pub enum Database {
     // Rocks(RocksInterface),
@@ -158,6 +157,30 @@ impl Database {
     pub async fn list_indices(&self) -> Result<Vec<(IndexGroup, IndexID)>> {
         match self {
             Database::SQLite(local) => local.list_indices().await,
+        }
+    }
+
+    pub async fn lease_blob(&self) -> Result<BlobID> {
+        match self {
+            Database::SQLite(local) => local.lease_blob().await,
+        }
+    }
+
+    pub async fn list_garbage_blobs(&self) -> Result<Vec<BlobID>> {
+        match self {
+            Database::SQLite(local) => local.list_garbage_blobs().await,
+        }
+    }
+
+    pub async fn release_blob(&self, id: BlobID) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.release_blob(id).await,
+        }
+    }
+
+    pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.release_groups(id).await,
         }
     }
 

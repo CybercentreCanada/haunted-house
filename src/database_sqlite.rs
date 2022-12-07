@@ -3,7 +3,7 @@ use std::path::{Path};
 
 use anyhow::{Result, Context};
 use futures::{TryStreamExt};
-use log::{debug};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
 use sqlx::pool::{PoolOptions, PoolConnection};
@@ -362,9 +362,8 @@ impl SQLiteInterface {
             // write
             let mut trans = conn.begin().await?;
             debug!("update {index_group} {index_id} add old blob to garbage collection");
-            sqlx::query("INSERT OR IGNORE INTO garbage(blob_id) VALUES(?)")
-                .bind(old_blob_id.as_str())
-                .execute(&mut trans).await?;
+            self._schedule_blob_gc(&mut trans, old_blob_id, chrono::Utc::now()).await?;
+            self._release_blob_gc(&mut trans, blob_id).await?;
 
             debug!("update {index_group} {index_id} insert new index entry");
             let res = match old {
@@ -392,6 +391,78 @@ impl SQLiteInterface {
             SELECT expiry_group, label FROM index_index")
             .fetch_all(&mut conn).await?;
         Ok(list)
+    }
+
+    pub async fn lease_blob(&self) -> Result<BlobID> {
+        let id = BlobID::new();
+        self._schedule_blob_gc(&self.db, &id, chrono::Utc::now() + chrono::Duration::days(1)).await?;
+        return Ok(id)
+    }
+
+    pub async fn list_garbage_blobs(&self) -> Result<Vec<BlobID>> {
+        let rows: Vec<(BlobID, )> = sqlx::query_as(
+            "SELECT blob_id FROM garbage WHERE time < ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .fetch_all(&self.db).await?;
+        return Ok(rows.into_iter().map(|row|row.0).collect())
+    }
+
+    pub async fn release_blob(&self, id: BlobID) -> Result<()> {
+        self._release_blob_gc(&self.db, &id).await
+    }
+
+    async fn _schedule_blob_gc<'e, E>(&self, conn: E, id: &BlobID, when: chrono::DateTime<chrono::Utc>) -> Result<()> 
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        sqlx::query("INSERT OR REPLACE INTO garbage(blob_id, time) VALUES(?, ?)")
+            .bind(id.as_str())
+            .bind(&when.to_rfc3339())
+            .execute(conn).await?;
+        return Ok(())
+    }
+
+    async fn _release_blob_gc<'e, E>(&self, conn: E, id: &BlobID) -> Result<()> 
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        sqlx::query("DELETE FROM garbage WHERE blob_id = ?").bind(id.as_str()).execute(conn).await?;
+        return Ok(())
+    }
+
+    pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
+        // Search for groups older than that id
+        let rows: Vec<(Vec<u8>, )> = sqlx::query_as(
+            "SELECT data FROM index_index WHERE expiry_group <= ?")
+            .bind(id.as_str())
+            .fetch_all(&self.db).await?;
+
+        for data in rows {
+            let entry = postcard::from_bytes(&data.0)?;
+            self._release_group(entry).await?;
+        }
+
+        return Ok(())
+    }
+
+    async fn _release_group(&self, entry: IndexEntry) -> Result<()> {
+        info!("Garbage collecting index for {}", entry.group);
+
+        // In a transaction
+        let mut trans = self.db.begin().await?;
+
+        // Delete from index_index
+        sqlx::query("DELETE FROM index_index WHERE label = ?")
+            .bind(entry.label.as_str())
+            .execute(&mut trans).await?;
+        
+        // Add blob to GC
+        self._schedule_blob_gc(&mut trans, &entry.current_blob, chrono::Utc::now()).await?;
+        
+        // Delete group table
+        let table_name = filter_table_name(&entry.label);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table_name}")).execute(&mut trans).await?;
+
+        // Commit
+        Ok(trans.commit().await?)
     }
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {

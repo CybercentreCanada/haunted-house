@@ -13,7 +13,7 @@ use futures::future::select_all;
 use log::{error, debug, info};
 use tokio::sync::{mpsc, oneshot};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Duration};
 use tokio::task::JoinHandle;
 use weak_self::WeakSelf;
 
@@ -28,6 +28,7 @@ pub enum IngestMessage {
 pub struct Config {
     pub batch_limit_size: usize,
     pub batch_limit_seconds: u64,
+    pub garbage_collection_interval: std::time::Duration,
 }
 
 impl Default for Config {
@@ -35,6 +36,7 @@ impl Default for Config {
         Self {
             batch_limit_seconds: chrono::Duration::hours(1).num_seconds() as u64,
             batch_limit_size: 100,
+            garbage_collection_interval: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -48,7 +50,8 @@ pub struct HouseCore {
     pub authenticator: Authenticator,
     pub config: Config,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
-    search_watchers: mpsc::UnboundedSender<WorkResult>
+    search_watchers: mpsc::UnboundedSender<WorkResult>,
+    garbage_collection_notification: tokio::sync::Notify,
 }
 
 impl HouseCore {
@@ -66,11 +69,13 @@ impl HouseCore {
             ingest_queue: send_ingest,
             config,
             search_watchers: send_search,
+            garbage_collection_notification: tokio::sync::Notify::new()
         });
         core.weak_self.init(&core);
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
         tokio::spawn(search_watcher(core.clone(), receive_search));
+        tokio::spawn(garbage_collector(core.clone()));
 
         return Ok(core)
     }
@@ -309,7 +314,7 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
 
             // Upload the new index file
             let size = new_index_file.size_to_fit().await?;
-            let new_blob = BlobID::new();
+            let new_blob = core.database.lease_blob().await?;
             debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
             core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
 
@@ -338,7 +343,7 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
             }).await?;
 
             // Upload the new index file
-            let new_blob = BlobID::new();
+            let new_blob = core.database.lease_blob().await?;
             let size = new_index_file.size_to_fit().await?;
             debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
             core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
@@ -353,6 +358,7 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
     for res in remaining_responses {
         _ = res.send(Ok(()));
     }
+    core.garbage_collection_notification.notify_one();
     Ok(())
 }
 
@@ -445,4 +451,50 @@ async fn _single_search_watcher(core: Arc<HouseCore>, code: String, mut messages
         }
     }
     return Ok(())
+}
+
+
+async fn garbage_collector(core: Arc<HouseCore>){
+    loop {
+        // Kick off a garbage collection job
+        let result = tokio::spawn(_garbage_collector(core.clone())).await;
+
+        match result {
+            // Log errors
+            Ok(result) => if let Err(err) = result {
+                error!("Error in garbage collection: {err}");
+            },
+            // Log panics
+            Err(err) => {
+                error!("Panic in garbage collection: {err}");
+            },
+        };
+    }
+}
+
+async fn _garbage_collector(core: Arc<HouseCore>) -> Result<()> {
+    loop {
+        // Clean up unused blobs
+        {
+            let garbage_blobs = core.database.list_garbage_blobs().await?;
+            for blob_id in garbage_blobs {
+                core.index_storage.delete(blob_id.as_str()).await?;
+                if core.index_storage.size(blob_id.as_str()).await?.is_none() {
+                    core.database.release_blob(blob_id).await?;
+                }
+            }
+        }
+        
+        // Clean up old index groups
+        {
+            let old = Some(Utc::now() - Duration::days(1));
+            core.database.release_groups(IndexGroup::create(&old)).await?;
+        }
+        
+        // Wait a while before doing garbage collection again
+        tokio::time::timeout(
+            core.config.garbage_collection_interval,
+            core.garbage_collection_notification.notified()
+        ).await;
+    }
 }

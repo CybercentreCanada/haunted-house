@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 
-use log::{info, error, warn};
+use log::{info, error, debug};
 use pyo3::{pyclass, PyResult, pymethods, Py, PyAny, Python, PyObject};
 use reqwest::StatusCode;
 use tokio::sync::{mpsc};
@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 
 use crate::blob_cache::{BlobCache, BlobHandle};
+use crate::database::BlobID;
 use crate::filter::TrigramFilter;
 use crate::interface::{WorkPackage, FilterTask, YaraTask, WorkRequest, WorkResult, WorkResultValue, WorkError};
 use crate::storage::{BlobStorage, LocalDirectory, PythonBlobStore};
@@ -99,7 +100,7 @@ impl WorkerBuilder {
 
 
             let (sender, recv) = mpsc::unbounded_channel();
-            let data = Arc::new(WorkerData::new(sender.clone(), file_cache, index_cache, address, token)?);
+            let data = Arc::new(WorkerData::new(file_cache, index_cache, address, token)?);
 
             tokio::spawn(async {
                 if let Err(err) = worker_manager(data, recv).await {
@@ -116,12 +117,19 @@ impl WorkerBuilder {
 }
 
 enum WorkerMessage {
-
+    Stop,
 }
 
 #[pyclass]
 struct WorkerHandle {
     connection: mpsc::UnboundedSender<WorkerMessage>,
+}
+
+#[pymethods]
+impl WorkerHandle {
+    pub fn stop(&self) {
+        _ = self.connection.send(WorkerMessage::Stop);
+    }
 }
 
 struct WorkerData {
@@ -141,7 +149,7 @@ enum TaskId {
 
 impl WorkerData {
 
-    fn new(connection: mpsc::UnboundedSender<WorkerMessage>, file_cache: BlobCache, index_cache: BlobCache, address: String, token: String) -> Result<Self> {
+    fn new(file_cache: BlobCache, index_cache: BlobCache, address: String, token: String) -> Result<Self> {
         // Build our default header list
         let mut headers = reqwest::header::HeaderMap::new();
         let mut auth_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
@@ -169,7 +177,7 @@ impl WorkerData {
     async fn get_work_package(&self) -> Result<WorkPackage> {
         let work_request = WorkRequest {
             worker: self.hostname.clone(),
-            cached_filters: self.index_cache.current_open().await?,
+            cached_filters: self.index_cache.current_open().await?.into_iter().map(BlobID::from).collect(),
         };
 
         // Try to get a work package
@@ -214,20 +222,6 @@ impl WorkerData {
         resp.error_for_status().context("Error reporting result")?;
         Ok(())
     }
-
-    // async fn cleanup_tasks(&self, task_map: &mut IdMap, error: &String) -> Result<()> {
-    //     let mut bad = vec![];
-    //     for (id, handle) in task_map.iter() {
-    //         if handle.is_finished() {
-    //             bad.push(*id);
-    //         }
-    //     }
-    //     for id in bad {
-    //         task_map.remove(&id);
-    //         self.report_error(id, error).await?;
-    //     }
-    //     Ok(())
-    // }
 }
 
 
@@ -251,6 +245,10 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
                 }
             };
 
+            if !work.filter.is_empty() || !work.yara.is_empty() {
+                info!("Got {} filter and {} yara tasks", work.filter.len(), work.yara.len());
+            }
+            
             // dispatch all the tasks in the package
             for filter_task in work.filter {
                 active_tasks.spawn(do_filter_task(data.clone(), filter_task));
@@ -275,7 +273,7 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
                 };
 
                 match message {
-
+                    WorkerMessage::Stop => still_running = false,
                 }
             },
 
@@ -353,38 +351,51 @@ async fn do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> (TaskId, Re
 
 
 async fn _do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()> {
+    debug!("yara task {} starting", yara_task.id);
+    let filter_handle = {
+        let (file_send, mut file_recv) = mpsc::unbounded_channel::<(Vec<u8>, BlobHandle)>();
 
-    let (file_send, mut file_recv) = mpsc::unbounded_channel::<(Vec<u8>, BlobHandle)>();
+        // Run the interaction with yara in a blocking thread
+        let filter_handle = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
+            debug!("yara task {} launched yara worker", yara_task.id);
+            // Compile the yara rules
+            let compiler = yara::Compiler::new()?
+                .add_rules_str(&yara_task.yara_rule)?;
+            let rules = compiler.compile_rules()?;
+            debug!("yara task {} yara ready", yara_task.id);
 
-    // Run the interaction with yara in a blocking thread
-    let filtered = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
-        // Compile the yara rules
-        let compiler = yara::Compiler::new()?
-            .add_rules_str(&yara_task.yara_rule)?;
-        let rules = compiler.compile_rules()?;
+            // Try
+            let mut selected = vec![];
+            while let Some((hash, handle)) = file_recv.blocking_recv() {
+                debug!("yara task {} processing {}", yara_task.id, handle.id());
+                let result = rules.scan_file(handle.path(), 60 * 30)?;
+                if !result.is_empty() {
+                    selected.push(hash);
+                }
+            }
+            debug!("yara task {} yara finished", yara_task.id);
+            return Ok(selected);
+        });
 
-        // Try
-        let mut selected = vec![];
-        while let Some((hash, handle)) = file_recv.blocking_recv() {
-            let result = rules.scan_file(handle.path(), 60 * 30)?;
-            if !result.is_empty() {
-                selected.push(hash);
+        // Load the files and send them to the worker
+        for hash in yara_task.hashes {
+            // download the file
+            let hash_string = hex::encode(&hash);
+            debug!("yara task {} waiting for {}", yara_task.id, hash_string);
+            match data.file_cache.open(hash_string.clone()).await {
+                Ok(blob) => file_send.send((hash, blob))?,
+                Err(err) => info!("File not available: {hash_string} {err}"),
             }
         }
-        return Ok(selected);
-    }).await??;
 
-    // Load the files and send them to the worker
-    for hash in yara_task.hashes {
-        // download the file
-        let hash_string = hex::encode(&hash);
-        match data.file_cache.open(hash_string.clone()).await {
-            Ok(blob) => file_send.send((hash, blob))?,
-            Err(err) => info!("File not available: {hash_string} {err}"),
-        }
-    }
+        filter_handle
+    };
+    
+    // Wait for worker to finish
+    let filtered = filter_handle.await??;
 
     // Report the result to the broker
+    debug!("yara task {} finished", yara_task.id);
     data.report_result(WorkResult {
         id: yara_task.id,
         search: yara_task.search,

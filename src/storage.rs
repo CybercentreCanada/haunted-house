@@ -69,6 +69,12 @@ impl BlobStorage {
             BlobStorage::Python(obj) => obj.get(label).await,
         }
     }
+    pub async fn delete(&self, label: &str) -> Result<()> {
+        match self {
+            BlobStorage::Local(obj) => obj.delete(label).await,
+            BlobStorage::Python(obj) => obj.delete(label).await,
+        }
+    }
 }
 
 
@@ -140,6 +146,11 @@ impl LocalDirectory {
     async fn get(&self, label: &str) -> Result<Vec<u8>> {
         let path = self.get_path(&label);
         Ok(tokio::fs::read(path).await?)
+    }
+
+    async fn delete(&self, label: &str) -> Result<()> {
+        let path = self.get_path(&label);
+        Ok(tokio::fs::remove_file(path).await?)
     }
 }
 
@@ -259,6 +270,21 @@ impl PythonBlobStore {
             let result: Vec<u8> = result.extract(py)?;
             Ok(result)
         });
+    }
+
+    async fn delete(&self, label: &str) -> Result<()> {
+        // Invoke method
+        let future = Python::with_gil(|py| {
+            // calling the py_sleep method like a normal function returns a coroutine
+            let coroutine = self.object.call_method1(py, "delete", (label.to_string(), ))?;
+
+            // convert the coroutine into a Rust future
+            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
+        })?;
+
+        // await the future
+        future.await?;
+        return Ok(())
     }
 }
 

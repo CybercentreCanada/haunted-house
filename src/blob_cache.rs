@@ -34,6 +34,10 @@ impl BlobHandle {
         self.data.file.path().to_owned()
     }
 
+    pub fn id(&self) -> &str {
+        &self.data.id
+    }
+
     pub fn open(&self) -> Result<std::fs::File> {
         Ok(self.data.file.reopen()?)
     }
