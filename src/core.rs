@@ -196,10 +196,16 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                             _ = respond.send(Err(anyhow::anyhow!("Expected hash to be binary encoded sha256")));
                             continue
                         }
-                        debug!("Ingesting {}", hex::encode(&hash));
+
+                        // Make sure the expiry isn't already due
+                        let index_group = IndexGroup::create(&expiry);
+                        let today_group = IndexGroup::create(&Some(Utc::now()));
+                        if index_group.as_str() <= today_group.as_str() {
+                            continue
+                        }
 
                         // Try to update in place without changing indices
-                        let index_group = IndexGroup::create(&expiry);
+                        debug!("Ingesting {}", hex::encode(&hash));
                         if core.database.update_file_access(&hash, &access, &index_group).await? {
                             debug!("Ingesting {} by updating file data", hex::encode(&hash));
                             _ = respond.send(Ok(()));

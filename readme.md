@@ -3,7 +3,6 @@
 # todo
 
 ## Important
-- don't save in expired/nearly expired groups
 - worker loss detection/task timeout
 - filter or bundle large response sets
 
