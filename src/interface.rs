@@ -166,6 +166,7 @@ pub struct SearchRequestResponse {
     pub pending_indices: u64,
     pub pending_candidates: u64,
     pub hits: Vec<String>,
+    pub truncated: bool,
 }
 
 #[handler]

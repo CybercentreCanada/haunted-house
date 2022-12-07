@@ -32,6 +32,7 @@ pub struct Config {
     pub index_soft_entries_max: u64,
     pub index_soft_bytes_max: u64,    
     pub yara_job_size: u64,
+    pub max_result_set_size: u64,
 }
 
 const DEFAULT_SOFT_MAX_BYTES_SIZE: u64 = 50 << 30;
@@ -46,6 +47,7 @@ impl Default for Config {
             index_soft_bytes_max: DEFAULT_SOFT_MAX_BYTES_SIZE,
             index_soft_entries_max: DEFAULT_SOFT_MAX_ENTRIES_SIZE,
             yara_job_size: 1000,
+            max_result_set_size: 1_000_000,
         }
     }
 }

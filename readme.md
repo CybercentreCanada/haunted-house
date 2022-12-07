@@ -4,7 +4,6 @@
 
 ## Important
 - worker loss detection/task timeout
-- filter or bundle large response sets
 
 ## Nice to have/performance
 - use blob cache for indexing to prevent upload+delete immidately followed by download

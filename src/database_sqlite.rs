@@ -98,7 +98,8 @@ struct SearchRecord {
     errors: Vec<String>,
     // pending_indices: Vec<BlobID>,
     // pending_files: BTreeSet<Vec<u8>>,
-    hit_files: BTreeSet<Vec<u8>>
+    hit_files: BTreeSet<Vec<u8>>,
+    truncated: bool,
 }
 
 
@@ -497,6 +498,7 @@ impl SQLiteInterface {
                 access: req.access,
                 query: req.query.clone(),
                 hit_files: Default::default(),
+                truncated: false,
             })?)
             .execute(&mut conn).await?;
 
@@ -515,12 +517,10 @@ impl SQLiteInterface {
 
     pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
         let mut conn = self.db.acquire().await?;
-        let data: Option<(Vec<u8>, )> = sqlx::query_as("SELECT data FROM searches WHERE code = ?")
-            .bind(&code)
-            .fetch_optional(&mut conn).await?;
+        let data: Option<SearchRecord> = self._get_search(&mut conn, &code).await?;
 
         let search: SearchRecord = match data {
-            Some((data, )) => postcard::from_bytes(&data)?,
+            Some(search) => search,
             None => return Err(anyhow::anyhow!("Search code not found"))
         };
 
@@ -540,6 +540,7 @@ impl SQLiteInterface {
             pending_indices: pending_indices as u64,
             pending_candidates: pending_files as u64,
             hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
+            truncated: search.truncated,
         })
     }
 
@@ -567,11 +568,13 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
-    async fn get_search(&self, code: &String) -> Result<Option<SearchRecord>> {
+    async fn _get_search<'e, E>(&self, conn: E, code: &String) -> Result<Option<SearchRecord>>  
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
         let search: Option<(Vec<u8>, )> = sqlx::query_as(
             "SELECT data FROM searches WHERE code = ? LIMIT 1")
             .bind(&code)
-            .fetch_optional(&self.db).await?;
+            .fetch_optional(conn).await?;
 
         Ok(match search {
             Some(search) => Some(postcard::from_bytes(&search.0)?),
@@ -582,14 +585,14 @@ impl SQLiteInterface {
     async fn get_yara_task(&self, conn: &mut PoolConnection<sqlx::Sqlite>, worker: &String) -> Result<Vec<YaraTask>> {
         let search: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
             "SELECT id, search, hashes FROM yara_tasks WHERE assigned_worker IS NULL LIMIT 1")
-            .fetch_optional(conn).await?;
+            .fetch_optional(&mut *conn).await?;
 
         let (id, search, hashes) = match search {
             Some(row) => row,
             None => return Ok(vec![]),
         };
 
-        let record = match self.get_search(&search).await? {
+        let record = match self._get_search(conn, &search).await? {
             Some(record) => record,
             None => return Ok(vec![])
         };
@@ -690,7 +693,7 @@ impl SQLiteInterface {
         let search_access = match &search_cache.access {
             Some(access) => access,
             None => {
-                let search_entry = self.get_search(code).await?;
+                let search_entry = self._get_search(&mut conn, code).await?;
                 match search_entry {
                     Some(search_entry) => {
                         search_cache.access = Some(search_entry.access.clone());
@@ -770,9 +773,17 @@ impl SQLiteInterface {
 
             // Update the record
             let before_count = search.hit_files.len();
-            search.hit_files.extend(hashes.iter().cloned());
+            let before_truncated = search.truncated;
+            for hash in hashes.iter() {
+                if search.hit_files.contains(hash) { continue }
+                if search.hit_files.len() >= self.config.max_result_set_size as usize { 
+                    search.truncated = true;
+                    break 
+                }
+                search.hit_files.insert(hash.clone());
+            }
 
-            if before_count == search.hit_files.len() {
+            if before_count == search.hit_files.len() && before_truncated == search.truncated {
                 break;
             }
 
