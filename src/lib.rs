@@ -119,9 +119,6 @@ impl ServerInterface {
     }
 }
 
-const DEFAULT_SOFT_MAX_BYTES_SIZE: u64 = 50 << 30;
-const DEFAULT_SOFT_MAX_ENTRIES_SIZE: u64 = 50 << 30;
-
 enum DatabaseConfig {
     SQLite(PathBuf),
     SQLiteTemp()
@@ -137,8 +134,6 @@ struct ServerBuilder {
     bind_address: String,
     authenticator: Option<Authenticator>,
     cache_space: Option<(PathBuf, usize)>,
-    index_soft_entries_max: Option<u64>,
-    index_soft_bytes_max: Option<u64>,
     database_config: Option<DatabaseConfig>,
     config: Config,
 }
@@ -199,11 +194,11 @@ impl ServerBuilder {
     }
 
     fn index_soft_bytes_max(&mut self, size: u64) {
-        self.index_soft_bytes_max = Some(size);
+        self.config.index_soft_bytes_max = size;
     }
 
     fn index_soft_entries_max(&mut self, size: u64) {
-        self.index_soft_entries_max = Some(size);
+        self.config.index_soft_entries_max = size;
     }
 
     fn build(&mut self, py: Python) -> PyResult<PyObject> {
@@ -227,8 +222,7 @@ impl ServerBuilder {
             Some(config) => config,
             None => DatabaseConfig::SQLiteTemp()
         };
-        let soft_entries_max = self.index_soft_entries_max.unwrap_or(DEFAULT_SOFT_MAX_ENTRIES_SIZE);
-        let soft_bytes_max = self.index_soft_bytes_max.unwrap_or(DEFAULT_SOFT_MAX_BYTES_SIZE);
+
         let bind_address = if self.bind_address.is_empty() {
             "localhost:8080".to_owned()
         } else {
@@ -243,8 +237,8 @@ impl ServerBuilder {
             // Initialize database
             info!("Connecting to database.");
             let database = match db_config {
-                DatabaseConfig::SQLite(path) => Database::new_sqlite(soft_entries_max, soft_bytes_max, path.to_str().unwrap()).await?,
-                DatabaseConfig::SQLiteTemp() => Database::new_sqlite_temp(soft_entries_max, soft_bytes_max).await?,
+                DatabaseConfig::SQLite(path) => Database::new_sqlite(config.clone(), path.to_str().unwrap()).await?,
+                DatabaseConfig::SQLiteTemp() => Database::new_sqlite_temp(config.clone()).await?,
             };
 
             // Start server core

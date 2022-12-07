@@ -9,7 +9,7 @@ use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
 use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
-use crate::core::SearchCache;
+use crate::core::{SearchCache, Config};
 use crate::database::{IndexGroup, BlobID, IndexID};
 use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
 use crate::query::Query;
@@ -55,8 +55,7 @@ impl sqlx::Type<sqlx::Sqlite> for BlobID {
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    index_soft_bytes_max: u64,
-    index_soft_entries_max: u64,
+    config: Config,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -104,7 +103,7 @@ struct SearchRecord {
 
 
 impl SQLiteInterface {
-    pub async fn new(index_soft_entries_max: u64, index_soft_bytes_max: u64, url: &str) -> Result<Self> {
+    pub async fn new(config: Config, url: &str) -> Result<Self> {
 
         let url = if url == "memory" {
             format!("sqlite::memory:")
@@ -125,17 +124,16 @@ impl SQLiteInterface {
 
         Ok(Self {
             db: pool,
-            index_soft_entries_max,
-            index_soft_bytes_max,
+            config,
             _temp_dir: None,
         })
     }
 
-    pub async fn new_temp(index_soft_entries_max: u64, index_soft_bytes_max: u64) -> Result<Self> {
+    pub async fn new_temp(config: Config) -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let path = tempdir.path().join("house.db");
 
-        let mut obj = Self::new(index_soft_entries_max, index_soft_bytes_max, path.to_str().unwrap()).await?;
+        let mut obj = Self::new(config, path.to_str().unwrap()).await?;
         obj._temp_dir = Some(tempdir);
 
         Ok(obj)
@@ -272,13 +270,13 @@ impl SQLiteInterface {
         for (key, value) in list {
             let value: IndexEntry = postcard::from_bytes(&value)?;
 
-            if value.size_bytes >= self.index_soft_bytes_max {
-                debug!("index {} chunk over size {}/{} skipping", key, value.size_bytes, self.index_soft_bytes_max);
+            if value.size_bytes >= self.config.index_soft_bytes_max {
+                debug!("index {} chunk over size {}/{} skipping", key, value.size_bytes, self.config.index_soft_bytes_max);
                 continue;
             }
 
-            if value.size_entries >= self.index_soft_entries_max {
-                debug!("index {} chunk over capacity {}/{} skipping", key, value.size_entries, self.index_soft_entries_max);
+            if value.size_entries >= self.config.index_soft_entries_max {
+                debug!("index {} chunk over capacity {}/{} skipping", key, value.size_entries, self.config.index_soft_entries_max);
                 continue;
             }
 
@@ -735,13 +733,13 @@ impl SQLiteInterface {
         }
 
         // Create yara job
-        if !found_hashes.is_empty() {
-            let hashes_data = postcard::to_allocvec(&found_hashes)?;
+        for hash_block in found_hashes.chunks(self.config.yara_job_size as usize) {
+            let hashes_data = postcard::to_allocvec(&hash_block)?;
             sqlx::query(
                 "INSERT INTO yara_tasks(search, hashes, hash_count) VALUES(?,?,?)")
                 .bind(&code)
                 .bind(hashes_data)
-                .bind(found_hashes.len() as i64)
+                .bind(hash_block.len() as i64)
                 .execute(&mut conn).await?;
         }
 

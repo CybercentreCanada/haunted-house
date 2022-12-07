@@ -29,7 +29,13 @@ pub struct Config {
     pub batch_limit_size: usize,
     pub batch_limit_seconds: u64,
     pub garbage_collection_interval: std::time::Duration,
+    pub index_soft_entries_max: u64,
+    pub index_soft_bytes_max: u64,    
+    pub yara_job_size: u64,
 }
+
+const DEFAULT_SOFT_MAX_BYTES_SIZE: u64 = 50 << 30;
+const DEFAULT_SOFT_MAX_ENTRIES_SIZE: u64 = 50 << 30;
 
 impl Default for Config {
     fn default() -> Self {
@@ -37,6 +43,9 @@ impl Default for Config {
             batch_limit_seconds: chrono::Duration::hours(1).num_seconds() as u64,
             batch_limit_size: 100,
             garbage_collection_interval: std::time::Duration::from_secs(60),
+            index_soft_bytes_max: DEFAULT_SOFT_MAX_BYTES_SIZE,
+            index_soft_entries_max: DEFAULT_SOFT_MAX_ENTRIES_SIZE,
+            yara_job_size: 1000,
         }
     }
 }
@@ -133,7 +142,6 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
     loop {
 
-
         // Check if its time to launch an index building job
         if let Some(job) = &mut current_batch {
             if job.is_finished() {
@@ -152,7 +160,20 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 if at_size_limit || (Utc::now() - batch_start).num_seconds() > core.config.batch_limit_seconds as i64 {
                     let key = key.clone();
                     if let Some(values) = pending_batch.remove(&key) {
-                        current_batch = Some(tokio::spawn(run_batch_ingest(core.clone(), key, values)));
+                        let mut batch = HashMap::new();
+                        let mut remains = HashMap::new();
+                        for row in values.into_iter() {
+                            if batch.len() < core.config.batch_limit_size {
+                                batch.insert(row.0, row.1);
+                            } else {
+                                remains.insert(row.0, row.1);
+                            }
+                        }
+
+                        current_batch = Some(tokio::spawn(run_batch_ingest(core.clone(), key.clone(), batch)));
+                        if !remains.is_empty() {
+                            pending_batch.insert(key, remains);
+                        }
                     }
                     break;
                 }
@@ -474,6 +495,13 @@ async fn garbage_collector(core: Arc<HouseCore>){
 
 async fn _garbage_collector(core: Arc<HouseCore>) -> Result<()> {
     loop {
+        // Delete any groups with expiry in the past. 
+        // Expiry is rounded to the day, so we give it yesterday.
+        {
+            let old = Some(Utc::now() - Duration::days(1));
+            core.database.release_groups(IndexGroup::create(&old)).await?;
+        }
+
         // Clean up unused blobs
         {
             let garbage_blobs = core.database.list_garbage_blobs().await?;
@@ -484,15 +512,9 @@ async fn _garbage_collector(core: Arc<HouseCore>) -> Result<()> {
                 }
             }
         }
-        
-        // Clean up old index groups
-        {
-            let old = Some(Utc::now() - Duration::days(1));
-            core.database.release_groups(IndexGroup::create(&old)).await?;
-        }
-        
+                
         // Wait a while before doing garbage collection again
-        tokio::time::timeout(
+        _ = tokio::time::timeout(
             core.config.garbage_collection_interval,
             core.garbage_collection_notification.notified()
         ).await;

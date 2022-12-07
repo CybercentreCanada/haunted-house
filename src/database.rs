@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::core::SearchCache;
+use crate::core::{SearchCache, Config};
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult, WorkError};
@@ -118,12 +118,12 @@ impl Database {
     //     Ok(Database::Rocks(RocksInterface::new(index_soft_max)?))
     // }
 
-    pub async fn new_sqlite(index_soft_entries_max: u64, index_soft_bytes_max: u64, path: &str) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new(index_soft_entries_max, index_soft_bytes_max, path).await?))
+    pub async fn new_sqlite(config: Config, path: &str) -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new(config, path).await?))
     }
 
-    pub async fn new_sqlite_temp(index_soft_entries_max: u64, index_soft_bytes_max: u64) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new_temp(index_soft_entries_max, index_soft_bytes_max).await?))
+    pub async fn new_sqlite_temp(config: Config) -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new_temp(config).await?))
     }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {
