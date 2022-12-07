@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
+use crate::blob_cache::BlobCache;
 use crate::database::{Database, IndexGroup, BlobID};
 use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue, WorkError};
 use crate::storage::BlobStorage;
-use crate::cache::LocalCache;
+// use crate::cache::LocalCache;
 use crate::access::AccessControl;
 use crate::filter::TrigramFilter;
 use bitvec::vec::BitVec;
 use futures::future::select_all;
 use log::{error, debug, info};
 use tokio::sync::{mpsc, oneshot};
-use anyhow::Result;
+use anyhow::{Result, Context};
 use chrono::{DateTime, Utc, Duration};
 use tokio::task::JoinHandle;
 use weak_self::WeakSelf;
@@ -57,7 +58,7 @@ pub struct HouseCore {
     pub database: Database,
     pub file_storage: BlobStorage,
     pub index_storage: BlobStorage,
-    pub local_cache: LocalCache,
+    pub index_cache: BlobCache,
     pub authenticator: Authenticator,
     pub config: Config,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
@@ -66,7 +67,7 @@ pub struct HouseCore {
 }
 
 impl HouseCore {
-    pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, local_cache: LocalCache, authenticator: Authenticator, config: Config) -> Result<Arc<Self>> {
+    pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, index_cache: BlobCache, authenticator: Authenticator, config: Config) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
         let (send_search, receive_search) = mpsc::unbounded_channel();
 
@@ -75,7 +76,7 @@ impl HouseCore {
             database,
             file_storage,
             index_storage,
-            local_cache,
+            index_cache,
             authenticator,
             ingest_queue: send_ingest,
             config,
@@ -332,18 +333,20 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
         None => {
             debug!("Ingest {} building a new index", index_group.as_str());
             let final_size = TrigramFilter::guess_max_size(data.len());
-            let new_index_file = core.local_cache.open(final_size).await?;
-            let out_handle = new_index_file.open()?;
+            let new_blob = core.database.lease_blob().await
+                .context("Leasing new blob id.")?;
+            let new_index_file = core.index_cache.open_new(new_blob.to_string(), final_size).await
+                .context("Opening a new file empty file in the cache space.")?;
+            let out_handle = new_index_file.open()
+                .context("Opening cache file to write new filter.")?;
             debug!("Ingest {} build filter file", index_group.as_str());
-            let ok: Result<()> = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 TrigramFilter::build_from_data(out_handle, data)?;
-                Ok(())
-            }).await?;
-            ok?;
+                anyhow::Ok(())
+            }).await??;
 
             // Upload the new index file
             let size = new_index_file.size_to_fit().await?;
-            let new_blob = core.database.lease_blob().await?;
             debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
             core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
 
@@ -353,17 +356,20 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
         }
         Some((index_id, old_blob, new_data_offset)) => {
             debug!("Ingest {} merging into filter {} {}", index_group.as_str(), index_id.as_str(), old_blob.as_str());
-            let data_size = core.index_storage.size(old_blob.as_str()).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
-            let index_file = core.local_cache.open(data_size).await?;
-            let index_file_handle = index_file.open()?;
+            // let data_size = core.index_storage.size(old_blob.as_str()).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
+            // let index_file = core.local_cache.open(data_size).await?;
+            // let index_file_handle = index_file.open()?;
 
             debug!("Ingest {} downloading {}", index_group.as_str(), old_blob.as_str());
-            core.index_storage.download(old_blob.as_str(), index_file.path()).await?;
-            debug!("Ingest {index_group} downloaded {old_blob} ({} bytes)", index_file.size().await?);
+            let index_file = core.index_cache.open(old_blob.to_string()).await?;
+            let index_file_handle = index_file.open()?;
+            let old_data_size = index_file.size().await?;
+            debug!("Ingest {index_group} downloaded {old_blob} ({} bytes)", old_data_size);
 
             debug!("Ingest {} creating local scratch space", index_group.as_str());
-            let final_size = TrigramFilter::guess_max_size(data.len()) + data_size;
-            let new_index_file = core.local_cache.open(final_size).await?;
+            let final_size = TrigramFilter::guess_max_size(data.len()) + old_data_size;
+            let new_blob = core.database.lease_blob().await?;
+            let new_index_file = core.index_cache.open_new(new_blob.to_string(), final_size).await?;
             let out_handle = new_index_file.open()?;
             debug!("Ingest {} merging data into index file", index_group.as_str());
             let _: Result<()> = tokio::task::spawn_blocking(move || {
@@ -372,7 +378,6 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
             }).await?;
 
             // Upload the new index file
-            let new_blob = core.database.lease_blob().await?;
             let size = new_index_file.size_to_fit().await?;
             debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
             core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;

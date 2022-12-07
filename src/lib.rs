@@ -31,9 +31,9 @@ use storage::{BlobStorage, LocalDirectory, PythonBlobStore};
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
+use crate::blob_cache::BlobCache;
 use crate::core::{IngestMessage, Config, HouseCore};
 use crate::access::AccessControl;
-use crate::cache::LocalCache;
 use crate::worker::WorkerBuilder;
 
 
@@ -232,7 +232,7 @@ impl ServerBuilder {
 
         Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
 
-            let cache = LocalCache::new(cache.1, cache.0).await;
+            let cache = BlobCache::new(index_storage.clone(), cache.1, cache.0);
 
             // Initialize database
             info!("Connecting to database.");

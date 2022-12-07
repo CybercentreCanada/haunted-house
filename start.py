@@ -9,13 +9,6 @@ import asyncio
 
 from haunted_house import ServerBuilder
 
-logger = logging.getLogger("poem")
-logger.handlers.clear()
-stream = logging.StreamHandler(sys.stdout)
-stream.formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger.addHandler(stream)
-logger.setLevel(logging.DEBUG)
-
 
 async def main():
     logger = logging.getLogger("haunted_house")
@@ -23,7 +16,7 @@ async def main():
     stream = logging.StreamHandler(sys.stdout)
     stream.formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger.addHandler(stream)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 
     with tempfile.TemporaryDirectory() as tempdir:

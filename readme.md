@@ -6,7 +6,6 @@
 - worker loss detection/task timeout
 
 ## Nice to have/performance
-- use blob cache for indexing to prevent upload+delete immidately followed by download
 - let work requests block to see if work becomes available
 - add config flag to tune filter memory use
 - add tracing
