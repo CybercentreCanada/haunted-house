@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
@@ -7,6 +7,7 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
 use sqlx::pool::{PoolOptions, PoolConnection};
+use tokio::sync::{oneshot, Mutex};
 
 use crate::access::AccessControl;
 use crate::core::{SearchCache, Config};
@@ -56,6 +57,7 @@ impl sqlx::Type<sqlx::Sqlite> for BlobID {
 pub struct SQLiteInterface {
     db: SqlitePool,
     config: Config,
+    work_waiters: Mutex<VecDeque<(String, oneshot::Sender<WorkPackage>)>>,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -126,6 +128,7 @@ impl SQLiteInterface {
         Ok(Self {
             db: pool,
             config,
+            work_waiters: Default::default(),
             _temp_dir: None,
         })
     }
@@ -568,6 +571,17 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
+    async fn release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>  
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        let req = sqlx::query(
+            "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
+            WHERE id = ?")
+            .bind(id)
+            .execute(conn).await?;
+        return Ok(req.rows_affected() > 0)
+    }
+
     async fn _get_search<'e, E>(&self, conn: E, code: &String) -> Result<Option<SearchRecord>>  
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
@@ -610,7 +624,8 @@ impl SQLiteInterface {
         }
     }
 
-    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+    
+    pub async fn get_work(&self, req: WorkRequest, respond: oneshot::Sender<WorkPackage>) -> Result<()> {
         let mut conn = self.db.acquire().await?;
         // Look for related filter jobs
         let mut filter_tasks = {
@@ -679,11 +694,17 @@ impl SQLiteInterface {
         // Grab some yara jobs
         let yara_tasks = self.get_yara_task(&mut conn, &req.worker).await?;
 
-        debug!("Returning work bundle with {} filters {} yara batches", filter_tasks.len(), yara_tasks.len());
-        return Ok(WorkPackage{
-            filter: filter_tasks,
-            yara: yara_tasks,
-        })
+        if !filter_tasks.is_empty() || !yara_tasks.is_empty() {
+            debug!("Returning work bundle with {} filters {} yara batches", filter_tasks.len(), yara_tasks.len());
+            _ = respond.send(WorkPackage{
+                filter: filter_tasks,
+                yara: yara_tasks,
+            });
+        } else {
+            let mut buffer = self.work_waiters.lock().await;
+            buffer.push_back((req.worker, respond));
+        }
+        return Ok(())
     }
 
     pub async fn finish_filter_work(&self, id: i64, code: &String, search_cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
@@ -751,6 +772,35 @@ impl SQLiteInterface {
             "DELETE FROM filter_tasks WHERE id = ?")
             .bind(id)
             .execute(&mut conn).await?;
+
+        {
+            let mut waiters = self.work_waiters.lock().await;
+            waiters.retain(|(_, resp)|!resp.is_closed());
+
+            let mut pocket_job = None;
+
+            while let Some((worker, respond)) = waiters.pop_front() {
+                let job = match pocket_job.take() {
+                    Some(pocket) => pocket,
+                    None => self.get_yara_task(&mut conn, &worker).await?,
+                };
+
+                if job.is_empty() {
+                    waiters.push_front((worker, respond));
+                    break;
+                }
+
+                if let Err(val) = respond.send(WorkPackage { filter: vec![], yara: job }) {
+                    pocket_job = Some(val.yara);
+                }
+            }
+
+            if let Some(jobs) = pocket_job {
+                for task in jobs {
+                    self.release_yara_task(&mut conn, task.id).await?;
+                }
+            }
+        }
 
         return Ok(())
     }

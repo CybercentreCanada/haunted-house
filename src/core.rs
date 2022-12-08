@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 use crate::auth::Authenticator;
 use crate::blob_cache::BlobCache;
-use crate::database::{Database, IndexGroup, BlobID};
+use crate::database::{Database, IndexGroup};
 use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue, WorkError};
 use crate::storage::BlobStorage;
-// use crate::cache::LocalCache;
 use crate::access::AccessControl;
 use crate::filter::TrigramFilter;
 use bitvec::vec::BitVec;
@@ -107,8 +106,8 @@ impl HouseCore {
         self.database.search_status(code).await
     }
 
-    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
-        self.database.get_work(req).await
+    pub async fn get_work(&self, req: WorkRequest, respond: oneshot::Sender<WorkPackage>) -> Result<()> {
+        self.database.get_work(req, respond).await
     }
 
     pub fn finish_work(&self, req: WorkResult) -> Result<()> {

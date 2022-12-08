@@ -8,7 +8,7 @@ use log::{info, error, debug};
 use pyo3::{pyclass, PyResult, pymethods, Py, PyAny, Python, PyObject};
 use reqwest::StatusCode;
 use tokio::sync::{mpsc};
-use tokio::task::JoinSet;
+use tokio::task::{JoinSet, JoinHandle};
 use tokio::time::sleep;
 
 
@@ -100,7 +100,8 @@ impl WorkerBuilder {
 
 
             let (sender, recv) = mpsc::unbounded_channel();
-            let data = Arc::new(WorkerData::new(file_cache, index_cache, address, token)?);
+            let weak = sender.downgrade();
+            let data = Arc::new(WorkerData::new(weak, file_cache, index_cache, address, token)?);
 
             tokio::spawn(async {
                 if let Err(err) = worker_manager(data, recv).await {
@@ -118,6 +119,8 @@ impl WorkerBuilder {
 
 enum WorkerMessage {
     Stop,
+    NoWork,
+    Work(WorkPackage)
 }
 
 #[pyclass]
@@ -133,7 +136,7 @@ impl WorkerHandle {
 }
 
 struct WorkerData {
-    // connection: mpsc::UnboundedSender<WorkerMessage>,
+    connection: mpsc::WeakUnboundedSender<WorkerMessage>,
     hostname: String,
     file_cache: BlobCache,
     index_cache: BlobCache,
@@ -149,7 +152,7 @@ enum TaskId {
 
 impl WorkerData {
 
-    fn new(file_cache: BlobCache, index_cache: BlobCache, address: String, token: String) -> Result<Self> {
+    fn new(connection: mpsc::WeakUnboundedSender<WorkerMessage>, file_cache: BlobCache, index_cache: BlobCache, address: String, token: String) -> Result<Self> {
         // Build our default header list
         let mut headers = reqwest::header::HeaderMap::new();
         let mut auth_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
@@ -162,7 +165,7 @@ impl WorkerData {
             .build()?;
 
         Ok(Self {
-            // connection,
+            connection,
             hostname: match gethostname::gethostname().into_string() {
                 Ok(host) => host,
                 Err(_) => return Err(anyhow::anyhow!("Hostname has bad characters?")),
@@ -230,33 +233,41 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
     let mut connection_good = true;
     let mut still_running = true;
     let mut active_tasks: JoinSet<(TaskId, Result<()>)> = Default::default();
-    // let mut active_task_id_map: IdMap = Default::default();
-
+    let mut fetch_work: Option<JoinHandle<()>> = None;
+    
     while still_running || active_tasks.len() > 0 {
 
-        if still_running && active_tasks.len() < 5 {
-            // Get some work
-            let work = match data.get_work_package().await {
-                Ok(work) => work,
-                Err(err) => {
-                    error!("Couldn't get work package: {err}");
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
+        if let Some(job) = &fetch_work {
+            if job.is_finished() {
+                fetch_work = None;
+            }
+        }
+
+        if still_running && fetch_work.is_none() && active_tasks.len() < 5 {
+            let data = data.clone();
+            fetch_work = Some(tokio::spawn(async move {
+                let conn = match data.connection.upgrade() {
+                    Some(conn) => conn,
+                    None => return,
+                };
+
+                // Get some work
+                let work = match data.get_work_package().await {
+                    Ok(work) => work,
+                    Err(err) => {
+                        error!("Couldn't get work package: {err}");
+                        sleep(Duration::from_secs(5)).await;
+                        _ = conn.send(WorkerMessage::NoWork);
+                        return
+                    }
+                };
+
+                if !work.filter.is_empty() || !work.yara.is_empty() {
+                    info!("Got {} filter and {} yara tasks", work.filter.len(), work.yara.len());
                 }
-            };
 
-            if !work.filter.is_empty() || !work.yara.is_empty() {
-                info!("Got {} filter and {} yara tasks", work.filter.len(), work.yara.len());
-            }
-            
-            // dispatch all the tasks in the package
-            for filter_task in work.filter {
-                active_tasks.spawn(do_filter_task(data.clone(), filter_task));
-            }
-
-            for yara_task in work.yara {
-                active_tasks.spawn(do_yara_task(data.clone(), yara_task));
-            }
+                _ = conn.send(WorkerMessage::Work(work));
+            }))
         }
 
         tokio::select! {
@@ -273,7 +284,18 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
                 };
 
                 match message {
-                    WorkerMessage::Stop => still_running = false,
+                    WorkerMessage::Stop=>still_running=false,
+                    WorkerMessage::NoWork => continue,
+                    WorkerMessage::Work(work) => {
+                        // dispatch all the tasks in the package
+                        for filter_task in work.filter {
+                            active_tasks.spawn(do_filter_task(data.clone(), filter_task));
+                        }
+
+                        for yara_task in work.yara {
+                            active_tasks.spawn(do_yara_task(data.clone(), yara_task));
+                        }
+                    }, 
                 }
             },
 
@@ -292,8 +314,6 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
                     };
                 }
             },
-
-            _ = sleep(Duration::from_secs(30)) => {}
         }
     }
 
@@ -332,7 +352,7 @@ async fn _do_filter_task(data: Arc<WorkerData>, filter_task: FilterTask) -> Resu
         value: WorkResultValue::Filter(filter_task.filter_id, filter_task.filter_blob, file_ids),
     };
 
-    data.report_result(result).await?;
+    data.report_result(result).await.context("Failed to report results")?;
     return Ok(())
 }
 

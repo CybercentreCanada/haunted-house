@@ -2,6 +2,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::access::AccessControl;
 use crate::core::{SearchCache, Config};
@@ -196,9 +197,9 @@ impl Database {
         }
     }
 
-    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+    pub async fn get_work(&self, req: WorkRequest, respond: oneshot::Sender<WorkPackage>) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.get_work(req).await
+            Database::SQLite(local) => local.get_work(req, respond).await
         }
     }
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use anyhow::Result;
 
 use log::{error, debug};
@@ -12,6 +12,7 @@ use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::auth::Role;
 use crate::core::HouseCore;
@@ -117,7 +118,15 @@ impl WorkerInterface {
     }
 
     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
-        self.core.get_work(req).await
+        let (result, response) = oneshot::channel();
+        self.core.get_work(req, result).await?;
+        Ok(match tokio::time::timeout(Duration::from_secs(30), response).await {
+            Ok(res) => res?,
+            Err(_) => WorkPackage{
+                filter: vec![],
+                yara: vec![],
+            },
+        })
     }
 
     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
