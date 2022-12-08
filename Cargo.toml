@@ -48,6 +48,10 @@ pyo3 = { version = "0.17", features = ["extension-module", "anyhow", "chrono"] }
 pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"] }
 pyo3-log = { version = "0.7" }
 
+azure_core = "0.7"
+azure_storage = "0.8"
+azure_storage_blobs = "0.8"
+
 [dev-dependencies]
 rand = "*"
 assertor = "*"

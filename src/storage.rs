@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use azure_storage::StorageCredentials;
+use azure_storage_blobs::prelude::{BlobClient, ClientBuilder};
 use pyo3::{Python, PyAny, Py};
 use pyo3::types::{PyTuple, PyBytes};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 
@@ -13,7 +15,8 @@ use tempfile::TempDir;
 pub enum BlobStorageConfig {
     Directory {
         path: String,
-    }
+    },
+    Azure (AzureBlobConfig)
 }
 
 pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
@@ -23,6 +26,8 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
             tokio::fs::create_dir_all(&path).await?;
             Ok(BlobStorage::Local(LocalDirectory::new(path)))
         },
+        BlobStorageConfig::Azure(azure) =>
+            Ok(BlobStorage::Azure(AzureBlobStore::new(azure).await?)),
     }
 }
 
@@ -30,6 +35,7 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
 pub enum BlobStorage {
     Local(LocalDirectory),
     Python(PythonBlobStore),
+    Azure(AzureBlobStore)
 }
 
 impl BlobStorage {
@@ -37,42 +43,49 @@ impl BlobStorage {
         match self {
             BlobStorage::Local(obj) => obj.size(label).await,
             BlobStorage::Python(obj) => obj.size(label).await,
+            BlobStorage::Azure(obj) => obj.size(label).await,
         }
     }
     pub async fn stream(&self, label: &str) -> Result<Box<dyn std::io::Read + Send>> {
         match self {
             BlobStorage::Local(obj) => obj.stream(label).await,
             BlobStorage::Python(obj) => obj.stream(label).await,
+            BlobStorage::Azure(obj) => obj.stream(label).await,
         }
     }
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.download(label, path).await,
             BlobStorage::Python(obj) => obj.download(label, path).await,
+            BlobStorage::Azure(obj) => obj.download(label, path).await,
         }
     }
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.upload(label, path).await,
             BlobStorage::Python(obj) => obj.upload(label, path).await,
+            BlobStorage::Azure(obj) => obj.upload(label, path).await,
         }
     }
     pub async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.put(label, data).await,
             BlobStorage::Python(obj) => obj.put(label, data).await,
+            BlobStorage::Azure(obj) => obj.put(label, data).await,
         }
     }
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
         match self {
             BlobStorage::Local(obj) => obj.get(label).await,
             BlobStorage::Python(obj) => obj.get(label).await,
+            BlobStorage::Azure(obj) => obj.get(label).await,
         }
     }
     pub async fn delete(&self, label: &str) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.delete(label).await,
             BlobStorage::Python(obj) => obj.delete(label).await,
+            BlobStorage::Azure(obj) => obj.delete(label).await,
         }
     }
 }
@@ -312,3 +325,64 @@ impl std::io::Read for PythonStream {
         return Ok(copied)
     }
 }
+
+
+#[derive(Clone)]
+pub struct AzureBlobStore {
+    config: AzureBlobConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AzureBlobConfig {
+    pub account: String,
+    pub access_key: String,
+    pub container: String,
+}
+
+impl AzureBlobStore {
+    async fn new(config: AzureBlobConfig) -> Result<Self> {
+        Ok(Self{ config })
+    }
+
+    fn get_blob_client(&self, blob_name: &str) -> Result<BlobClient> {
+        let storage_credentials = StorageCredentials::Key(self.config.account.clone(), self.config.access_key.clone());
+        let client_builder = ClientBuilder::new(self.config.account.clone(), storage_credentials);
+        Ok(client_builder.blob_client(self.config.container.clone(), blob_name))
+    }
+
+    pub async fn size(&self, label: &str) -> Result<Option<usize>> {
+        let client = self.get_blob_client(label)?;
+        let data = match client.get_metadata().await {
+            Ok(metadata) => metadata,
+            Err(err) => match &err {
+                azure_storage::Error() => {
+                    if let azure_core::StatusCode::NotFound = status {
+                        return Ok(None)
+                    }
+                    return Err(err.into())
+                },
+                _ => return Err(err.into())
+            },
+        };
+        todo!();
+    }
+    pub async fn stream(&self, label: &str) -> Result<Box<dyn std::io::Read + Send>> {
+        todo!()
+    }
+    pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
+        todo!()
+    }
+    pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
+        todo!()
+    }
+    pub async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
+        todo!()
+    }
+    pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
+        todo!()
+    }
+    pub async fn delete(&self, label: &str) -> Result<()> {
+        todo!()
+    }
+}
+

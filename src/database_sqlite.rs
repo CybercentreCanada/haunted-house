@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
@@ -7,7 +7,6 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
 use sqlx::pool::{PoolOptions, PoolConnection};
-use tokio::sync::{oneshot, Mutex};
 
 use crate::access::AccessControl;
 use crate::core::{SearchCache, Config};
