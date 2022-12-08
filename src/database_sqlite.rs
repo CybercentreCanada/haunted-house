@@ -57,7 +57,7 @@ impl sqlx::Type<sqlx::Sqlite> for BlobID {
 pub struct SQLiteInterface {
     db: SqlitePool,
     config: Config,
-    work_waiters: Mutex<VecDeque<(String, oneshot::Sender<WorkPackage>)>>,
+    work_notification: tokio::sync::Notify,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -128,7 +128,7 @@ impl SQLiteInterface {
         Ok(Self {
             db: pool,
             config,
-            work_waiters: Default::default(),
+            work_notification: Default::default(),
             _temp_dir: None,
         })
     }
@@ -413,7 +413,7 @@ impl SQLiteInterface {
         self._release_blob_gc(&self.db, &id).await
     }
 
-    async fn _schedule_blob_gc<'e, E>(&self, conn: E, id: &BlobID, when: chrono::DateTime<chrono::Utc>) -> Result<()> 
+    async fn _schedule_blob_gc<'e, E>(&self, conn: E, id: &BlobID, when: chrono::DateTime<chrono::Utc>) -> Result<()>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         sqlx::query("INSERT OR REPLACE INTO garbage(blob_id, time) VALUES(?, ?)")
@@ -423,7 +423,7 @@ impl SQLiteInterface {
         return Ok(())
     }
 
-    async fn _release_blob_gc<'e, E>(&self, conn: E, id: &BlobID) -> Result<()> 
+    async fn _release_blob_gc<'e, E>(&self, conn: E, id: &BlobID) -> Result<()>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         sqlx::query("DELETE FROM garbage WHERE blob_id = ?").bind(id.as_str()).execute(conn).await?;
@@ -455,10 +455,10 @@ impl SQLiteInterface {
         sqlx::query("DELETE FROM index_index WHERE label = ?")
             .bind(entry.label.as_str())
             .execute(&mut trans).await?;
-        
+
         // Add blob to GC
         self._schedule_blob_gc(&mut trans, &entry.current_blob, chrono::Utc::now()).await?;
-        
+
         // Delete group table
         let table_name = filter_table_name(&entry.label);
         sqlx::query(&format!("DROP TABLE IF EXISTS {table_name}")).execute(&mut trans).await?;
@@ -515,6 +515,7 @@ impl SQLiteInterface {
                 .execute(&mut conn).await?;
         }
 
+        self.work_notification.notify_waiters();
         self.search_status(code).await
     }
 
@@ -571,7 +572,7 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
-    async fn release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>  
+    async fn release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let req = sqlx::query(
@@ -582,7 +583,7 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
-    async fn _get_search<'e, E>(&self, conn: E, code: &String) -> Result<Option<SearchRecord>>  
+    async fn _get_search<'e, E>(&self, conn: E, code: &String) -> Result<Option<SearchRecord>>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let search: Option<(Vec<u8>, )> = sqlx::query_as(
@@ -624,8 +625,8 @@ impl SQLiteInterface {
         }
     }
 
-    
-    pub async fn get_work(&self, req: WorkRequest, respond: oneshot::Sender<WorkPackage>) -> Result<()> {
+
+    pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
         let mut conn = self.db.acquire().await?;
         // Look for related filter jobs
         let mut filter_tasks = {
@@ -696,15 +697,15 @@ impl SQLiteInterface {
 
         if !filter_tasks.is_empty() || !yara_tasks.is_empty() {
             debug!("Returning work bundle with {} filters {} yara batches", filter_tasks.len(), yara_tasks.len());
-            _ = respond.send(WorkPackage{
-                filter: filter_tasks,
-                yara: yara_tasks,
-            });
-        } else {
-            let mut buffer = self.work_waiters.lock().await;
-            buffer.push_back((req.worker, respond));
         }
-        return Ok(())
+        return Ok(WorkPackage{
+            filter: filter_tasks,
+            yara: yara_tasks,
+        })
+    }
+
+    pub async fn get_work_notification(&self) -> Result<()> {
+        Ok(self.work_notification.notified().await)
     }
 
     pub async fn finish_filter_work(&self, id: i64, code: &String, search_cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
@@ -773,35 +774,7 @@ impl SQLiteInterface {
             .bind(id)
             .execute(&mut conn).await?;
 
-        {
-            let mut waiters = self.work_waiters.lock().await;
-            waiters.retain(|(_, resp)|!resp.is_closed());
-
-            let mut pocket_job = None;
-
-            while let Some((worker, respond)) = waiters.pop_front() {
-                let job = match pocket_job.take() {
-                    Some(pocket) => pocket,
-                    None => self.get_yara_task(&mut conn, &worker).await?,
-                };
-
-                if job.is_empty() {
-                    waiters.push_front((worker, respond));
-                    break;
-                }
-
-                if let Err(val) = respond.send(WorkPackage { filter: vec![], yara: job }) {
-                    pocket_job = Some(val.yara);
-                }
-            }
-
-            if let Some(jobs) = pocket_job {
-                for task in jobs {
-                    self.release_yara_task(&mut conn, task.id).await?;
-                }
-            }
-        }
-
+        self.work_notification.notify_waiters();
         return Ok(())
     }
 
@@ -826,9 +799,9 @@ impl SQLiteInterface {
             let before_truncated = search.truncated;
             for hash in hashes.iter() {
                 if search.hit_files.contains(hash) { continue }
-                if search.hit_files.len() >= self.config.max_result_set_size as usize { 
+                if search.hit_files.len() >= self.config.max_result_set_size as usize {
                     search.truncated = true;
-                    break 
+                    break
                 }
                 search.hit_files.insert(hash.clone());
             }

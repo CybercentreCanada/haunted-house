@@ -6,8 +6,8 @@
 - worker loss detection/task timeout
 
 ## Nice to have/performance
-- let work requests block to see if work becomes available
 - add config flag to tune filter memory use
+- add SSE for search progress
 - add tracing
 - keep a cache of which indices are assigned to what worker
 - task retry

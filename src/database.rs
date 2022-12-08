@@ -197,9 +197,15 @@ impl Database {
         }
     }
 
-    pub async fn get_work(&self, req: WorkRequest, respond: oneshot::Sender<WorkPackage>) -> Result<()> {
+    pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
         match self {
-            Database::SQLite(local) => local.get_work(req, respond).await
+            Database::SQLite(local) => local.get_work(req).await
+        }
+    }
+
+    pub async fn get_work_notification(&self) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.get_work_notification().await
         }
     }
 

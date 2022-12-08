@@ -30,7 +30,7 @@ pub struct Config {
     pub batch_limit_seconds: u64,
     pub garbage_collection_interval: std::time::Duration,
     pub index_soft_entries_max: u64,
-    pub index_soft_bytes_max: u64,    
+    pub index_soft_bytes_max: u64,
     pub yara_job_size: u64,
     pub max_result_set_size: u64,
 }
@@ -106,8 +106,12 @@ impl HouseCore {
         self.database.search_status(code).await
     }
 
-    pub async fn get_work(&self, req: WorkRequest, respond: oneshot::Sender<WorkPackage>) -> Result<()> {
-        self.database.get_work(req, respond).await
+    pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
+        self.database.get_work(req).await
+    }
+
+    pub async fn get_work_notification(&self) -> Result<()> {
+        self.database.get_work_notification().await
     }
 
     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
@@ -507,7 +511,7 @@ async fn garbage_collector(core: Arc<HouseCore>){
 
 async fn _garbage_collector(core: Arc<HouseCore>) -> Result<()> {
     loop {
-        // Delete any groups with expiry in the past. 
+        // Delete any groups with expiry in the past.
         // Expiry is rounded to the day, so we give it yesterday.
         {
             let old = Some(Utc::now() - Duration::days(1));
@@ -524,7 +528,7 @@ async fn _garbage_collector(core: Arc<HouseCore>) -> Result<()> {
                 }
             }
         }
-                
+
         // Wait a while before doing garbage collection again
         _ = tokio::time::timeout(
             core.config.garbage_collection_interval,

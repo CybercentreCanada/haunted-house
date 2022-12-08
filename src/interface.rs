@@ -118,15 +118,22 @@ impl WorkerInterface {
     }
 
     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
-        let (result, response) = oneshot::channel();
-        self.core.get_work(req, result).await?;
-        Ok(match tokio::time::timeout(Duration::from_secs(30), response).await {
-            Ok(res) => res?,
-            Err(_) => WorkPackage{
-                filter: vec![],
-                yara: vec![],
-            },
-        })
+        let start = std::time::Instant::now();
+        loop {
+            let work = self.core.get_work(&req).await?;
+            if !work.is_empty() {
+                return Ok(work);
+            }
+
+            let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
+                Some(wait) => wait,
+                None => return Ok(Default::default()),
+            };
+
+            if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
+                return Ok(Default::default())
+            }
+        }
     }
 
     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
@@ -205,10 +212,16 @@ pub struct YaraTask {
     pub hashes: Vec<Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct WorkPackage {
     pub filter: Vec<FilterTask>,
     pub yara: Vec<YaraTask>
+}
+
+impl WorkPackage {
+    pub fn is_empty(&self) -> bool {
+        self.filter.is_empty() && self.yara.is_empty()
+    }
 }
 
 #[derive(Serialize, Deserialize)]

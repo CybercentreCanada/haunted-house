@@ -5,7 +5,7 @@ import time
 
 
 def main():
-    query = {"Or":[{"And":[{"String":"pending_timers"},{"String":"pending_batch"}]},{"String":"get_bucket_range"}]}
+    query = {"Or": [{"And": [{"String": "pending_timers"}, {"String": "pending_batch"}]}, {"String": "get_bucket_range"}]}
 
     yara = """
 rule TestSig {
@@ -40,6 +40,7 @@ rule TestSig {
         pprint(res)
         if res['finished']:
             break
+
 
 if __name__ == '__main__':
     main()
