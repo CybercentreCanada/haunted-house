@@ -271,7 +271,7 @@ impl Inner {
                         }
                     }
                     self.waiting_for_space.push_back(WaitingForSpace{
-                        id, 
+                        id,
                         responders: vec![respond],
                         additional_local_bytes: new_size,
                         act: WaitingOperation::Open,
@@ -302,10 +302,10 @@ impl Inner {
                             return Ok(())
                         }
                     }
-                    self.waiting_for_space.push_back(WaitingForSpace { 
-                        id, 
-                        additional_local_bytes: size, 
-                        responders: vec![respond], 
+                    self.waiting_for_space.push_back(WaitingForSpace {
+                        id,
+                        additional_local_bytes: size,
+                        responders: vec![respond],
                         act: WaitingOperation::OpenNew
                     });
                 }
@@ -342,14 +342,14 @@ impl Inner {
                     self.do_resize(id, new_size, respond)?;
                 } else {
                     // Mark this as something we will need to download later
-                    self.waiting_for_space.push_back(WaitingForSpace { 
-                        id, 
-                        additional_local_bytes: new_size - old_size, 
-                        responders: vec![], 
-                        act: WaitingOperation::Resize { 
+                    self.waiting_for_space.push_back(WaitingForSpace {
+                        id,
+                        additional_local_bytes: new_size - old_size,
+                        responders: vec![],
+                        act: WaitingOperation::Resize {
                             new_size,
-                            responders: respond 
-                        } 
+                            responders: respond
+                        }
                     });
                 }
             }
@@ -422,7 +422,6 @@ impl Inner {
 
             async move {
                 let result = storage.download(id.as_str(), path).await;
-                info!("Load Done");
                 match result {
                     Ok(_) => {
                         let entry = CacheEntry{
@@ -439,7 +438,6 @@ impl Inner {
                         _ = finished.send(Some(Err(err.into())));
                     },
                 }
-                info!("Send cache notice");
                 _ = command.send(BlobCacheCommand::LoadFinished(id)).await;
                 finished.closed().await
             }

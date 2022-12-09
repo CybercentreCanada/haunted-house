@@ -5,6 +5,7 @@ use std::path::{PathBuf};
 
 use anyhow::Result;
 use bitvec::vec::BitVec;
+use tokio::sync::mpsc;
 
 use crate::query::Query;
 use crate::varint;
@@ -19,19 +20,19 @@ pub struct TrigramFilter {
 }
 
 impl TrigramFilter {
-    pub fn build_file<IN: std::io::Read>(mut handle: IN) -> Result<BitVec> {
-        // Prepare to read
-        let mut buffer: Vec<u8> = vec![0; 1 << 20];
-
+    pub async fn build_file(mut input: mpsc::Receiver<Result<Vec<u8>>>) -> Result<BitVec> {
         // Prepare accumulators
         let mut mask = BitVec::repeat(false, 1 << 24);
 
         // Read the initial block
-        let read = handle.read(&mut buffer)?;
+        let mut buffer = vec![];
+        while buffer.len() <= 2 {
+            let sub_buffer = match input.recv().await {
+                Some(sub_buffer) => sub_buffer?,
+                None => return Ok(mask),
+            };
 
-        // Terminate if file too short
-        if read <= 2 {
-            return Ok(mask)
+            buffer.extend(sub_buffer);
         }
 
         // Initialize trigram
@@ -39,13 +40,16 @@ impl TrigramFilter {
         let mut index_start = 2;
 
         loop {
-            for index in index_start..read {
-                trigram = (trigram & 0x00FFFF) << 8 | (buffer[index] as u32);
+            for byte in &buffer[index_start..] {
+                trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
                 mask.set(trigram as usize, true);
             }
 
-            let read = handle.read(&mut buffer)?;
-            if read == 0 {
+            buffer = match input.recv().await {
+                Some(buffer) => buffer?,
+                None => return Ok(mask),
+            };
+            if buffer.is_empty() {
                 break;
             }
             index_start = 0;
@@ -179,11 +183,11 @@ impl TrigramFilter {
         })
     }
 
-    pub fn build(file: std::fs::File, input: Vec<PathBuf>) -> Result<Self> {
+    pub async fn build(file: std::fs::File, input: Vec<PathBuf>) -> Result<Self> {
         let mut data: Vec<BitVec> = vec![];
 
-        for source_file in input.iter() {
-            data.push(Self::build_file(std::fs::File::open(source_file)?)?);
+        for source_file in input.into_iter() {
+            data.push(Self::build_file(crate::storage::read_chunks(source_file)).await?);
         }
 
         return Self::build_from_data(file, data)
@@ -363,8 +367,8 @@ mod test {
 
     use super::TrigramFilter;
 
-    #[test]
-    fn build_and_search() -> Result<()> {
+    #[tokio::test]
+    async fn build_and_search() -> Result<()> {
         let mut input_data: Vec<u8> = Default::default();
         let mut input = tempfile::NamedTempFile::new()?;
         for _ in 0..10000 {
@@ -377,7 +381,7 @@ mod test {
         let filter = tempfile::tempfile()?;
 
         let filter = {
-            let filter = TrigramFilter::build(filter, vec![input.path().to_path_buf()])?;
+            let filter = TrigramFilter::build(filter, vec![input.path().to_path_buf()]).await?;
             for _ in 0..10 {
                 let index = rand::thread_rng().gen_range(0..input_data.len()-50);
                 let search = Vec::from(&input_data[index..index+50]);

@@ -26,7 +26,7 @@ use pyo3::exceptions::{PyRuntimeError};
 use pyo3::types::PyModule;
 use pyo3::{Python, pymodule, PyResult, pyclass, pymethods, PyAny, Py, PyObject};
 use sha2::Digest;
-use storage::{BlobStorage, LocalDirectory, PythonBlobStore};
+use storage::BlobStorageConfig;
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
@@ -128,8 +128,8 @@ enum DatabaseConfig {
 #[derive(Default)]
 struct ServerBuilder {
     // runtime: Option<tokio::runtime::Runtime>,
-    index_storage: Option<BlobStorage>,
-    file_storage: Option<BlobStorage>,
+    index_storage: Option<BlobStorageConfig>,
+    file_storage: Option<BlobStorageConfig>,
     bind_address: String,
     authenticator: Option<Authenticator>,
     cache_space: Option<(PathBuf, usize)>,
@@ -144,23 +144,17 @@ impl ServerBuilder {
         Default::default()
     }
 
-    fn index_storage_path(&mut self, path: PathBuf) -> PyResult<()> {
-        self.index_storage = Some(BlobStorage::Local(LocalDirectory::new(path)));
+    fn index_storage(&mut self, config: &str) -> PyResult<()> {
+        let config: BlobStorageConfig = serde_json::from_str(config)
+            .context("Could not parse configuration for index storage.")?;
+        self.index_storage = Some(config);
         Ok(())
     }
 
-    fn index_storage_object(&mut self, object: Py<PyAny>) -> PyResult<()> {
-        self.index_storage = Some(BlobStorage::Python(PythonBlobStore::new(object)));
-        Ok(())
-    }
-
-    fn file_storage_path(&mut self, path: PathBuf) -> PyResult<()> {
-        self.file_storage = Some(BlobStorage::Local(LocalDirectory::new(path)));
-        Ok(())
-    }
-
-    fn file_storage_object(&mut self, object: Py<PyAny>) -> PyResult<()> {
-        self.file_storage = Some(BlobStorage::Python(PythonBlobStore::new(object)));
+    fn file_storage(&mut self, config: &str) -> PyResult<()> {
+        let config: BlobStorageConfig = serde_json::from_str(config)
+            .context("Could not parse configuration for fil storage.")?;
+        self.file_storage = Some(config);
         Ok(())
     }
 
@@ -202,13 +196,13 @@ impl ServerBuilder {
 
     fn build(&mut self, py: Python) -> PyResult<PyObject> {
         // Initialize blob stores
-        let index_storage = match self.index_storage.take() {
+        let index_storage_config = match self.index_storage.take() {
             Some(index) => index,
-            None => LocalDirectory::new_temp().context("Error setting up local blob store")?
+            None => BlobStorageConfig::TempDir
         };
-        let file_storage = match self.file_storage.take() {
+        let file_storage_config = match self.file_storage.take() {
             Some(index) => index,
-            None => LocalDirectory::new_temp().context("Error setting up local blob store")?
+            None => BlobStorageConfig::TempDir
         };
 
         // Initialize authenticator
@@ -230,6 +224,9 @@ impl ServerBuilder {
         let config = self.config.clone();
 
         Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
+
+            let index_storage = crate::storage::connect(index_storage_config).await?;
+            let file_storage = crate::storage::connect(file_storage_config).await?;
 
             let cache = BlobCache::new(index_storage.clone(), cache.1, cache.0);
 

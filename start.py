@@ -1,10 +1,8 @@
 import sys
 import logging
 import tempfile
-import time
 import os
 import os.path
-import base64
 import asyncio
 
 from haunted_house import ServerBuilder
@@ -48,7 +46,6 @@ async def main():
                     directories.append(file)
 
                 if os.path.isfile(file):
-                    print("upload", file)
                     hash = bytes(await server.upload(file))
                     futures.append(server.ingest_file(hash, "", None))
                     if len(futures) > 100:

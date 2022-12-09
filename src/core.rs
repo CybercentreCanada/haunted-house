@@ -291,6 +291,7 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
 
     // Buildup the file data
     debug!("Ingest {} collecting file data", index_group.as_str());
+    let files_being_ingested = new_items.len();
     let mut data = vec![];
     let mut meta = vec![];
     let mut remaining_responses = vec![];
@@ -391,7 +392,7 @@ async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut ne
         }
     };
 
-    debug!("Ingest {} processes batch responses", index_group.as_str());
+    info!("Ingested batch of {} files into {}", files_being_ingested, index_group.as_str());
     for res in remaining_responses {
         _ = res.send(Ok(()));
     }
@@ -406,15 +407,7 @@ async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result
         Err(err) => return (hash, Err(err)),
     };
 
-    let result = tokio::task::spawn_blocking(|| {
-        let result = TrigramFilter::build_file(stream);
-        return result
-    }).await;
-
-    let result = match result {
-        Ok(stream) => stream,
-        Err(err) => return (hash, Err(err.into())),
-    };
+    let result = TrigramFilter::build_file(stream).await;
 
     return (hash, result)
 }
