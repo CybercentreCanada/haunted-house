@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::{BlobClient, ClientBuilder};
+use azure_storage_blobs::container::Container;
+use azure_storage_blobs::prelude::{BlobClient, ClientBuilder, ContainerClient};
+use futures::StreamExt;
 use pyo3::{Python, PyAny, Py};
 use pyo3::types::{PyTuple, PyBytes};
 use serde::{Deserialize, Serialize};
@@ -67,10 +69,10 @@ impl BlobStorage {
             BlobStorage::Azure(obj) => obj.upload(label, path).await,
         }
     }
-    pub async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
+    pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         match self {
-            BlobStorage::Local(obj) => obj.put(label, data).await,
-            BlobStorage::Python(obj) => obj.put(label, data).await,
+            BlobStorage::Local(obj) => obj.put(label, &data).await,
+            BlobStorage::Python(obj) => obj.put(label, &data).await,
             BlobStorage::Azure(obj) => obj.put(label, data).await,
         }
     }
@@ -330,6 +332,7 @@ impl std::io::Read for PythonStream {
 #[derive(Clone)]
 pub struct AzureBlobStore {
     config: AzureBlobConfig,
+    client: ContainerClient,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -337,52 +340,110 @@ pub struct AzureBlobConfig {
     pub account: String,
     pub access_key: String,
     pub container: String,
+    pub use_emulator: bool,
 }
 
 impl AzureBlobStore {
     async fn new(config: AzureBlobConfig) -> Result<Self> {
-        Ok(Self{ config })
+        let client = Self::get_container_client(&config)?;
+        client.create().await?;
+        Ok(Self{ config, client })
     }
 
-    fn get_blob_client(&self, blob_name: &str) -> Result<BlobClient> {
-        let storage_credentials = StorageCredentials::Key(self.config.account.clone(), self.config.access_key.clone());
-        let client_builder = ClientBuilder::new(self.config.account.clone(), storage_credentials);
-        Ok(client_builder.blob_client(self.config.container.clone(), blob_name))
+    fn get_container_client(config: &AzureBlobConfig) -> Result<ContainerClient> {
+        let client_builder = if config.use_emulator {
+            ClientBuilder::emulator()
+        } else {
+            let storage_credentials = if config.access_key.is_empty() {
+                StorageCredentials::Anonymous
+            } else {
+                StorageCredentials::Key(config.account.clone(), config.access_key.clone())
+            };
+            ClientBuilder::new(config.account.clone(), storage_credentials)
+        };
+        Ok(client_builder.container_client(config.container.clone()))
     }
 
     pub async fn size(&self, label: &str) -> Result<Option<usize>> {
-        let client = self.get_blob_client(label)?;
-        let data = match client.get_metadata().await {
+        let client = self.client.blob_client(label);
+        let data = match client.get_properties().await {
             Ok(metadata) => metadata,
-            Err(err) => match &err {
-                azure_storage::Error() => {
-                    if let azure_core::StatusCode::NotFound = status {
-                        return Ok(None)
-                    }
-                    return Err(err.into())
-                },
-                _ => return Err(err.into())
+            Err(err) => {
+                match err.kind() {
+                    azure_storage::ErrorKind::HttpResponse { status, .. } => {
+                        if let azure_core::StatusCode::NotFound = status {
+                            return Ok(None)
+                        } else {
+                            return Err(err.into())
+                        }
+                    },
+                    _ => return Err(err.into())
+                }
             },
         };
-        todo!();
+        Ok(Some(data.blob.properties.content_length as usize))
     }
+    
     pub async fn stream(&self, label: &str) -> Result<Box<dyn std::io::Read + Send>> {
         todo!()
+        // let mut stream = client.get().into_stream();
+        // let mut data = vec![];
+        // while let Some(chunk) = stream.next().await {
+        //     let chunk = chunk?;
+        //     data.extend(&chunk.data.collect().await?);
+        // }
+        // Ok(data)
     }
+
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         todo!()
     }
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         todo!()
     }
-    pub async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
-        todo!()
+
+    pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
+        let client = self.client.blob_client(label);
+        client.put_block_blob(data).await?;
+        return Ok(())
     }
+    
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
-        todo!()
+        let client = self.client.blob_client(label);
+        Ok(client.get_content().await?)
     }
+
     pub async fn delete(&self, label: &str) -> Result<()> {
         todo!()
     }
 }
 
+#[cfg(test)]
+mod test {
+    use crate::storage::{AzureBlobStore, AzureBlobConfig};
+
+
+    #[tokio::test]
+    async fn anon_access() {
+        let store = AzureBlobStore::new(AzureBlobConfig{
+            account: "devstoreaccount1".to_owned(),
+            access_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_owned(),
+            container: "test".to_owned(),
+            use_emulator: true,
+        }).await.unwrap();
+
+        let body = b"a body".repeat(10);
+        assert!(store.size("not-a-blob").await.unwrap().is_none());
+        store.put("test", body.clone()).await.unwrap();
+        assert_eq!(store.size("test").await.unwrap().unwrap(), 60);
+        assert_eq!(store.get("test").await.unwrap(), body);
+        
+        let mut file_like = store.stream("test").await.unwrap();
+        let mut buff = vec![0u8; 1000];
+        let bytes_read = file_like.read_to_end(&mut buff).unwrap();
+        assert_eq!(buff[0..bytes_read], body);
+
+        todo!();
+    }
+
+}

@@ -545,7 +545,7 @@ mod test {
 
         // Add some data
         let id = uuid::Uuid::new_v4().to_string();
-        storage.put(id.as_str(), &data).await.unwrap();
+        storage.put(id.as_str(), data.clone()).await.unwrap();
 
         {
             let handle = cache.open(id.clone()).await.unwrap();
@@ -578,7 +578,7 @@ mod test {
             let sample_size = cache_size + 1;
             let data: Vec<u8> = (0..sample_size).map(|_| rng.gen()).collect();
             let id = uuid::Uuid::new_v4().to_string();
-            storage.put(id.as_str(), &data).await.unwrap();
+            storage.put(id.as_str(), data).await.unwrap();
             assert_eq!(cache.open(id).await.unwrap_err().downcast::<crate::error::ErrorKinds>().unwrap(), crate::error::ErrorKinds::BlobTooLargeForCache)
         }
 
@@ -601,13 +601,13 @@ mod test {
         // Add some data
         let id1 = uuid::Uuid::new_v4().to_string();
         let data1: Vec<u8> = (0..sample_size).map(|_| rng.gen()).collect();
-        storage.put(id1.as_str(), &data1).await.unwrap();
+        storage.put(id1.as_str(), data1.clone()).await.unwrap();
         let id2 = uuid::Uuid::new_v4().to_string();
         let data2: Vec<u8> = (0..sample_size).map(|_| rng.gen()).collect();
-        storage.put(id2.as_str(), &data2).await.unwrap();
+        storage.put(id2.as_str(), data2.clone()).await.unwrap();
         let id3 = uuid::Uuid::new_v4().to_string();
         let data3: Vec<u8> = (0..sample_size).map(|_| rng.gen()).collect();
-        storage.put(id3.as_str(), &data3).await.unwrap();
+        storage.put(id3.as_str(), data3.clone()).await.unwrap();
 
         //
         let get1 = tokio::time::timeout(Duration::from_secs(1), cache.open(id1.clone())).await.unwrap().unwrap();
