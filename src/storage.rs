@@ -1,4 +1,5 @@
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{PathBuf, Path};
 use std::sync::{Arc};
@@ -9,33 +10,59 @@ use azure_storage_blobs::container::Container;
 use azure_storage_blobs::prelude::{BlobClient, ClientBuilder, ContainerClient};
 use bytes::BytesMut;
 use futures::StreamExt;
-use pyo3::{Python, PyAny, Py};
+use log::error;
+use pyo3::exceptions::PyValueError;
+use pyo3::{Python, PyAny, Py, FromPyObject};
 use pyo3::types::{PyTuple, PyBytes};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use futures::AsyncRead;
 
 
 #[derive(Deserialize)]
 pub enum BlobStorageConfig {
     TempDir,
-    Directory {path: String},
-    // Azure (AzureBlobConfig)
+    Directory {path: PathBuf},
+    Azure (AzureBlobConfig)
 }
 
 
-impl<'source> FromPyObject<'source> for Role {
+impl<'source> FromPyObject<'source> for BlobStorageConfig {
     fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
-        let value: String = ob.extract()?;
-        let value = value.to_lowercase();
-        if value == "search" {
-            Ok(Role::Search)
-        } else if value == "worker" {
-            Ok(Role::Worker)
-        } else {
-            Err(PyValueError::new_err(format!("Not accepted role catagory: {value}")))
+        // Try to interpret it as a string
+        if let Ok(value) = ob.extract::<String>() {
+            { // Check for keywords after lowercasing
+                let value = value.to_lowercase();
+                if value == "temp" || value == "temporary" {
+                    return Ok(BlobStorageConfig::TempDir)
+                }
+            }
+
+            // Try interpreting it as a path
+            if value.starts_with("/") || value.starts_with("./") {
+                let path = PathBuf::from(value);
+                std::fs::create_dir_all(&path)?;
+                return Ok(BlobStorageConfig::Directory { path })
+            }
         }
+
+        // Try interpreting it as an azure configuration
+        else if let Ok(config) = ob.extract::<AzureBlobConfig>() {
+            return Ok(BlobStorageConfig::Azure(config))
+        }
+
+        // Try interpreting it as a dict 
+        else if let Ok(config) = ob.extract::<HashMap<String, String>>() {
+            if let Some(value) = config.get("path") {
+                let path = PathBuf::from(value);
+                std::fs::create_dir_all(&path)?;
+                return Ok(BlobStorageConfig::Directory { path })
+            }
+        }
+
+        return Err(PyValueError::new_err("Provided blob storage configuration was not valid"));
     }
 }
 
@@ -45,13 +72,11 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
         BlobStorageConfig::TempDir => {
             LocalDirectory::new_temp().context("Error setting up local blob store")
         }
-        BlobStorageConfig::Directory { path } => {
-            let path = PathBuf::from(path);
-            tokio::fs::create_dir_all(&path).await?;
+        BlobStorageConfig::Directory { path } => {            
             Ok(BlobStorage::Local(LocalDirectory::new(path)))
         },
-        // BlobStorageConfig::Azure(azure) =>
-        //     Ok(BlobStorage::Azure(AzureBlobStore::new(azure).await?)),
+        BlobStorageConfig::Azure(azure) =>
+            Ok(BlobStorage::Azure(AzureBlobStore::new(azure).await?)),
     }
 }
 
@@ -59,7 +84,7 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
 pub enum BlobStorage {
     Local(LocalDirectory),
     Python(PythonBlobStore),
-    // Azure(AzureBlobStore)
+    Azure(AzureBlobStore)
 }
 
 impl BlobStorage {
@@ -67,49 +92,49 @@ impl BlobStorage {
         match self {
             BlobStorage::Local(obj) => obj.size(label).await,
             BlobStorage::Python(obj) => obj.size(label).await,
-            //BlobStorage::Azure(obj) => obj.size(label).await,
+            BlobStorage::Azure(obj) => obj.size(label).await,
         }
     }
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
         match self {
             BlobStorage::Local(obj) => obj.stream(label).await,
             BlobStorage::Python(obj) => obj.stream(label).await,
-            //BlobStorage::Azure(obj) => obj.stream(label).await,
+            BlobStorage::Azure(obj) => obj.stream(label).await,
         }
     }
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.download(label, path).await,
             BlobStorage::Python(obj) => obj.download(label, path).await,
-            //BlobStorage::Azure(obj) => obj.download(label, path).await,
+            BlobStorage::Azure(obj) => obj.download(label, path).await,
         }
     }
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.upload(label, path).await,
             BlobStorage::Python(obj) => obj.upload(label, path).await,
-            //BlobStorage::Azure(obj) => obj.upload(label, path).await,
+            BlobStorage::Azure(obj) => obj.upload(label, path).await,
         }
     }
     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.put(label, &data).await,
             BlobStorage::Python(obj) => obj.put(label, &data).await,
-            //BlobStorage::Azure(obj) => obj.put(label, data).await,
+            BlobStorage::Azure(obj) => obj.put(label, data).await,
         }
     }
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
         match self {
             BlobStorage::Local(obj) => obj.get(label).await,
             BlobStorage::Python(obj) => obj.get(label).await,
-            //BlobStorage::Azure(obj) => obj.get(label).await,
+            BlobStorage::Azure(obj) => obj.get(label).await,
         }
     }
     pub async fn delete(&self, label: &str) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.delete(label).await,
             BlobStorage::Python(obj) => obj.delete(label).await,
-            //BlobStorage::Azure(obj) => obj.delete(label).await,
+            BlobStorage::Azure(obj) => obj.delete(label).await,
         }
     }
 }
@@ -433,221 +458,249 @@ impl std::io::Read for PythonStream {
 }
 
 
-// #[derive(Clone)]
-// pub struct AzureBlobStore {
-//     config: AzureBlobConfig,
-//     client: ContainerClient,
-// }
+#[derive(Clone)]
+pub struct AzureBlobStore {
+    config: AzureBlobConfig,
+    http_client: reqwest::Client,
+    client: ContainerClient,
+}
 
-// #[derive(Clone, Serialize, Deserialize)]
-// pub struct AzureBlobConfig {
-//     pub account: String,
-//     pub access_key: String,
-//     pub container: String,
-//     pub use_emulator: bool,
-// }
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AzureBlobConfig {
+    pub account: String,
+    pub access_key: String,
+    pub container: String,
+    pub use_emulator: bool,
+}
 
-// impl AzureBlobStore {
-//     async fn new(config: AzureBlobConfig) -> Result<Self> {
-//         let client = Self::get_container_client(&config)?;
-//         if !client.exists().await? {
-//             client.create().await?;
-//         }
-//         Ok(Self{ config, client })
-//     }
+impl<'source> FromPyObject<'source> for AzureBlobConfig {
+    fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
+        Python::with_gil(|py| {
+            let use_emulator_key = pyo3::intern!(py, "use_emulator");
+            let use_emulator = if ob.hasattr(use_emulator_key)? {
+                ob.get_item(use_emulator_key)?.extract()?
+            } else {
+                false
+            };
 
-//     fn get_container_client(config: &AzureBlobConfig) -> Result<ContainerClient> {
-//         let client_builder = if config.use_emulator {
-//             ClientBuilder::emulator()
-//         } else {
-//             let storage_credentials = if config.access_key.is_empty() {
-//                 StorageCredentials::Anonymous
-//             } else {
-//                 StorageCredentials::Key(config.account.clone(), config.access_key.clone())
-//             };
-//             ClientBuilder::new(config.account.clone(), storage_credentials)
-//         };
-//         Ok(client_builder.container_client(config.container.clone()))
-//     }
+            Ok(AzureBlobConfig{
+                account: ob.get_item(pyo3::intern!(py, "account"))?.extract()?,
+                access_key: ob.get_item(pyo3::intern!(py, "access_key"))?.extract()?,
+                container: ob.get_item(pyo3::intern!(py, "container"))?.extract()?,
+                use_emulator,
+            })
+        })
+    }
+}
 
-//     pub async fn size(&self, label: &str) -> Result<Option<usize>> {
-//         let client = self.client.blob_client(label);
-//         let data = match client.get_properties().await {
-//             Ok(metadata) => metadata,
-//             Err(err) => {
-//                 match err.kind() {
-//                     azure_storage::ErrorKind::HttpResponse { status, .. } => {
-//                         if let azure_core::StatusCode::NotFound = status {
-//                             return Ok(None)
-//                         } else {
-//                             return Err(err.into())
-//                         }
-//                     },
-//                     _ => return Err(err.into())
-//                 }
-//             },
-//         };
-//         Ok(Some(data.blob.properties.content_length as usize))
-//     }
+impl AzureBlobStore {
+    async fn new(config: AzureBlobConfig) -> Result<Self> {
+        let client = Self::get_container_client(&config)?;
+        if !client.exists().await? {
+            client.create().await?;
+        }
+        let http_client = reqwest::ClientBuilder::new().build()?;
 
-//     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
-//         let mut stream = self.client.blob_client(label).get().into_stream();
-//         let (send, recv) = mpsc::channel(8);
-//         tokio::spawn(async move {
-//             while let Some(chunk) = stream.next().await {
-//                 let chunk = match chunk {
-//                     Ok(chunk) => chunk,
-//                     Err(err) => {
-//                         _ = send.send(Err(anyhow::anyhow!(err))).await;
-//                         return;
-//                     },
-//                 };
+        Ok(Self{ config, http_client, client })
+    }
 
-//                 let mut body = chunk.data;
-//                 while let Some(data) = body.next().await {
-//                     let data = match data {
-//                         Ok(data) => data,
-//                         Err(err) => {
-//                             _ = send.send(Err(anyhow::anyhow!(err))).await;
-//                             return;
-//                         },
-//                     };
-//                     if let Err(_) = send.send(anyhow::Ok(data.to_vec())).await {
-//                         return;
-//                     }
-//                 };
-//             }
-//         });
-//         Ok(recv)
-//     }
+    fn get_container_client(config: &AzureBlobConfig) -> Result<ContainerClient> {
+        let client_builder = if config.use_emulator {
+            ClientBuilder::emulator()
+        } else {
+            let storage_credentials = if config.access_key.is_empty() {
+                StorageCredentials::Anonymous
+            } else {
+                StorageCredentials::Key(config.account.clone(), config.access_key.clone())
+            };
+            ClientBuilder::new(config.account.clone(), storage_credentials)
+        };
+        Ok(client_builder.container_client(config.container.clone()))
+    }
 
-//     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
-//         let mut recv = self.stream(label).await?;
-//         Ok(tokio::task::spawn_blocking(move || {
-//             let mut file = std::fs::File::open(path)?;
-//             while let Some(data) = recv.blocking_recv() {
-//                 file.write(&data?)?;
-//             }
-//             return anyhow::Ok(())
-//         }).await??)
-//     }
+    pub async fn size(&self, label: &str) -> Result<Option<usize>> {
+        let client = self.client.blob_client(label);
+        let data = match client.get_properties().await {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                match err.kind() {
+                    azure_storage::ErrorKind::HttpResponse { status, .. } => {
+                        if let azure_core::StatusCode::NotFound = status {
+                            return Ok(None)
+                        } else {
+                            return Err(err.into())
+                        }
+                    },
+                    _ => return Err(err.into())
+                }
+            },
+        };
+        Ok(Some(data.blob.properties.content_length as usize))
+    }
 
-//     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
-//         let client = self.client.blob_client(label);
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+        let mut stream = self.client.blob_client(label).get().into_stream();
+        let (send, recv) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        _ = send.send(Err(anyhow::anyhow!(err))).await;
+                        return;
+                    },
+                };
 
-//         // self.client.
+                let mut body = chunk.data;
+                while let Some(data) = body.next().await {
+                    let data = match data {
+                        Ok(data) => data,
+                        Err(err) => {
+                            _ = send.send(Err(anyhow::anyhow!(err))).await;
+                            return;
+                        },
+                    };
+                    if let Err(_) = send.send(anyhow::Ok(data.to_vec())).await {
+                        return;
+                    }
+                };
+            }
+        });
+        Ok(recv)
+    }
 
-//         if !client.exists().await? {
-//             client.put_append_blob().await
-//                 .context("Error setting block to append")?;
-//         //     client.delete().lease_id(lease_id).await.context("error deleting blob for replacement")?;
-//         }
+    pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
+        let mut recv = self.stream(label).await?;
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::options().write(true).open(path)?;
+            while let Some(data) = recv.blocking_recv() {
+                file.write(&data?)?;
+            }
+            return anyhow::Ok(())
+        }).await??)
+    }
 
-//         let lease = client.acquire_lease(std::time::Duration::from_secs(60 * 5)).await
-//             .context("Aquire lease error")?;
-//         let lease_id = lease.lease_id;
+    pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
+        let client = self.client.blob_client(label);
+        let sas = client.shared_access_signature(azure_storage::prelude::BlobSasPermissions { 
+            read: true, 
+            add: true, 
+            create: true, 
+            write: true, 
+            delete: false, 
+            delete_version: false, 
+            permanent_delete: false, 
+            list: false, 
+            tags: false, 
+            move_: false, 
+            execute: false, 
+            ownership: false, 
+            permissions: false 
+        }, time::OffsetDateTime::now_utc() + time::Duration::HOUR)?;
 
-//         let mut file = tokio::fs::File::open(path).await?;
+        let url = client.generate_signed_blob_url(&sas)?;
 
-//         loop {
-//             let mut buffer = BytesMut::zeroed(1 << 20);
-//             let bytes_read = file.read(&mut buffer).await?;
-//             println!("read {bytes_read} bytes");
-//             if bytes_read == 0 {
-//                 break
-//             }
-//             buffer.resize(bytes_read, 0);
-//             client.append_block(buffer)
-//                 .lease_id(lease_id).await
-//                 .context("Error appending to block.")?;
-//         }
+        loop {
+            let request = self.http_client.put(url.clone())
+                .header("x-ms-blob-type", "BlockBlob")
+                .header("Date", chrono::Utc::now().to_rfc3339())
+                .header("Content-Length", tokio::fs::metadata(&path).await?.len().to_string())
+                .body(tokio::fs::File::open(&path).await?)
+                .send().await?;
 
-//         client.break_lease().lease_id(lease_id).await.context("error breaking lease")?;
-//         return Ok(())
-//     }
+            if request.status().is_success() {
+                break
+            }
 
-//     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
-//         let client = self.client.blob_client(label);
-//         client.put_block_blob(data).await?;
-//         return Ok(())
-//     }
+            error!("HTTP error uploading blob to azure: {}; {}", request.status(), request.text().await?);
+        }
+            
+        return Ok(())
+    }
 
-//     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
-//         let client = self.client.blob_client(label);
-//         Ok(client.get_content().await?)
-//     }
+    pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
+        let client = self.client.blob_client(label);
+        client.put_block_blob(data).await?;
+        return Ok(())
+    }
 
-//     pub async fn delete(&self, label: &str) -> Result<()> {
-//         let client = self.client.blob_client(label);
-//         client.delete().await?;
-//         return Ok(())
-//     }
-// }
+    pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
+        let client = self.client.blob_client(label);
+        Ok(client.get_content().await?)
+    }
 
-
-// #[cfg(test)]
-// mod test {
-//     use std::io::Write;
-
-//     use crate::storage::{AzureBlobStore, AzureBlobConfig};
-
-//     async fn connect() -> AzureBlobStore {
-//         AzureBlobStore::new(AzureBlobConfig{
-//             account: "devstoreaccount1".to_owned(),
-//             access_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_owned(),
-//             container: "test".to_owned(),
-//             use_emulator: true,
-//         }).await.unwrap()
-//     }
-
-//     #[tokio::test]
-//     async fn get_put_size() {
-//         let store = connect().await;
-
-//         let body = b"a body".repeat(10);
-//         assert!(store.size("not-a-blob").await.unwrap().is_none());
-//         store.put("test", body.clone()).await.unwrap();
-//         assert_eq!(store.size("test").await.unwrap().unwrap(), 60);
-//         assert_eq!(store.get("test").await.unwrap(), body);
-
-//     }
-
-//     #[tokio::test]
-//     async fn stream() {
-//         let store = connect().await;
-
-//         let body = b"a body".repeat(10);
-//         store.put("test", body.clone()).await.unwrap();
-
-//         let mut data_stream = store.stream("test").await.unwrap();
-//         let mut buff = vec![];
-//         while let Some(data) = data_stream.recv().await {
-//             buff.extend(data.unwrap());
-//         }
-//         assert_eq!(buff, body);
-//     }
+    pub async fn delete(&self, label: &str) -> Result<()> {
+        let client = self.client.blob_client(label);
+        client.delete().await?;
+        return Ok(())
+    }
+}
 
 
-//     #[tokio::test]
-//     async fn upload_download() {
-//         let store = connect().await;
+#[cfg(test)]
+mod test {
+    use std::io::Write;
 
-//         for _ in 0 .. 3 {
-//             let input_file = tempfile::NamedTempFile::new().unwrap();
-//             {
-//                 let mut handle = input_file.as_file();
-//                 for _ in 0..100 {
-//                     assert_eq!(handle.write(&(b"123".repeat(100))).unwrap(), 300);
-//                 }
-//                 handle.flush().unwrap();
-//             }
-//             store.upload("label", input_file.path().to_owned()).await.unwrap();
-//             assert_eq!(store.size("label").await.unwrap().unwrap(), 3 * 100 * 100);
+    use crate::storage::{AzureBlobStore, AzureBlobConfig};
 
-//             let output_file = tempfile::NamedTempFile::new().unwrap();
-//             store.download("label", output_file.path().to_owned()).await.unwrap();
+    async fn connect() -> AzureBlobStore {
+        AzureBlobStore::new(AzureBlobConfig{
+            account: "devstoreaccount1".to_owned(),
+            access_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_owned(),
+            container: "test".to_owned(),
+            use_emulator: true,
+        }).await.unwrap()
+    }
 
-//             assert_eq!(std::fs::read(input_file.path()).unwrap(), std::fs::read(output_file.path()).unwrap())
-//         }
-//     }
-// }
+    #[tokio::test]
+    async fn get_put_size() {
+        let store = connect().await;
+
+        let body = b"a body".repeat(10);
+        assert!(store.size("not-a-blob").await.unwrap().is_none());
+        store.put("test", body.clone()).await.unwrap();
+        assert_eq!(store.size("test").await.unwrap().unwrap(), 60);
+        assert_eq!(store.get("test").await.unwrap(), body);
+
+    }
+
+    #[tokio::test]
+    async fn stream() {
+        let store = connect().await;
+
+        let body = b"a body".repeat(10);
+        store.put("test", body.clone()).await.unwrap();
+
+        let mut data_stream = store.stream("test").await.unwrap();
+        let mut buff = vec![];
+        while let Some(data) = data_stream.recv().await {
+            buff.extend(data.unwrap());
+        }
+        assert_eq!(buff, body);
+    }
+
+
+    #[tokio::test]
+    async fn upload_download() {
+        let store = connect().await;
+
+        for _ in 0 .. 3 {
+            let input_file = tempfile::NamedTempFile::new().unwrap();
+            {
+                let mut handle = input_file.as_file();
+                for _ in 0..100 {
+                    assert_eq!(handle.write(&(b"123".repeat(100))).unwrap(), 300);
+                }
+                println!("file length {}", handle.metadata().unwrap().len());
+                handle.flush().unwrap();
+            }
+            store.upload("label", input_file.path().to_owned()).await.unwrap();
+            assert_eq!(store.size("label").await.unwrap().unwrap(), 3 * 100 * 100);
+
+            let output_file = tempfile::NamedTempFile::new().unwrap();
+            store.download("label", output_file.path().to_owned()).await.unwrap();
+
+            assert_eq!(std::fs::read(input_file.path()).unwrap(), std::fs::read(output_file.path()).unwrap())
+        }
+    }
+}

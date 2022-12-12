@@ -21,7 +21,8 @@ bytes = "*"
 
 anyhow = "1"
 uuid = { version = "*", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde", "std"] }
+time = { version = "0.3" }
 parse_duration = "2"
 tempfile = "3"
 log = "*"
@@ -50,6 +51,7 @@ pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"] }
 pyo3-log = { version = "0.7" }
 
 azure_core = "0.7"
+azure_identity = "*"
 azure_storage = "0.8"
 azure_storage_blobs = "0.8"
 

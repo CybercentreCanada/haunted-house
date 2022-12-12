@@ -21,4 +21,3 @@
 - use more single value structs for better build time error detection
 - pyi files
 - worker that runs without downloading the entire filter file
-- native azure blob store

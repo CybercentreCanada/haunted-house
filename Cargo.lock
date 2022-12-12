@@ -70,6 +70,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-lock"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8101efe8695a6c17e02911402145357e718ac92d3ff88ae8419e84b1707b685"
+dependencies = [
+ "event-listener",
+ "futures-lite",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -136,6 +146,28 @@ dependencies = [
  "rustc_version",
  "serde",
  "serde-xml-rs",
+ "serde_json",
+ "time 0.3.17",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "azure_identity"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a4f72c60d1fc960e305dadf20f2c7c16dd64723a9f760e3492a4ea829d73dcb"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core",
+ "base64",
+ "fix-hidden-lifetime-bug",
+ "futures",
+ "log",
+ "oauth2",
+ "pin-project",
+ "serde",
  "serde_json",
  "time 0.3.17",
  "url",
@@ -531,6 +563,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fix-hidden-lifetime-bug"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4ae9c2016a663983d4e40a9ff967d6dcac59819672f0b47f2b17574e99c33c8"
+dependencies = [
+ "fix-hidden-lifetime-bug-proc_macros",
+]
+
+[[package]]
+name = "fix-hidden-lifetime-bug-proc_macros"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4c81935e123ab0741c4c4f0d9b8377e5fb21d3de7e062fa4b1263b1fbcba1ea"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "flume"
 version = "0.10.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -827,6 +879,7 @@ dependencies = [
  "assertor",
  "async-trait",
  "azure_core",
+ "azure_identity",
  "azure_storage",
  "azure_storage_blobs",
  "bitvec",
@@ -851,6 +904,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tempfile",
+ "time 0.3.17",
  "tokio",
  "tokio-stream",
  "uuid",
@@ -1374,6 +1428,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2819ce041d2ee131036f4fc9d6ae7ae125a3a40e97ba64d04fe799ad9dabbb44"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "oauth2"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eeaf26a72311c087f8c5ba617c96fac67a5c04f430e716ac8d8ab2de62e23368"
+dependencies = [
+ "base64",
+ "chrono",
+ "getrandom 0.2.8",
+ "http",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -2061,6 +2134,15 @@ checksum = "020ff22c755c2ed3f8cf162dbb41a7268d934702f3ed3631656ea597e08fc3db"
 dependencies = [
  "itoa",
  "ryu",
+ "serde",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "184c643044780f7ceb59104cef98a5a6f12cb2288a7bc701ab93a362b49fd47d"
+dependencies = [
  "serde",
 ]
 

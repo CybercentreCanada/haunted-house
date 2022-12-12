@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 
 
 use log::{info, error, debug};
+use pyo3::exceptions::PyValueError;
 use pyo3::{pyclass, PyResult, pymethods, Py, PyAny, Python, PyObject};
 use reqwest::StatusCode;
 use tokio::sync::{mpsc};
@@ -16,14 +17,14 @@ use crate::blob_cache::{BlobCache, BlobHandle};
 use crate::database::BlobID;
 use crate::filter::TrigramFilter;
 use crate::interface::{WorkPackage, FilterTask, YaraTask, WorkRequest, WorkResult, WorkResultValue, WorkError};
-use crate::storage::{BlobStorage, LocalDirectory, PythonBlobStore};
+use crate::storage::{BlobStorage, LocalDirectory, PythonBlobStore, BlobStorageConfig};
 
 
 #[pyclass]
 #[derive(Default)]
 pub struct WorkerBuilder {
-    index_storage: Option<BlobStorage>,
-    file_storage: Option<BlobStorage>,
+    index_storage: Option<BlobStorageConfig>,
+    file_storage: Option<BlobStorageConfig>,
     api_token: Option<String>,
     server_address: Option<String>,
     cache_space: Option<(PathBuf, usize, usize)>,
@@ -36,23 +37,13 @@ impl WorkerBuilder {
         Default::default()
     }
 
-    fn index_storage_path(&mut self, path: PathBuf) -> PyResult<()> {
-        self.index_storage = Some(BlobStorage::Local(LocalDirectory::new(path)));
+    fn index_storage(&mut self, config: BlobStorageConfig) -> PyResult<()> {
+        self.index_storage = Some(config);
         Ok(())
     }
 
-    fn index_storage_object(&mut self, object: Py<PyAny>) -> PyResult<()> {
-        self.index_storage = Some(BlobStorage::Python(PythonBlobStore::new(object)));
-        Ok(())
-    }
-
-    fn file_storage_path(&mut self, path: PathBuf) -> PyResult<()> {
-        self.file_storage = Some(BlobStorage::Local(LocalDirectory::new(path)));
-        Ok(())
-    }
-
-    fn file_storage_object(&mut self, object: Py<PyAny>) -> PyResult<()> {
-        self.file_storage = Some(BlobStorage::Python(PythonBlobStore::new(object)));
+    fn file_storage(&mut self, config: BlobStorageConfig) -> PyResult<()> {
+        self.file_storage = Some(config);
         Ok(())
     }
 
@@ -73,13 +64,13 @@ impl WorkerBuilder {
 
     fn start(&mut self, py: Python) -> PyResult<PyObject> {
         // Initialize blob stores
-        let index_storage = match self.index_storage.take() {
+        let index_storage_config = match self.index_storage.take() {
             Some(index) => index,
-            None => LocalDirectory::new_temp().context("Error setting up local blob store")?
+            None => return Err(PyValueError::new_err("index storage must be configured"))
         };
-        let file_storage = match self.file_storage.take() {
+        let file_storage_config = match self.file_storage.take() {
             Some(index) => index,
-            None => LocalDirectory::new_temp().context("Error setting up local blob store")?
+            None => return Err(PyValueError::new_err("file storage must be configured"))
         };
 
         // Initialize authenticator
@@ -95,6 +86,8 @@ impl WorkerBuilder {
 
         Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
             // Define cache directory
+            let index_storage = crate::storage::connect(index_storage_config).await?;
+            let file_storage = crate::storage::connect(file_storage_config).await?;
             let index_cache = BlobCache::new(index_storage, index_cache_size, cache_dir.clone());
             let file_cache = BlobCache::new(file_storage, file_cache_size, cache_dir);
 

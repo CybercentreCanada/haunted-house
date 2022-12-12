@@ -22,7 +22,7 @@ use auth::{Authenticator, Role};
 use chrono::{DateTime, Utc};
 use database::Database;
 use log::{info};
-use pyo3::exceptions::{PyRuntimeError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::PyModule;
 use pyo3::{Python, pymodule, PyResult, pyclass, pymethods, PyAny, Py, PyObject};
 use sha2::Digest;
@@ -144,16 +144,12 @@ impl ServerBuilder {
         Default::default()
     }
 
-    fn index_storage(&mut self, config: &str) -> PyResult<()> {
-        let config: BlobStorageConfig = serde_json::from_str(config)
-            .context("Could not parse configuration for index storage.")?;
+    fn index_storage(&mut self, config: BlobStorageConfig) -> PyResult<()> {
         self.index_storage = Some(config);
         Ok(())
     }
 
-    fn file_storage(&mut self, config: &str) -> PyResult<()> {
-        let config: BlobStorageConfig = serde_json::from_str(config)
-            .context("Could not parse configuration for fil storage.")?;
+    fn file_storage(&mut self, config: BlobStorageConfig) -> PyResult<()> {
         self.file_storage = Some(config);
         Ok(())
     }
@@ -198,11 +194,11 @@ impl ServerBuilder {
         // Initialize blob stores
         let index_storage_config = match self.index_storage.take() {
             Some(index) => index,
-            None => BlobStorageConfig::TempDir
+            None => return Err(PyValueError::new_err("index storage must be configured"))
         };
         let file_storage_config = match self.file_storage.take() {
             Some(index) => index,
-            None => BlobStorageConfig::TempDir
+            None => return Err(PyValueError::new_err("file storage must be configured"))
         };
 
         // Initialize authenticator
