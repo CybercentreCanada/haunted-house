@@ -2,13 +2,12 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
 use crate::access::AccessControl;
 use crate::core::{SearchCache, Config};
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
-use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkResult, WorkError};
+use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkError};
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]

@@ -1,14 +1,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{PathBuf, Path};
+use std::path::{PathBuf};
 use std::sync::{Arc};
 
 use anyhow::{Result, Context};
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::container::Container;
-use azure_storage_blobs::prelude::{BlobClient, ClientBuilder, ContainerClient};
-use bytes::BytesMut;
+use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use futures::StreamExt;
 use log::error;
 use pyo3::exceptions::PyValueError;
@@ -16,9 +14,7 @@ use pyo3::{Python, PyAny, Py, FromPyObject};
 use pyo3::types::{PyTuple, PyBytes};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
-use futures::AsyncRead;
 
 
 #[derive(Deserialize)]
@@ -53,7 +49,7 @@ impl<'source> FromPyObject<'source> for BlobStorageConfig {
             return Ok(BlobStorageConfig::Azure(config))
         }
 
-        // Try interpreting it as a dict 
+        // Try interpreting it as a dict
         else if let Ok(config) = ob.extract::<HashMap<String, String>>() {
             if let Some(value) = config.get("path") {
                 let path = PathBuf::from(value);
@@ -72,7 +68,7 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
         BlobStorageConfig::TempDir => {
             LocalDirectory::new_temp().context("Error setting up local blob store")
         }
-        BlobStorageConfig::Directory { path } => {            
+        BlobStorageConfig::Directory { path } => {
             Ok(BlobStorage::Local(LocalDirectory::new(path)))
         },
         BlobStorageConfig::Azure(azure) =>
@@ -582,20 +578,20 @@ impl AzureBlobStore {
 
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         let client = self.client.blob_client(label);
-        let sas = client.shared_access_signature(azure_storage::prelude::BlobSasPermissions { 
-            read: true, 
-            add: true, 
-            create: true, 
-            write: true, 
-            delete: false, 
-            delete_version: false, 
-            permanent_delete: false, 
-            list: false, 
-            tags: false, 
-            move_: false, 
-            execute: false, 
-            ownership: false, 
-            permissions: false 
+        let sas = client.shared_access_signature(azure_storage::prelude::BlobSasPermissions {
+            read: true,
+            add: true,
+            create: true,
+            write: true,
+            delete: false,
+            delete_version: false,
+            permanent_delete: false,
+            list: false,
+            tags: false,
+            move_: false,
+            execute: false,
+            ownership: false,
+            permissions: false
         }, time::OffsetDateTime::now_utc() + time::Duration::HOUR)?;
 
         let url = client.generate_signed_blob_url(&sas)?;
@@ -614,7 +610,7 @@ impl AzureBlobStore {
 
             error!("HTTP error uploading blob to azure: {}; {}", request.status(), request.text().await?);
         }
-            
+
         return Ok(())
     }
 

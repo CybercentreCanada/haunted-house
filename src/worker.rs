@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use log::{info, error, debug};
 use pyo3::exceptions::PyValueError;
-use pyo3::{pyclass, PyResult, pymethods, Py, PyAny, Python, PyObject};
+use pyo3::{pyclass, PyResult, pymethods, Python, PyObject};
 use reqwest::StatusCode;
 use tokio::sync::{mpsc};
 use tokio::task::{JoinSet, JoinHandle};
@@ -17,7 +17,7 @@ use crate::blob_cache::{BlobCache, BlobHandle};
 use crate::database::BlobID;
 use crate::filter::TrigramFilter;
 use crate::interface::{WorkPackage, FilterTask, YaraTask, WorkRequest, WorkResult, WorkResultValue, WorkError};
-use crate::storage::{BlobStorage, LocalDirectory, PythonBlobStore, BlobStorageConfig};
+use crate::storage::BlobStorageConfig;
 
 
 #[pyclass]
@@ -227,7 +227,7 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
     let mut still_running = true;
     let mut active_tasks: JoinSet<(TaskId, Result<()>)> = Default::default();
     let mut fetch_work: Option<JoinHandle<()>> = None;
-    
+
     while still_running || active_tasks.len() > 0 {
 
         if let Some(job) = &fetch_work {
@@ -288,7 +288,7 @@ async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedRece
                         for yara_task in work.yara {
                             active_tasks.spawn(do_yara_task(data.clone(), yara_task));
                         }
-                    }, 
+                    },
                 }
             },
 
@@ -403,7 +403,7 @@ async fn _do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()>
 
         filter_handle
     };
-    
+
     // Wait for worker to finish
     let filtered = filter_handle.await??;
 
