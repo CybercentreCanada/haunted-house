@@ -96,8 +96,8 @@ fn try_build_expr(expr: &yara_x::ast::Expr, patterns: &Vec<Pattern>) -> Result<P
         yara_x::ast::Expr::False { .. } => Value::Bool(false).into(),
         yara_x::ast::Expr::Filesize { .. } => Value::Unknown.into(),
         yara_x::ast::Expr::Entrypoint { .. } => Value::Unknown.into(),
-        yara_x::ast::Expr::Literal(literal) => literal.value.into(),
-        yara_x::ast::Expr::Ident(identifier) => todo!(),
+        yara_x::ast::Expr::Literal(literal) => literal.value.clone().into(),
+        yara_x::ast::Expr::Ident(_) => todo!(),
         yara_x::ast::Expr::PatternMatch(pattern) => {
             let pattern = match patterns.iter().find(|item| item.identifier().name == pattern.identifier.name) {
                 Some(p) => p,
@@ -107,12 +107,27 @@ fn try_build_expr(expr: &yara_x::ast::Expr, patterns: &Vec<Pattern>) -> Result<P
             query_from_pattern(pattern)?.into()
         },
         yara_x::ast::Expr::PatternCount(pattern) => {
-            let pattern = match patterns.iter().find(|item| item.identifier().name == pattern.identifier.name) {
-                Some(p) => p,
-                None => return Err(anyhow::anyhow!("")),
-            };
-
-            query_from_pattern(pattern)?.into()
+            match &pattern.range {
+                None => {
+                    let pattern = match patterns.iter().find(|item| item.identifier().name == pattern.name) {
+                        Some(p) => p,
+                        None => return Err(anyhow::anyhow!("")),
+                    };
+                    query_from_pattern(pattern)?.into()
+                }
+                Some(range) => {
+                    let pattern = match patterns.iter().find(|item| item.identifier().name == pattern.name) {
+                        Some(p) => p,
+                        None => return Err(anyhow::anyhow!("")),
+                    };
+                    let query = query_from_pattern(pattern)?;
+                    if range.upper_bound == 0 {
+                        Query::Not(query).into()
+                    } else {
+                        query.into()
+                    }
+                },
+            }
         },
         yara_x::ast::Expr::PatternOffset(_) => todo!(),
         yara_x::ast::Expr::PatternLength(_) => todo!(),
