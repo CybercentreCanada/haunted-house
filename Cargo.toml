@@ -34,6 +34,7 @@ itertools = "*"
 weak-self = "*"
 gethostname = "0.4"
 yara = { version = "0.16", features= ["vendored"] }
+yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
 
 
 tokio = { version = "1", features = ["full"] }

@@ -241,6 +241,7 @@ impl TrigramFilter {
 
     pub fn run_query(&self, query: &Query) -> Result<HashSet<u64>> {
         match query {
+            Query::Not(query) => todo!(),
             Query::Or(parts) => {
                 let (mut accumulated, remain) = match parts.split_first() {
                     Some((first, remain)) => {
@@ -265,7 +266,7 @@ impl TrigramFilter {
                 }
                 Ok(accumulated)
             },
-            Query::String(string) => self.buffer_query(string.as_bytes()),
+            // Query::String(string) => self.buffer_query(string.as_bytes()),
             Query::Literal(data) => self.buffer_query(data),
         }
     }
