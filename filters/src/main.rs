@@ -1,8 +1,10 @@
+use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, HashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use bitvec::vec::BitVec;
 use anyhow::{anyhow, Result, Context};
@@ -27,6 +29,8 @@ pub trait Filter {
 fn load(label: &str, data: BitVec) -> Result<Box<dyn Filter>> {
     if label.starts_with("simple:") {
         Ok(Box::new(SimpleFilter::load(label, data)?))
+    } else if label.starts_with("kin:") {
+        Ok(Box::new(KinFilter::load(label, data)?))
     } else {
         Err(anyhow!("Unknown label format: {label}"))
     }
@@ -334,91 +338,159 @@ impl ClosedBucketFilter {
 }
 
 
-// pub struct KinFilter {
-//     data: BitVec,
-//     min_find: u32,
-//     max_set: u32,
-// }
+pub struct KinFilter {
+    data: BitVec,
+    min_find: u32,
+    max_set: u32,
+}
 
-// impl Filter for KinFilter {
-//     fn label(&self) -> String {
-//         format!("kin:{}:{}:{}", self.data.len(), self.min_find, self.max_set)
-//     }
+impl Filter for KinFilter {
+    fn label(&self) -> String {
+        Self::label_as(self.data.len(), self.min_find, self.max_set)
+    }
 
-//     fn data<'a>(&'a self) -> &'a BitVec {
-//         &self.data
-//     }
+    fn data<'a>(&'a self) -> &'a BitVec {
+        &self.data
+    }
 
-//     fn search(&self, target: &Vec<u8>) -> Result<bool> {
-//         if target.len() < 3 {
-//             return Ok(false);
-//         }
-//         let mut trigram = ((target[0] as u32) << 8) | target[1] as u32;
+    fn search(&self, target: &Vec<u8>) -> Result<bool> {
+        if target.len() < 3 {
+            return Ok(false);
+        }
+        let mut trigram = ((target[0] as u32) << 8) | target[1] as u32;
 
-//         for byte in target[2..].iter() {
-//             trigram = ((trigram & 0xFFFF) << 8) | *byte as u32;
+        for byte in target[2..].iter() {
+            trigram = ((trigram & 0xFFFF) << 8) | *byte as u32;
 
-//             let mut hasher = DefaultHasher::new();
-//             trigram.hash(&mut hasher);
-    
-//             let index = hasher.finish() as usize % self.data.len();
-//             if !self.data.get(index).unwrap() {
-//                 return Ok(false)
-//             }
-//         }
+            let mut hits = 0;
+            for index in Self::hash_trigram(trigram, self.max_set, self.data.len()) {
+                if *self.data.get(index).unwrap() {
+                    hits += 1;
+                    if hits >= self.min_find {
+                        break;
+                    }
+                }
+            }
 
-//         return Ok(true)
-//     }
-// }
+            if hits < self.min_find {
+                return Ok(false)
+            }
+        }
 
-// impl KinFilter {
-//     pub fn build<IN: std::io::Read>(settings: u32, input: IN) -> Result<Self> {
-//         // init buffer
-//         let mut data = BitVec::new();
-//         data.resize(settings as usize, false);
-//         let mut bytes = input.bytes();
+        return Ok(true)
+    }
+}
+
+impl KinFilter {
+    pub fn build<IN: std::io::Read>(size: usize, min_find: u32, max_set: u32, input: IN) -> Result<Self> {
+        // init buffer
+        let mut data = BitVec::new();
+        data.resize(size, false);
+
+        let mut heatmap: Vec<Rc<RefCell<HashSet<u32>>>> = Default::default();
+        heatmap.resize_with(size, || Rc::new(RefCell::new(Default::default())));
+
+        let mut bytes = input.bytes();
         
-//         // build initial state
-//         let first = match bytes.next() {
-//             Some(first) => first?,
-//             None => return Ok(Self { data }),
-//         };
-//         let second = match bytes.next() {
-//             Some(first) => first?,
-//             None => return Ok(Self { data }),
-//         };
+        // build initial state
+        let first = match bytes.next() {
+            Some(first) => first?,
+            None => return Ok(Self { data, min_find, max_set }),
+        };
+        let second = match bytes.next() {
+            Some(first) => first?,
+            None => return Ok(Self { data, min_find, max_set }),
+        };
     
-//         let mut trigram: u32 = ((first as u32) << 8) | second as u32;
+        let mut trigram: u32 = ((first as u32) << 8) | second as u32;
 
-//         // injest data
-//         for byte in bytes.into_iter() {
-//             trigram = ((trigram & 0xFFFF) << 8) | byte? as u32;
+        // injest data
+        for byte in bytes.into_iter() {
+            trigram = ((trigram & 0xFFFF) << 8) | byte? as u32;
 
-//             let mut hasher = DefaultHasher::new();
-//             trigram.hash(&mut hasher);
+            for index in Self::hash_trigram(trigram, max_set, size) {
+                heatmap[index].borrow_mut().insert(trigram);
+            }
+        }
     
-//             let index = hasher.finish() % settings as u64;
-//             data.set(index as usize, true);
-//         }
-    
-//         // 
-//         Ok(Self { data })
-//     }
+        let mut missing: Vec<(usize, Rc<RefCell<HashSet<u32>>>)> = heatmap.iter().cloned().enumerate().collect();
+        let mut assignments = vec![0; 1 << 24];
 
-//     // fn load(label: String, data: BitVec) -> Result<Self> {
-//     //     let mut parts = label.split(":");
-//     //     let kind_name = parts.next().ok_or(anyhow!("Invalid label"))?;
-//     //     if kind_name != "simple" {
-//     //         return Err(anyhow!("Invalid label"));
-//     //     }
-//     //     let expected_size = u32::from_str_radix(parts.next().ok_or(anyhow!("Invalid label"))?, 10)?;
-//     //     if data.len() != expected_size as usize {
-//     //         return Err(anyhow!("corrupt"));
-//     //     }
-//     //     return Ok(SimpleFilter { data })
-//     // }
+        loop {
+            let mut ii = 0;
+            while ii < missing.len() {
+                if missing[ii].1.borrow().is_empty() {
+                    missing.swap_remove(ii);
+                } else {
+                    ii += 1;
+                }
+            }
+            missing.sort_by_key(|a| a.1.borrow().len());
 
-// }
+            let (index, trigrams) = match missing.pop() {
+                Some(row) => row,
+                None => break,
+            };
+
+            data.set(index, true);
+
+            let trigrams: HashSet<u32> = trigrams.borrow_mut().clone();
+            for trigram in trigrams {
+                assignments[trigram as usize] += 1;
+                if assignments[trigram as usize] >= min_find {
+                    for index in Self::hash_trigram(trigram, max_set, size) {
+                        heatmap[index].borrow_mut().remove(&trigram);
+                    }
+        
+                    // for row in missing.iter_mut() {
+                    //     row.1.remove(&trigram);
+                    // }
+                }
+            }
+        }
+        
+        return Ok(Self { data, min_find, max_set })
+    }
+
+    fn hash_trigram(trigram: u32, max_set: u32, bins: usize) -> Vec<usize> {
+        let mut out: HashSet<usize> = HashSet::default();
+
+        let mut hasher = DefaultHasher::new();
+        trigram.hash(&mut hasher);
+
+        let mut ii = 0;
+        while out.len() < max_set as usize {
+            out.insert(hasher.finish() as usize % bins);
+            ii += 1;
+            ii.hash(&mut hasher);
+        }
+
+        return out.into_iter().collect();
+    }
+
+    pub fn label_as(size: usize, min_find: u32, max_set: u32) -> String  {
+        format!("kin:{}:{}:{}", size, min_find, max_set)
+    }
+
+    fn load(label: &str, data: BitVec) -> Result<Self> {
+        let mut parts = label.split(":");
+        let kind_name = parts.next().ok_or(anyhow!("Invalid label"))?;
+        if kind_name != "kin" {
+            return Err(anyhow!("Invalid label"));
+        }
+        let expected_size = u32::from_str_radix(parts.next().ok_or(anyhow!("Invalid label"))?, 10)?;
+        if data.len() != expected_size as usize {
+            return Err(anyhow!("corrupt"));
+        }
+        let min_find = u32::from_str_radix(parts.next().ok_or(anyhow!("Invalid label"))?, 10)?;
+        let max_set = u32::from_str_radix(parts.next().ok_or(anyhow!("Invalid label"))?, 10)?;
+        if min_find > max_set {
+            return Err(anyhow!("couldn't figure out kin label: {label}"));
+        }
+        return Ok(KinFilter { data, min_find, max_set })
+    }
+
+}
 
 struct Database {
     db: SqlitePool,
@@ -552,18 +624,37 @@ async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Fi
         hash
     };
 
-    for size in 8..=18 {
+    for size in 6..=18 {
         let label = SimpleFilter::label_as(1 << size);
-        if let Some(filter) = db.get(&hash, &label).await? {
-            out.push(filter);
+        let simple = if let Some(filter) = db.get(&hash, &label).await? {
+            filter
         } else {
             let file = std::fs::File::open(path)?;
             let file = BufReader::new(file);
             let filter = SimpleFilter::build(1 << size, file)?;
             let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
             db.insert(&hash, &label, &data?).await?;
-            out.push(Box::new(filter));
             new_built += 1;
+            Box::new(filter)
+        };
+
+        let label = KinFilter::label_as(1 << size, 2, 3);
+        let kin = if let Some(filter) = db.get(&hash, &label).await? {
+            filter
+        } else {
+            let file = std::fs::File::open(path)?;
+            let file = BufReader::new(file);
+            let filter = KinFilter::build(1 << size, 2, 3, file)?;
+            let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
+            db.insert(&hash, &label, &data?).await?;
+            new_built += 1;
+            Box::new(filter)
+        };
+
+        if simple.data().count_ones() <= kin.data().count_ones() {
+            out.push(simple);
+        } else {
+            out.push(kin);
         }
     }
 
@@ -574,6 +665,10 @@ async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Fi
 async fn main() -> Result<()> {
 
     let mut db = Database::new("./hashes.sqlite").await?;
+
+    // let res = sqlx::query("DELETE FROM filter_table where label LIKE 'kin%' ").execute(&db.db).await?;
+    // println!("removed {}", res.rows_affected());
+    // return Ok(());
 
     let mut visited: HashSet<PathBuf> = Default::default();
     let mut dirs = vec![PathBuf::from("/bin/")];
@@ -590,9 +685,9 @@ async fn main() -> Result<()> {
         for item in std::fs::read_dir(current_dir)? {
             let item = item?;
 
-            // if added > 500 {
-            //     break
-            // }
+            if added >= 10 {
+                break
+            }
         
             if visited.contains(&item.path()) {
                 continue;
@@ -610,11 +705,11 @@ async fn main() -> Result<()> {
                 let (filters, new_built) = fetch_filters(&mut db, &item.path()).await?;
                 added += new_built;
 
-                let mut line: Vec<(i64, f64)> = vec![];
+                let mut line: Vec<(i64, f64, bool)> = vec![];
                 for filter in filters {
                     let bits = filter.data();
                     let len = bits.len();
-                    line.push((len as i64, bits.count_ones() as f64 / len as f64));
+                    line.push((len as i64, bits.count_ones() as f64 / len as f64, filter.label().starts_with("simple")));
                 }
                 filled_lines.push(line);
             }
@@ -623,7 +718,7 @@ async fn main() -> Result<()> {
 
     let bins = filled_lines
         .iter()
-        .map(|line| line.iter().map(|(point, _)| *point).collect())
+        .map(|line| line.iter().map(|(point, _, _)| *point).collect())
         .reduce(|a: HashSet<i64>, b: HashSet<i64>|a.intersection(&b).cloned().collect()).unwrap();
     let mut bins: Vec<i64> = bins.into_iter().collect();
     bins.sort();
@@ -631,7 +726,7 @@ async fn main() -> Result<()> {
     // let bins: Vec<i64> = filled_lines.first().unwrap().iter().cloned().map(|(point, _)| point).collect();
     let mut percent_bins = vec![0; 51];
     for line in filled_lines.iter() {
-        percent_bins[(line[8].1 * 50.0) as usize] += 1;
+        percent_bins[(line.last().unwrap().1 * 50.0) as usize] += 1;
     }
     percent_bins[49] += percent_bins[50];
     percent_bins.pop();
@@ -663,7 +758,7 @@ async fn main() -> Result<()> {
         .draw()?;
 
     for line in filled_lines {
-        let points: HashMap<i64, f64> = line.into_iter().collect();
+        let points: HashMap<i64, f64> = line.into_iter().map(|(a, b, c)|(a, b)).collect();
         let mut line = vec![];
         for (index, bin) in bins.iter().enumerate() {
             line.push((index as i64, *points.get(bin).unwrap()))
@@ -673,6 +768,7 @@ async fn main() -> Result<()> {
                 line,
                 &plotters::style::RED.mix(0.2),
             )
+            
             // .border_style(&plotters::style::RED),
         )?;
 

@@ -3,11 +3,11 @@ name = "haunted-house"
 version = "0.1.0"
 edition = "2021"
 
-#[[bin]]
-#name = "worker"
-#test = false
-#bench = false
-#path = "src/worker.rs"
+[[bin]]
+name = "evil_clown"
+test = false
+bench = false
+path = "src/evil_clown.rs"
 
 [lib]
 name = "haunted_house"
