@@ -12,5 +12,4 @@ rand = "*"
 sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
 sha2 = "*"
 tokio = { version = "1", features = ["full"] }
-plotlib = "*"
 plotters = "0.3.4"
