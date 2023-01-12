@@ -1,16 +1,14 @@
-use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashSet, HashMap, BinaryHeap};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use bitvec::vec::BitVec;
 use anyhow::{anyhow, Result, Context};
-use plotters::prelude::{IntoDrawingArea, ChartBuilder, LabelAreaPosition, IntoLogRange, Rectangle, IntoLinspace};
-use plotters::series::{Histogram, LineSeries};
-use plotters::style::{Color, HSLColor};
+use plotters::prelude::{IntoDrawingArea, ChartBuilder, LabelAreaPosition, Rectangle, Circle, BitMapBackend};
+use plotters::series::{LineSeries};
+use plotters::style::{Color};
 use sha2::Digest;
 use sqlx::SqlitePool;
 use sqlx::pool::PoolOptions;
@@ -18,7 +16,7 @@ use sqlx::pool::PoolOptions;
 use plotters::backend::SVGBackend;
 
 
-pub trait Filter {
+pub trait Filter: Send + Sync {
 
     fn label(&self) -> String;
     fn data<'a>(&'a self) -> &'a BitVec;
@@ -60,7 +58,7 @@ impl Filter for SimpleFilter {
 
             let mut hasher = DefaultHasher::new();
             trigram.hash(&mut hasher);
-    
+
             let index = hasher.finish() as usize % self.data.len();
             if !self.data.get(index).unwrap() {
                 return Ok(false)
@@ -77,7 +75,7 @@ impl SimpleFilter {
         let mut data = BitVec::new();
         data.resize(settings as usize, false);
         let mut bytes = input.bytes();
-        
+
         // build initial state
         let first = match bytes.next() {
             Some(first) => first?,
@@ -87,7 +85,7 @@ impl SimpleFilter {
             Some(first) => first?,
             None => return Ok(SimpleFilter { data }),
         };
-    
+
         let mut trigram: u32 = ((first as u32) << 8) | second as u32;
 
         // injest data
@@ -96,12 +94,12 @@ impl SimpleFilter {
 
             let mut hasher = DefaultHasher::new();
             trigram.hash(&mut hasher);
-    
+
             let index = hasher.finish() % settings as u64;
             data.set(index as usize, true);
         }
-    
-        // 
+
+        //
         Ok(Self { data })
     }
 
@@ -181,7 +179,7 @@ impl OpenBucketFilter {
         let mut data = BitVec::new();
         data.resize(buffer_size as usize, false);
         let mut bytes = input.bytes();
-        
+
         // build initial state
         let first = match bytes.next() {
             Some(first) => first?,
@@ -191,7 +189,7 @@ impl OpenBucketFilter {
             Some(first) => first?,
             None => return Ok(Self { data, bucket_size }),
         };
-    
+
         let mut trigram: u32 = ((first as u32) << 8) | second as u32;
 
         // injest data
@@ -201,12 +199,12 @@ impl OpenBucketFilter {
             let mut hasher = DefaultHasher::new();
             trigram.hash(&mut hasher);
             (index % bucket_size as usize).hash(&mut hasher);
-    
+
             let index = hasher.finish() % buffer_size as u64;
             data.set(index as usize, true);
         }
-    
-        // 
+
+        //
         Ok(Self { data, bucket_size })
     }
 
@@ -290,7 +288,7 @@ impl ClosedBucketFilter {
         if buckets * bucket_size != buffer_size {
             return Err(anyhow!("bucket size must be factor of buffer size"));
         }
-        
+
         // build initial state
         let first = match bytes.next() {
             Some(first) => first?,
@@ -300,7 +298,7 @@ impl ClosedBucketFilter {
             Some(first) => first?,
             None => return Ok(Self { data, buckets, bucket_size }),
         };
-    
+
         let mut trigram: u32 = ((first as u32) << 8) | second as u32;
 
         // injest data
@@ -309,12 +307,12 @@ impl ClosedBucketFilter {
 
             let mut hasher = DefaultHasher::new();
             trigram.hash(&mut hasher);
-    
+
             let index = (hasher.finish() % buckets) * bucket_size + (index as u64) % bucket_size;
             data.set(index as usize, true);
         }
-    
-        // 
+
+        //
         Ok(Self { data, buckets, bucket_size })
     }
 
@@ -381,17 +379,35 @@ impl Filter for KinFilter {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct Item {
+    index: usize,
+    trigrams: HashSet<u32>
+}
+
+impl Ord for Item {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.trigrams.len().cmp(&other.trigrams.len())
+    }
+}
+
+impl PartialOrd for Item {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl KinFilter {
     pub fn build<IN: std::io::Read>(size: usize, min_find: u32, max_set: u32, input: IN) -> Result<Self> {
         // init buffer
         let mut data = BitVec::new();
         data.resize(size, false);
 
-        let mut heatmap: Vec<Rc<RefCell<HashSet<u32>>>> = Default::default();
-        heatmap.resize_with(size, || Rc::new(RefCell::new(Default::default())));
+        let mut heatmap: Vec<Vec<u32>> = Default::default();
+        heatmap.resize_with(size,  ||Default::default());
 
         let mut bytes = input.bytes();
-        
+
         // build initial state
         let first = match bytes.next() {
             Some(first) => first?,
@@ -401,7 +417,7 @@ impl KinFilter {
             Some(first) => first?,
             None => return Ok(Self { data, min_find, max_set }),
         };
-    
+
         let mut trigram: u32 = ((first as u32) << 8) | second as u32;
 
         // injest data
@@ -409,46 +425,79 @@ impl KinFilter {
             trigram = ((trigram & 0xFFFF) << 8) | byte? as u32;
 
             for index in Self::hash_trigram(trigram, max_set, size) {
-                heatmap[index].borrow_mut().insert(trigram);
+                heatmap[index].push(trigram);
             }
         }
-    
-        let mut missing: Vec<(usize, Rc<RefCell<HashSet<u32>>>)> = heatmap.iter().cloned().enumerate().collect();
+
+        let mut missing: BinaryHeap<Item> = heatmap.into_iter().enumerate().map(|(index, trigrams)|Item{index, trigrams: trigrams.into_iter().collect()}).collect();
+        let mut finished: HashSet<u32> = Default::default();
         let mut assignments = vec![0; 1 << 24];
 
-        loop {
-            let mut ii = 0;
-            while ii < missing.len() {
-                if missing[ii].1.borrow().is_empty() {
-                    missing.swap_remove(ii);
-                } else {
-                    ii += 1;
+        while let Some(mut current) = missing.pop() {
+            // println!("kin {size} {}", missing.len());
+
+            // Update the trigram list
+            current.trigrams.retain(|trigram| !finished.contains(trigram));
+            if current.trigrams.is_empty() {
+                continue;
+            }
+
+            // Check if we should drop this item back into the heap
+            if let Some(next) = missing.peek() {
+                if next.trigrams.len() > current.trigrams.len() {
+                    missing.push(current);
+                    continue;
                 }
             }
-            missing.sort_by_key(|a| a.1.borrow().len());
 
-            let (index, trigrams) = match missing.pop() {
-                Some(row) => row,
-                None => break,
-            };
+            // We are processing this item
+            data.set(current.index, true);
 
-            data.set(index, true);
-
-            let trigrams: HashSet<u32> = trigrams.borrow_mut().clone();
-            for trigram in trigrams {
+            for trigram in current.trigrams {
                 assignments[trigram as usize] += 1;
                 if assignments[trigram as usize] >= min_find {
-                    for index in Self::hash_trigram(trigram, max_set, size) {
-                        heatmap[index].borrow_mut().remove(&trigram);
-                    }
-        
-                    // for row in missing.iter_mut() {
-                    //     row.1.remove(&trigram);
-                    // }
+                    finished.insert(trigram);
                 }
             }
         }
-        
+
+        // let mut assignments = vec![0; 1 << 24];
+        // for iteration in 0.. {
+        //     println!("kin {size} {}", missing.len());
+        //     if iteration % 10 == 0 {
+        //         let mut ii = 0;
+        //         while ii < missing.len() {
+        //             if missing[ii].1.borrow().is_empty() {
+        //                 missing.swap_remove(ii);
+        //             } else {
+        //                 ii += 1;
+        //             }
+        //         }
+        //     }
+        //     missing.sort_by_key(|a| a.1.borrow().len());
+
+        //     let (index, trigrams) = match missing.pop() {
+        //         Some(row) => row,
+        //         None => break,
+        //     };
+
+        //     data.set(index, true);
+
+        //     let trigrams: HashSet<u32> = trigrams.borrow_mut().clone();
+        //     for trigram in trigrams {
+        //         assignments[trigram as usize] += 1;
+        //         if assignments[trigram as usize] >= min_find {
+        //             for index in Self::hash_trigram(trigram, max_set, size) {
+        //                 heatmap[index].borrow_mut().remove(&trigram);
+        //             }
+
+        //             // for row in missing.iter_mut() {
+        //             //     row.1.remove(&trigram);
+        //             // }
+        //         }
+        //     }
+        // }
+
         return Ok(Self { data, min_find, max_set })
     }
 
@@ -492,6 +541,7 @@ impl KinFilter {
 
 }
 
+#[derive(Clone)]
 struct Database {
     db: SqlitePool,
     // config: Config,
@@ -599,9 +649,92 @@ impl Database {
     }
 }
 
-// async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Filter>>, i32)> {
-//     todo!()
-// }
+async fn fetch_simple_filter(db: Database, path: PathBuf, hash: Vec<u8>, size: usize) -> Result<(Box<dyn Filter>, i32)> {
+    let mut new_built = 0;
+    let label = SimpleFilter::label_as(1 << size);
+    let simple = if let Some(filter) = db.get(&hash, &label).await? {
+        filter
+    } else {
+        let file = std::fs::File::open(&path)?;
+        let file = BufReader::new(file);
+        let filter = tokio::task::spawn_blocking(move ||{
+            anyhow::Ok(SimpleFilter::build(1 << size, file)?)
+        }).await??;
+        let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
+        db.insert(&hash, &label, &data?).await?;
+        new_built += 1;
+        Box::new(filter)
+    };
+    return Ok((simple, new_built))
+}
+
+async fn fetch_kin2_filter(db: Database, path: PathBuf, hash: Vec<u8>, size: usize) -> Result<(Box<dyn Filter>, i32)> {
+    let mut new_built = 0;
+    let label = KinFilter::label_as(1 << size, 1,2);
+    let kin = if let Some(filter) = db.get(&hash, &label).await? {
+        filter
+    } else {
+        let file = std::fs::File::open(&path)?;
+        let file = BufReader::new(file);
+        let filter = tokio::task::spawn_blocking(move ||{
+            anyhow::Ok(KinFilter::build(1 << size, 1, 2, file)?)
+        }).await??;
+        let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
+        db.insert(&hash, &label, &data?).await?;
+        new_built += 1;
+        Box::new(filter)
+    };
+    return Ok((kin, new_built))
+}
+
+async fn fetch_kin3_filter(db: Database, path: PathBuf, hash: Vec<u8>, size: usize) -> Result<(Box<dyn Filter>, i32)> {
+    let mut new_built = 0;
+    let label = KinFilter::label_as(1 << size, 2, 3);
+    let kin = if let Some(filter) = db.get(&hash, &label).await? {
+        filter
+    } else {
+        let file = std::fs::File::open(&path)?;
+        let file = BufReader::new(file);
+        let filter = tokio::task::spawn_blocking(move ||{
+            anyhow::Ok(KinFilter::build(1 << size, 2, 3, file)?)
+        }).await??;
+        let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
+        db.insert(&hash, &label, &data?).await?;
+        new_built += 1;
+        Box::new(filter)
+    };
+    return Ok((kin, new_built))
+}
+
+async fn fetch_filters_size(db: Database, path: PathBuf, hash: Vec<u8>, size: usize) -> Result<(Box<dyn Filter>, i32)> {
+
+    let (simple, kin3, kin2) = tokio::join!(
+        fetch_simple_filter(db.clone(), path.clone(), hash.clone(), size),
+        fetch_kin3_filter(db.clone(), path.clone(), hash.clone(), size),
+        fetch_kin2_filter(db, path, hash, size)
+    );
+
+    let (simple, _a) = simple?;
+    let (kin2, _c) = kin2?;
+    let (kin3, _b) = kin3?;
+    let built = _a + _b + _c;
+
+    return Ok((simple, built));
+
+    // if simple.data().count_ones() <= kin3.data().count_ones() {
+    //     if simple.data().count_ones() <= kin2.data().count_ones() {
+    //         Ok((simple, built))
+    //     } else {
+    //         Ok((kin2, built))
+    //     }
+    // } else {
+    //     if kin3.data().count_ones() <= kin2.data().count_ones() {
+    //         Ok((kin3, built))
+    //     } else {
+    //         Ok((kin2, built))
+    //     }
+    // }
+}
 
 async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Filter>>, i32)> {
     let mut out = vec![];
@@ -628,49 +761,38 @@ async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Fi
         hash
     };
 
-    for size in 6..=18 {
-        let label = SimpleFilter::label_as(1 << size);
-        let simple = if let Some(filter) = db.get(&hash, &label).await? {
-            filter
-        } else {
-            let file = std::fs::File::open(path)?;
-            let file = BufReader::new(file);
-            let filter = tokio::task::spawn_blocking(move ||{
-                anyhow::Ok(SimpleFilter::build(1 << size, file)?)
-            }).await??;
-            let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
-            db.insert(&hash, &label, &data?).await?;
-            new_built += 1;
-            Box::new(filter)
-        };
-
-        let label = KinFilter::label_as(1 << size, 2, 3);
-        let kin = if let Some(filter) = db.get(&hash, &label).await? {
-            filter
-        } else {
-            let file = std::fs::File::open(path)?;
-            let file = BufReader::new(file);
-            let filter = tokio::task::spawn_blocking(move ||{
-                anyhow::Ok(KinFilter::build(1 << size, 2, 3, file)?)
-            }).await??;
-            let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
-            db.insert(&hash, &label, &data?).await?;
-            new_built += 1;
-            Box::new(filter)
-        };
-
-        if simple.data().count_ones() <= kin.data().count_ones() {
-            out.push(simple);
-        } else {
-            out.push(kin);
-        }
+    let mut futures = vec![];
+    for size in 6..=20 {
+        futures.push(tokio::spawn(fetch_simple_filter(db.clone(), path.to_owned(), hash.clone(), size)));
     }
 
-    return Ok((out, new_built))
+    for result in futures {
+        let (filter, built) = result.await??;
+        out.push(filter);
+        new_built += built;
+    }
+
+    return Ok((out, new_built));
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    run().await.unwrap()
+}
+
+fn label_kind(label: &str) -> u8 {
+    if label.starts_with("simple") {
+        0
+    } else {
+        if label.ends_with(":1:2") {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+async fn run() -> Result<()> {
 
     let mut db = Database::new("./hashes.sqlite").await?;
 
@@ -696,7 +818,7 @@ async fn main() -> Result<()> {
             if added >= 10 {
                 break
             }
-        
+
             if visited.contains(&item.path()) {
                 continue;
             }
@@ -713,11 +835,11 @@ async fn main() -> Result<()> {
                 let (filters, new_built) = fetch_filters(&mut db, &item.path()).await?;
                 added += new_built;
 
-                let mut line: Vec<(i64, f64, bool)> = vec![];
+                let mut line: Vec<(i64, f64, u8)> = vec![];
                 for filter in filters {
                     let bits = filter.data();
                     let len = bits.len();
-                    line.push((len as i64, bits.count_ones() as f64 / len as f64, filter.label().starts_with("simple")));
+                    line.push((len as i64, bits.count_ones() as f64 / len as f64, label_kind(&filter.label())));
                 }
                 filled_lines.push(line);
             }
@@ -738,18 +860,20 @@ async fn main() -> Result<()> {
     }
     percent_bins[49] += percent_bins[50];
     percent_bins.pop();
-    
-    let root = SVGBackend::new("line.svg", (1024, 768)).into_drawing_area();
+
+    // let root = SVGBackend::new("line.svg", (1024, 768)).into_drawing_area();
+    let width = 1 << 10;
+    let root = BitMapBackend::new("line.png", (width, 1 << 10)).into_drawing_area();
 
     root.fill(&plotters::style::WHITE)?;
 
-    let (main, axis) = root.split_horizontally(900);
+    let (main, axis) = root.split_horizontally(width * 9 / 10);
 
     let mut chart = ChartBuilder::on(&main)
         .set_label_area_size(LabelAreaPosition::Left, 60)
         .set_label_area_size(LabelAreaPosition::Bottom, 60)
         .set_label_area_size(LabelAreaPosition::Right, 30)
-        .caption("Fliter density", ("sans-serif", 40))
+        .caption("Filter density", ("sans-serif", 40))
         .build_cartesian_2d(0..(bins.len() as i64 - 1), 0.0f64..1.0)?;
 
     chart
@@ -766,20 +890,36 @@ async fn main() -> Result<()> {
         .draw()?;
 
     for line in filled_lines {
-        let points: HashMap<i64, f64> = line.into_iter().map(|(a, b, c)|(a, b)).collect();
-        let mut line = vec![];
-        for (index, bin) in bins.iter().enumerate() {
-            line.push((index as i64, *points.get(bin).unwrap()))
+        let mut non_simple: HashMap<i64, u8> = Default::default();
+        for (size, _density, simple) in line.iter() {
+            non_simple.insert(*size, *simple);
         }
-        chart.draw_series(
-            LineSeries::new(
-                line,
-                &plotters::style::RED.mix(0.2),
-            )
-            
-            // .border_style(&plotters::style::RED),
-        )?;
 
+        let points: HashMap<i64, f64> = line.into_iter().map(|(a, b, _)|(a, b)).collect();
+        let mut line = vec![];
+        let mut marked_points1 = vec![];
+        let mut marked_points2 = vec![];
+        for (index, bin) in bins.iter().enumerate() {
+            line.push((index as i64, *points.get(bin).unwrap()));
+            if non_simple.get(bin) == Some(&1) {
+                marked_points1.push((index as i64, *points.get(bin).unwrap()));
+            }
+            if non_simple.get(bin) == Some(&2) {
+                marked_points2.push((index as i64, *points.get(bin).unwrap()));
+            }
+        }
+        chart.draw_series(LineSeries::new(line, &plotters::style::RED.mix(0.2)))?;
+        // chart.draw_series(PointSeries::new(marked_points, 1, &plotters::style::BLUE.mix(0.2)))?;
+        chart.draw_series(
+            marked_points1
+                .iter()
+                .map(|(x, y)| Circle::new((*x, *y), 1, &plotters::style::BLUE.mix(0.2))),
+        )?;
+        chart.draw_series(
+            marked_points2
+                .iter()
+                .map(|(x, y)| Circle::new((*x, *y), 1, &plotters::style::MAGENTA.mix(0.3))),
+        )?;
     }
 
     let bin_max = match percent_bins.iter().reduce(|a, b|a.max(b)) {
