@@ -599,6 +599,10 @@ impl Database {
     }
 }
 
+// async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Filter>>, i32)> {
+//     todo!()
+// }
+
 async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Filter>>, i32)> {
     let mut out = vec![];
     let mut new_built = 0;
@@ -631,7 +635,9 @@ async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Fi
         } else {
             let file = std::fs::File::open(path)?;
             let file = BufReader::new(file);
-            let filter = SimpleFilter::build(1 << size, file)?;
+            let filter = tokio::task::spawn_blocking(move ||{
+                anyhow::Ok(SimpleFilter::build(1 << size, file)?)
+            }).await??;
             let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
             db.insert(&hash, &label, &data?).await?;
             new_built += 1;
@@ -644,7 +650,9 @@ async fn fetch_filters(db: &mut Database, path: &Path) -> Result<(Vec<Box<dyn Fi
         } else {
             let file = std::fs::File::open(path)?;
             let file = BufReader::new(file);
-            let filter = KinFilter::build(1 << size, 2, 3, file)?;
+            let filter = tokio::task::spawn_blocking(move ||{
+                anyhow::Ok(KinFilter::build(1 << size, 2, 3, file)?)
+            }).await??;
             let data: core::result::Result<Vec<u8>, _> = filter.data().clone().bytes().collect();
             db.insert(&hash, &label, &data?).await?;
             new_built += 1;
