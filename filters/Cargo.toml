@@ -13,3 +13,6 @@ sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
 sha2 = "*"
 tokio = { version = "1", features = ["full"] }
 plotters = "0.3.4"
+tempfile = "*"
+snap = "1"
+clap = { version = "4", features = [ "derive" ] }
