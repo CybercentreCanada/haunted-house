@@ -50,22 +50,22 @@ impl BlobHandle {
         Arc::strong_count(&self.data)
     }
 
-    pub async fn resize(&self, new_size: usize) -> Result<usize> {
+    pub async fn resize(&self, new_size: u64) -> Result<u64> {
         let (send, recv) = oneshot::channel();
         _ = self.data.connection.send(BlobCacheCommand::Resize(self.data.id.clone(), new_size, send)).await;
         return Ok(recv.await??)
     }
 
-    pub async fn size_to_fit(&self) -> Result<usize> {
+    pub async fn size_to_fit(&self) -> Result<u64> {
         self.resize(self.size().await?).await
     }
 
-    pub async fn size(&self) -> Result<usize> {
+    pub async fn size(&self) -> Result<u64> {
         let handle = self.open()?;
         let meta = tokio::task::spawn_blocking(move ||{
             handle.metadata()
         }).await??;
-        return Ok(meta.len() as usize)
+        return Ok(meta.len())
     }
 }
 
@@ -82,16 +82,16 @@ impl Drop for BlobHandle {
 struct CacheEntry {
     access_time: chrono::DateTime<chrono::Utc>,
     handle: BlobHandle,
-    size: usize,
+    size: u64,
 }
 
 
 enum BlobCacheCommand {
     ListBlobs(oneshot::Sender<Vec<String>>),
     Open(String, oneshot::Sender<Result<BlobHandle>>),
-    OpenNew(String, usize, oneshot::Sender<Result<BlobHandle>>),
-    Resize(String, usize, oneshot::Sender<Result<usize>>),
-    Capacity(oneshot::Sender<(usize, usize)>),
+    OpenNew(String, u64, oneshot::Sender<Result<BlobHandle>>),
+    Resize(String, u64, oneshot::Sender<Result<u64>>),
+    Capacity(oneshot::Sender<(u64, u64)>),
     Flush(oneshot::Sender<()>),
     LoadFinished(String),
     HandleDropped(String),
@@ -104,7 +104,7 @@ pub struct BlobCache {
 
 impl BlobCache {
 
-    pub fn new(storage: BlobStorage, capacity: usize, path: PathBuf) -> Self {
+    pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Self {
         let (daemon, send) = Inner::new(storage, capacity, path);
 
         tokio::spawn(async {
@@ -124,7 +124,7 @@ impl BlobCache {
         Ok(recv.await??)
     }
 
-    pub async fn open_new(&self, id: String, size: usize) -> Result<BlobHandle> {
+    pub async fn open_new(&self, id: String, size: u64) -> Result<BlobHandle> {
         let (send, recv) = oneshot::channel();
         _ = self.connection.send(BlobCacheCommand::OpenNew(id, size, send)).await;
         Ok(recv.await??)
@@ -136,7 +136,7 @@ impl BlobCache {
         Ok(recv.await?)
     }
 
-    pub async fn capacity(&self) -> Result<(usize, usize)> {
+    pub async fn capacity(&self) -> Result<(u64, u64)> {
         let (send, recv) = oneshot::channel();
         _ = self.connection.send(BlobCacheCommand::Capacity(send)).await;
         Ok(recv.await?)
@@ -153,8 +153,8 @@ impl BlobCache {
 struct Inner {
     sender: mpsc::WeakSender<BlobCacheCommand>,
     connection: mpsc::Receiver<BlobCacheCommand>,
-    committed_capacity: usize,
-    capacity: usize,
+    committed_capacity: u64,
+    capacity: u64,
     open: HashMap<String, CacheEntry>,
     pending: HashMap<String, watch::Receiver<Option<Result<CacheEntry>>>>,
     waiting_for_space: VecDeque<WaitingForSpace>,
@@ -164,7 +164,7 @@ struct Inner {
 
 struct WaitingForSpace {
     pub id: String,
-    pub additional_local_bytes: usize,
+    pub additional_local_bytes: u64,
     pub responders: Vec<oneshot::Sender<Result<BlobHandle>>>,
     pub act: WaitingOperation,
 }
@@ -173,14 +173,14 @@ enum WaitingOperation {
     Open,
     OpenNew,
     Resize{
-        new_size: usize,
-        responders: oneshot::Sender<Result<usize>>
+        new_size: u64,
+        responders: oneshot::Sender<Result<u64>>
     }
 }
 
 impl Inner {
 
-    fn new(storage: BlobStorage, capacity: usize, path: PathBuf) -> (Self, mpsc::Sender<BlobCacheCommand>) {
+    fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> (Self, mpsc::Sender<BlobCacheCommand>) {
         let (sender, connection) = mpsc::channel(32);
 
         (Self {
@@ -410,7 +410,7 @@ impl Inner {
         return Ok(())
     }
 
-    fn start_download(&mut self, id: String, responders: Vec<oneshot::Sender<Result<BlobHandle>>>, new_size: usize) -> Result<()> {
+    fn start_download(&mut self, id: String, responders: Vec<oneshot::Sender<Result<BlobHandle>>>, new_size: u64) -> Result<()> {
         // Start downloading the blob
         let (finished, load_result) = watch::channel(None);
         tokio::spawn({
@@ -448,7 +448,7 @@ impl Inner {
         return Ok(())
     }
 
-    fn do_resize(&mut self, id: String, new_size: usize, respond: oneshot::Sender<Result<usize>>) -> Result<()> {
+    fn do_resize(&mut self, id: String, new_size: u64, respond: oneshot::Sender<Result<u64>>) -> Result<()> {
         let handle = match self.open.get_mut(&id) {
             Some(handle) => handle,
             None => {
@@ -463,7 +463,7 @@ impl Inner {
         return Ok(())
     }
 
-    fn open_empty(&mut self, id: String, responses: Vec<oneshot::Sender<Result<BlobHandle>>>, new_size: usize) -> Result<()> {
+    fn open_empty(&mut self, id: String, responses: Vec<oneshot::Sender<Result<BlobHandle>>>, new_size: u64) -> Result<()> {
         let sender = match self.sender.upgrade() {
             Some(sender) => sender,
             None => return Err(anyhow::format_err!("Cache disconnected.")),
@@ -484,7 +484,7 @@ impl Inner {
         return Ok(())
     }
 
-    fn free_space(&mut self, size: usize) -> bool {
+    fn free_space(&mut self, size: u64) -> bool {
         while self.capacity - self.committed_capacity < size {
             let mut candidate: Option<&String> = None;
             let mut candidate_changed = chrono::Utc::now();
@@ -534,7 +534,10 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
+        let storage = connect(BlobStorageConfig::Directory {
+            path: storage_dir.path().to_owned(),
+            size: 100 << 30
+        }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
 
         let mut rng = rand::thread_rng();
@@ -568,7 +571,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
+        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned(), size: 1 << 30 }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
 
         {
@@ -589,7 +592,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
+        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned(), size: 1 << 30 }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
 
         let mut rng = rand::thread_rng();

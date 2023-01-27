@@ -1,17 +1,26 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 
 use anyhow::Result;
 
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
 use pyo3::types::{PyTuple, PyBool};
+#[cfg(feature = "python")]
 use pyo3::{Py, PyAny, IntoPy, PyObject, intern, FromPyObject, Python};
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+use serde::{Serialize, Deserialize};
+
+
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Role {
     Search,
-    Worker
+    Worker,
+    Ingest,
 }
 
+#[cfg(feature = "python")]
 impl IntoPy<PyObject> for Role {
     fn into_py(self, py: pyo3::Python<'_>) -> PyObject {
         match self {
@@ -21,15 +30,17 @@ impl IntoPy<PyObject> for Role {
     }
 }
 
-impl ToString for Role {
-    fn to_string(&self) -> String {
-        match self {
-            Role::Search => "Search".to_owned(),
-            Role::Worker => "Worker".to_owned(),
-        }
+impl Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Role::Search => "Search",
+            Role::Worker => "Worker",
+            Role::Ingest => "Ingest",
+        })
     }
 }
 
+#[cfg(feature = "python")]
 impl<'source> FromPyObject<'source> for Role {
     fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
         let value: String = ob.extract()?;
@@ -47,6 +58,7 @@ impl<'source> FromPyObject<'source> for Role {
 
 pub enum Authenticator {
     Static(HashMap<String, HashSet<Role>>),
+    #[cfg(feature = "python")]
     Python(PythonAuthenticator)
 }
 
@@ -64,8 +76,17 @@ impl Authenticator {
         Ok(Authenticator::Static(assignments))
     }
 
+    #[cfg(feature = "python")]
     pub fn new_python(object: Py<PyAny>) -> Result<Self> {
         Ok(Authenticator::Python(PythonAuthenticator::new(object)))
+    }
+
+    pub fn from_config(config: crate::config::Authentication) -> Result<Self> {
+        let mut assignment: HashMap<String, HashSet<Role>> = Default::default();
+        for key in config.static_keys {
+            assignment.insert(key.key, key.roles.into_iter().collect());
+        }
+        Self::new_static(assignment)
     }
 
     pub fn get_roles(&self, token: &str) -> Result<HashSet<Role>> {
@@ -74,6 +95,7 @@ impl Authenticator {
                 Some(roles) => roles.clone(),
                 None => Default::default()
             }),
+            #[cfg(feature = "python")]
             Authenticator::Python(obj) => obj.get_roles(token),
         }
     }
@@ -84,17 +106,19 @@ impl Authenticator {
                 Some(roles) => roles.contains(&role),
                 None => false,
             },
+            #[cfg(feature = "python")]
             Authenticator::Python(obj) => obj.is_role_assigned(token, role),
         }
     }
 }
 
-
+#[cfg(feature = "python")]
 #[derive(Clone)]
 pub struct PythonAuthenticator {
     object: Py<PyAny>
 }
 
+#[cfg(feature = "python")]
 impl PythonAuthenticator {
     pub fn new(object: Py<PyAny>) -> Self {
         Self {object}

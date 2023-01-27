@@ -27,7 +27,7 @@ pub struct WorkerBuilder {
     file_storage: Option<BlobStorageConfig>,
     api_token: Option<String>,
     server_address: Option<String>,
-    cache_space: Option<(PathBuf, usize, usize)>,
+    cache_space: Option<(PathBuf, u64, u64)>,
 }
 
 #[pymethods]
@@ -47,7 +47,7 @@ impl WorkerBuilder {
         Ok(())
     }
 
-    fn cache_directory(&mut self, path: PathBuf, index_capacity: usize, file_capacity: usize) -> PyResult<()> {
+    fn cache_directory(&mut self, path: PathBuf, index_capacity: u64, file_capacity: u64) -> PyResult<()> {
         self.cache_space = Some((path, index_capacity, file_capacity));
         Ok(())
     }

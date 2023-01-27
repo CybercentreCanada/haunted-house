@@ -16,7 +16,6 @@ async def main():
     logger.addHandler(stream)
     logger.setLevel(logging.INFO)
 
-
     with tempfile.TemporaryDirectory() as tempdir:
         builder = ServerBuilder()
         builder.static_authentication({
@@ -28,12 +27,11 @@ async def main():
         builder.cache_directory(tempdir, 100 << 30)
         server = await builder.build()
 
-        async def print_status():
-            status = await server.status()
-            print(status.indices)
-            print(status.ingest_buffer)
-            print(status.ingest_batch_active)
-
+        # async def print_status():
+        #     status = await server.status()
+        #     print(status.indices)
+        #     print(status.ingest_buffer)
+        #     print(status.ingest_batch_active)
 
         futures = []
         directories = ["."]

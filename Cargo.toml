@@ -3,21 +3,19 @@ name = "haunted-house"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "evil_clown"
-test = false
-bench = false
-path = "src/evil_clown.rs"
-
-[lib]
-name = "haunted_house"
-crate-type = ["cdylib"]
+#[lib]
+#name = "haunted_house"
+#crate-type = ["cdylib"]
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0"
+# toml = "0.6"
+# serde_yaml = "0.9"
 postcard = { version = "1.0.2", features = ["alloc"] }
 bytes = "*"
+# humansize = "2"
+parse-size = { version = "1", features = ["std"] }
 
 anyhow = "1"
 uuid = { version = "*", features = ["v4"] }
@@ -34,8 +32,8 @@ itertools = "*"
 weak-self = "*"
 gethostname = "0.4"
 yara = { version = "0.16", features= ["vendored"] }
-yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
-
+# yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
+clap = { version = "4", features = ["derive"] }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -47,9 +45,9 @@ reqwest = { version = "0.11", features = ["json"] }
 
 sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
 
-pyo3 = { version = "0.17", features = ["anyhow", "chrono"] }
-pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"] }
-pyo3-log = { version = "0.7" }
+pyo3 = { version = "0.17", features = ["anyhow", "chrono"], optional = true }
+pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"], optional = true }
+pyo3-log = { version = "0.7", optional = true }
 
 azure_core = "0.7"
 azure_identity = "*"
@@ -61,5 +59,7 @@ rand = "*"
 assertor = "*"
 
 [features]
-extension-module = ["pyo3/extension-module"]
-default = ["extension-module"]
+python = ["pyo3", "dep:pyo3-asyncio", "dep:pyo3-log"]
+extension-module = ["python", "pyo3/extension-module"]
+#default = ["extension-module"]
+default = []

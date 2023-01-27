@@ -9,54 +9,58 @@ use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use futures::StreamExt;
 use log::error;
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
 use pyo3::{Python, PyAny, Py, FromPyObject};
+#[cfg(feature = "python")]
 use pyo3::types::{PyTuple, PyBytes};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 
-#[derive(Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum BlobStorageConfig {
-    TempDir,
-    Directory {path: PathBuf},
+    TempDir{size: u64},
+    Directory {path: PathBuf, size: u64},
     Azure (AzureBlobConfig)
 }
 
-
+#[cfg(feature = "python")]
 impl<'source> FromPyObject<'source> for BlobStorageConfig {
     fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
+        todo!();
         // Try to interpret it as a string
-        if let Ok(value) = ob.extract::<String>() {
-            { // Check for keywords after lowercasing
-                let value = value.to_lowercase();
-                if value == "temp" || value == "temporary" {
-                    return Ok(BlobStorageConfig::TempDir)
-                }
-            }
+        // if let Ok(value) = ob.extract::<String>() {
+        //     { // Check for keywords after lowercasing
+        //         let value = value.to_lowercase();
+        //         if value == "temp" || value == "temporary" {
+        //             return Ok(BlobStorageConfig::TempDir)
+        //         }
+        //     }
 
-            // Try interpreting it as a path
-            if value.starts_with("/") || value.starts_with("./") {
-                let path = PathBuf::from(value);
-                std::fs::create_dir_all(&path)?;
-                return Ok(BlobStorageConfig::Directory { path })
-            }
-        }
+        //     // Try interpreting it as a path
+        //     if value.starts_with("/") || value.starts_with("./") {
+        //         let path = PathBuf::from(value);
+        //         std::fs::create_dir_all(&path)?;
+        //         return Ok(BlobStorageConfig::Directory { path })
+        //     }
+        // }
 
-        // Try interpreting it as an azure configuration
-        else if let Ok(config) = ob.extract::<AzureBlobConfig>() {
-            return Ok(BlobStorageConfig::Azure(config))
-        }
+        // // Try interpreting it as an azure configuration
+        // else if let Ok(config) = ob.extract::<AzureBlobConfig>() {
+        //     return Ok(BlobStorageConfig::Azure(config))
+        // }
 
-        // Try interpreting it as a dict
-        else if let Ok(config) = ob.extract::<HashMap<String, String>>() {
-            if let Some(value) = config.get("path") {
-                let path = PathBuf::from(value);
-                std::fs::create_dir_all(&path)?;
-                return Ok(BlobStorageConfig::Directory { path })
-            }
-        }
+        // // Try interpreting it as a dict
+        // else if let Ok(config) = ob.extract::<HashMap<String, String>>() {
+        //     if let Some(value) = config.get("path") {
+        //         let path = PathBuf::from(value);
+        //         std::fs::create_dir_all(&path)?;
+        //         return Ok(BlobStorageConfig::Directory { path })
+        //     }
+        // }
 
         return Err(PyValueError::new_err("Provided blob storage configuration was not valid"));
     }
@@ -65,10 +69,10 @@ impl<'source> FromPyObject<'source> for BlobStorageConfig {
 
 pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
     match config {
-        BlobStorageConfig::TempDir => {
+        BlobStorageConfig::TempDir { size } => {
             LocalDirectory::new_temp().context("Error setting up local blob store")
         }
-        BlobStorageConfig::Directory { path } => {
+        BlobStorageConfig::Directory { path, size } => {
             Ok(BlobStorage::Local(LocalDirectory::new(path)))
         },
         BlobStorageConfig::Azure(azure) =>
@@ -79,14 +83,16 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
 #[derive(Clone)]
 pub enum BlobStorage {
     Local(LocalDirectory),
+    #[cfg(feature = "python")]
     Python(PythonBlobStore),
     Azure(AzureBlobStore)
 }
 
 impl BlobStorage {
-    pub async fn size(&self, label: &str) -> Result<Option<usize>> {
+    pub async fn size(&self, label: &str) -> Result<Option<u64>> {
         match self {
             BlobStorage::Local(obj) => obj.size(label).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.size(label).await,
             BlobStorage::Azure(obj) => obj.size(label).await,
         }
@@ -94,6 +100,7 @@ impl BlobStorage {
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
         match self {
             BlobStorage::Local(obj) => obj.stream(label).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.stream(label).await,
             BlobStorage::Azure(obj) => obj.stream(label).await,
         }
@@ -101,6 +108,7 @@ impl BlobStorage {
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.download(label, path).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.download(label, path).await,
             BlobStorage::Azure(obj) => obj.download(label, path).await,
         }
@@ -108,6 +116,7 @@ impl BlobStorage {
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.upload(label, path).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.upload(label, path).await,
             BlobStorage::Azure(obj) => obj.upload(label, path).await,
         }
@@ -115,6 +124,7 @@ impl BlobStorage {
     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.put(label, &data).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.put(label, &data).await,
             BlobStorage::Azure(obj) => obj.put(label, data).await,
         }
@@ -122,6 +132,7 @@ impl BlobStorage {
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
         match self {
             BlobStorage::Local(obj) => obj.get(label).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.get(label).await,
             BlobStorage::Azure(obj) => obj.get(label).await,
         }
@@ -129,6 +140,7 @@ impl BlobStorage {
     pub async fn delete(&self, label: &str) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.delete(label).await,
+            #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.delete(label).await,
             BlobStorage::Azure(obj) => obj.delete(label).await,
         }
@@ -192,10 +204,10 @@ impl LocalDirectory {
         return dest;
     }
 
-    async fn size(&self, label: &str) -> Result<Option<usize>> {
+    async fn size(&self, label: &str) -> Result<Option<u64>> {
         let path = self.get_path(label);
         match tokio::fs::metadata(path).await {
-            Ok(meta) => Ok(Some(meta.len() as usize)),
+            Ok(meta) => Ok(Some(meta.len())),
             Err(err) => match err.kind() {
                 std::io::ErrorKind::NotFound => Ok(None),
                 _ => Err(err.into())
@@ -244,17 +256,19 @@ impl LocalDirectory {
 }
 
 
+#[cfg(feature = "python")]
 #[derive(Clone)]
 pub struct PythonBlobStore {
     object: Py<PyAny>
 }
 
+#[cfg(feature = "python")]
 impl PythonBlobStore {
     pub fn new(object: Py<PyAny>) -> Self {
         Self {object}
     }
 
-    async fn size(&self, label: &str) -> Result<Option<usize>> {
+    async fn size(&self, label: &str) -> Result<Option<u64>> {
         // Invoke method
         let future = Python::with_gil(|py| {
             // calling the py_sleep method like a normal function returns a coroutine
@@ -270,7 +284,7 @@ impl PythonBlobStore {
 
         // Convert the python value back to rust
         return Python::with_gil(|py| {
-            let result: Option<usize> = result.extract(py)?;
+            let result: Option<u64> = result.extract(py)?;
             Ok(result)
         });
     }
@@ -428,11 +442,13 @@ impl PythonBlobStore {
     }
 }
 
+#[cfg(feature = "python")]
 #[derive(Clone)]
 pub struct PythonStream {
     object: Py<PyAny>
 }
 
+#[cfg(feature = "python")]
 impl std::io::Read for PythonStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let copied = Python::with_gil(|py| {
@@ -461,14 +477,16 @@ pub struct AzureBlobStore {
     client: ContainerClient,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AzureBlobConfig {
     pub account: String,
     pub access_key: String,
     pub container: String,
+    #[serde(default)]
     pub use_emulator: bool,
 }
 
+#[cfg(feature = "python")]
 impl<'source> FromPyObject<'source> for AzureBlobConfig {
     fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
         Python::with_gil(|py| {
@@ -514,7 +532,7 @@ impl AzureBlobStore {
         Ok(client_builder.container_client(config.container.clone()))
     }
 
-    pub async fn size(&self, label: &str) -> Result<Option<usize>> {
+    pub async fn size(&self, label: &str) -> Result<Option<u64>> {
         let client = self.client.blob_client(label);
         let data = match client.get_properties().await {
             Ok(metadata) => metadata,
@@ -531,7 +549,7 @@ impl AzureBlobStore {
                 }
             },
         };
-        Ok(Some(data.blob.properties.content_length as usize))
+        Ok(Some(data.blob.properties.content_length))
     }
 
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {

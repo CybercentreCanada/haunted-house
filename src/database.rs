@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::core::{SearchCache, Config};
+use crate::core::{SearchCache, CoreConfig};
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkError};
@@ -118,11 +118,11 @@ impl Database {
     //     Ok(Database::Rocks(RocksInterface::new(index_soft_max)?))
     // }
 
-    pub async fn new_sqlite(config: Config, path: &str) -> Result<Self> {
+    pub async fn new_sqlite(config: CoreConfig, path: &str) -> Result<Self> {
         Ok(Database::SQLite(SQLiteInterface::new(config, path).await?))
     }
 
-    pub async fn new_sqlite_temp(config: Config) -> Result<Self> {
+    pub async fn new_sqlite_temp(config: CoreConfig) -> Result<Self> {
         Ok(Database::SQLite(SQLiteInterface::new_temp(config).await?))
     }
 

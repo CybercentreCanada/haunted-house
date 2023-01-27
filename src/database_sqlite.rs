@@ -9,7 +9,7 @@ use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
 use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
-use crate::core::{SearchCache, Config};
+use crate::core::{SearchCache, CoreConfig};
 use crate::database::{IndexGroup, BlobID, IndexID};
 use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
 use crate::query::Query;
@@ -55,7 +55,7 @@ impl sqlx::Type<sqlx::Sqlite> for BlobID {
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    config: Config,
+    config: CoreConfig,
     work_notification: tokio::sync::Notify,
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -105,7 +105,7 @@ struct SearchRecord {
 
 
 impl SQLiteInterface {
-    pub async fn new(config: Config, url: &str) -> Result<Self> {
+    pub async fn new(config: CoreConfig, url: &str) -> Result<Self> {
 
         let url = if url == "memory" {
             format!("sqlite::memory:")
@@ -132,7 +132,7 @@ impl SQLiteInterface {
         })
     }
 
-    pub async fn new_temp(config: Config) -> Result<Self> {
+    pub async fn new_temp(config: CoreConfig) -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let path = tempdir.path().join("house.db");
 
@@ -170,8 +170,8 @@ impl SQLiteInterface {
             UNIQUE (search, filter_blob)
         )
         ")).execute(&mut con).await.context("error creating table filter_tasks")?;
-        sqlx::query(&format!("CREATE INDEX filter_assigned_work_index ON filter_tasks(assigned_worker)")).execute(&mut con).await?;
-        sqlx::query(&format!("CREATE INDEX filter_filter_index ON filter_tasks(filter_blob)")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS filter_assigned_work_index ON filter_tasks(assigned_worker)")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS filter_filter_index ON filter_tasks(filter_blob)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists yara_tasks (
             id INTEGER PRIMARY KEY,
@@ -183,14 +183,14 @@ impl SQLiteInterface {
             FOREIGN KEY(search) REFERENCES searches(code)
         )
         ")).execute(&mut con).await.context("Error creating table yara_tasks")?;
-        sqlx::query(&format!("CREATE INDEX yara_assigned_work_index ON yara_tasks(assigned_worker)")).execute(&mut con).await?;
-        sqlx::query(&format!("CREATE INDEX yara_search_index ON yara_tasks(search)")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS yara_assigned_work_index ON yara_tasks(assigned_worker)")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS yara_search_index ON yara_tasks(search)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists garbage (
             blob_id TEXT PRIMARY KEY,
             time TEXT NOT NULL
         )")).execute(&mut con).await.context("error creating table garbage")?;
-        sqlx::query(&format!("CREATE INDEX garbage_blob_id ON garbage(time)")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS garbage_blob_id ON garbage(time)")).execute(&mut con).await?;
 
         return Ok(())
     }

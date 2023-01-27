@@ -89,8 +89,8 @@ impl TrigramFilter {
         return Ok(out);
     }
 
-    pub fn guess_max_size(files: usize) -> usize {
-        HEADER_SIZE + OFFSET_TABLE_SIZE as usize + files * 8
+    pub fn guess_max_size(files: usize) -> u64 {
+        HEADER_SIZE as u64 + OFFSET_TABLE_SIZE + files as u64 * 8
     }
 
     pub fn merge_in_data(mut file: std::fs::File, old: std::fs::File, data: Vec<BitVec>, index_offset: u64) -> Result<Self> {

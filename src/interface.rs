@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 use anyhow::Result;
 
+use chrono::serde::ts_seconds_option;
 use log::{error, debug};
 use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest};
 use poem::web::{TypedHeader, Data, Json};
@@ -12,6 +13,7 @@ use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::auth::Role;
 use crate::core::HouseCore;
@@ -60,6 +62,10 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
 
         if roles.contains(&Role::Search) {
             req.extensions_mut().insert(SearcherInterface::new(self.core.clone()));
+        }
+
+        if roles.contains(&Role::Ingest) {
+            req.extensions_mut().insert(IngestInterface::new(self.core.clone()));
         }
 
         // call the next endpoint.
@@ -162,6 +168,27 @@ impl SearcherInterface {
     }
 }
 
+struct IngestInterface {
+    core: Arc<HouseCore>
+}
+
+impl IngestInterface {
+    pub fn new(core: Arc<HouseCore>) -> Self {
+        Self{core}
+    }
+
+    pub async fn ingest(&self, request: IngestRequest) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        let hash = hex::decode(request.hash)?;
+        if hash.len() != 32 {
+            return Err(anyhow::anyhow!("Invalid hash: wrong number of bytes"));
+        }
+        self.core.ingest_queue.send(crate::core::IngestMessage::IngestMessage(hash, request.access, request.expiry, send))?;
+        return recv.await?;
+    }
+}
+
+
 
 #[derive(Deserialize)]
 pub struct SearchRequest {
@@ -263,6 +290,19 @@ async fn work_error(Data(interface): Data<&WorkerInterface>, Json(error): Json<W
     interface.work_error(error).await
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct IngestRequest {
+    hash: String,
+    access: crate::access::AccessControl,
+    #[serde(with = "ts_seconds_option")]
+    expiry: Option<chrono::DateTime<chrono::Utc>>
+}
+
+#[handler]
+async fn insert_sha(Data(interface): Data<&IngestInterface>, Json(request): Json<IngestRequest>) -> Result<()> {
+    interface.ingest(request).await
+}
+
 pub async fn serve(bind_address: String, core: Arc<HouseCore>) {
     if let Err(err) = _serve(bind_address, core).await {
         error!("Error with http interface: {err}");
@@ -276,6 +316,8 @@ pub async fn _serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), st
         .at("/work/", get(get_work))
         .at("/work/finished/", post(finish_work))
         .at("/work/error/", post(work_error))
+        .at("/insert/sha256/", post(insert_sha))
+
         .with(TokenMiddleware::new(core))
         .with(LoggerMiddleware);
 

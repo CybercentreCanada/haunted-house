@@ -2,6 +2,7 @@ pub mod error;
 pub mod ursadb;
 pub mod varint;
 mod access;
+mod config;
 mod storage;
 mod core;
 mod database;
@@ -31,7 +32,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
 use crate::blob_cache::BlobCache;
-use crate::core::{IngestMessage, Config, HouseCore};
+use crate::core::{IngestMessage, CoreConfig, HouseCore};
 use crate::access::AccessControl;
 use crate::worker::WorkerBuilder;
 
@@ -132,9 +133,9 @@ struct ServerBuilder {
     file_storage: Option<BlobStorageConfig>,
     bind_address: String,
     authenticator: Option<Authenticator>,
-    cache_space: Option<(PathBuf, usize)>,
+    cache_space: Option<(PathBuf, u64)>,
     database_config: Option<DatabaseConfig>,
-    config: Config,
+    config: CoreConfig,
 }
 
 #[pymethods]
@@ -154,7 +155,7 @@ impl ServerBuilder {
         Ok(())
     }
 
-    fn cache_directory(&mut self, path: PathBuf, capacity: usize) -> PyResult<()> {
+    fn cache_directory(&mut self, path: PathBuf, capacity: u64) -> PyResult<()> {
         self.cache_space = Some((path, capacity));
         Ok(())
     }
@@ -174,7 +175,7 @@ impl ServerBuilder {
         Ok(())
     }
 
-    fn batch_limit_size(&mut self, size: usize) {
+    fn batch_limit_size(&mut self, size: u64) {
         self.config.batch_limit_size = size;
     }
 

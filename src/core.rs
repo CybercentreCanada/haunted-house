@@ -11,6 +11,7 @@ use crate::filter::TrigramFilter;
 use bitvec::vec::BitVec;
 use futures::future::select_all;
 use log::{error, debug, info};
+use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot};
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc, Duration};
@@ -24,30 +25,42 @@ pub enum IngestMessage {
     Status(oneshot::Sender<(bool, usize)>)
 }
 
-#[derive(Clone)]
-pub struct Config {
-    pub batch_limit_size: usize,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreConfig {
+    #[serde(default="default_batch_limit_size")]
+    pub batch_limit_size: u64,
+    #[serde(default="default_batch_limit_seconds")]
     pub batch_limit_seconds: u64,
+    #[serde(default="default_garbage_collection_interval")]
     pub garbage_collection_interval: std::time::Duration,
+    #[serde(default="default_index_soft_entries_max")]
     pub index_soft_entries_max: u64,
+    #[serde(default="default_index_soft_bytes_max")]
     pub index_soft_bytes_max: u64,
+    #[serde(default="default_yara_job_size")]
     pub yara_job_size: u64,
+    #[serde(default="default_max_result_set_size")]
     pub max_result_set_size: u64,
 }
 
-const DEFAULT_SOFT_MAX_BYTES_SIZE: u64 = 50 << 30;
-const DEFAULT_SOFT_MAX_ENTRIES_SIZE: u64 = 50 << 30;
+fn default_batch_limit_seconds() -> u64 { chrono::Duration::hours(1).num_seconds() as u64 }
+fn default_batch_limit_size() -> u64 { 100 }
+fn default_garbage_collection_interval() -> std::time::Duration { std::time::Duration::from_secs(60) }
+fn default_index_soft_bytes_max() -> u64 { 50 << 30 }
+fn default_index_soft_entries_max() -> u64 { 50 << 30 }
+fn default_yara_job_size() -> u64 { 1000 }
+fn default_max_result_set_size() -> u64 { 100_000 }
 
-impl Default for Config {
+impl Default for CoreConfig {
     fn default() -> Self {
         Self {
-            batch_limit_seconds: chrono::Duration::hours(1).num_seconds() as u64,
-            batch_limit_size: 100,
-            garbage_collection_interval: std::time::Duration::from_secs(60),
-            index_soft_bytes_max: DEFAULT_SOFT_MAX_BYTES_SIZE,
-            index_soft_entries_max: DEFAULT_SOFT_MAX_ENTRIES_SIZE,
-            yara_job_size: 1000,
-            max_result_set_size: 1_000_000,
+            batch_limit_seconds: default_batch_limit_seconds(),
+            batch_limit_size: default_batch_limit_size(),
+            garbage_collection_interval: default_garbage_collection_interval(),
+            index_soft_bytes_max: default_index_soft_bytes_max(),
+            index_soft_entries_max: default_index_soft_entries_max(),
+            yara_job_size: default_yara_job_size(),
+            max_result_set_size: default_max_result_set_size(),
         }
     }
 }
@@ -59,14 +72,14 @@ pub struct HouseCore {
     pub index_storage: BlobStorage,
     pub index_cache: BlobCache,
     pub authenticator: Authenticator,
-    pub config: Config,
+    pub config: CoreConfig,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     search_watchers: mpsc::UnboundedSender<WorkResult>,
     garbage_collection_notification: tokio::sync::Notify,
 }
 
 impl HouseCore {
-    pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, index_cache: BlobCache, authenticator: Authenticator, config: Config) -> Result<Arc<Self>> {
+    pub fn new(index_storage: BlobStorage, file_storage: BlobStorage, database: Database, index_cache: BlobCache, authenticator: Authenticator, config: CoreConfig) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
         let (send_search, receive_search) = mpsc::unbounded_channel();
 
@@ -158,7 +171,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
         //
         if current_batch.is_none() {
             for (key, values) in pending_batch.iter() {
-                let at_size_limit = values.len() >= core.config.batch_limit_size;
+                let at_size_limit = values.len() >= core.config.batch_limit_size as usize;
                 let batch_start = match pending_timers.get(key) {
                     Some(start) => start.clone(),
                     None => Utc::now(),
@@ -169,7 +182,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         let mut batch = HashMap::new();
                         let mut remains = HashMap::new();
                         for row in values.into_iter() {
-                            if batch.len() < core.config.batch_limit_size {
+                            if batch.len() < core.config.batch_limit_size as usize {
                                 batch.insert(row.0, row.1);
                             } else {
                                 remains.insert(row.0, row.1);
