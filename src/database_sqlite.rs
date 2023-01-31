@@ -119,6 +119,7 @@ impl SQLiteInterface {
         };
 
         let pool = PoolOptions::new()
+            .max_connections(200)
             .acquire_timeout(std::time::Duration::from_secs(30))
             .connect(&url).await?;
 
@@ -392,6 +393,18 @@ impl SQLiteInterface {
             SELECT expiry_group, label FROM index_index")
             .fetch_all(&mut conn).await?;
         Ok(list)
+    }
+
+    pub async fn count_files(&self, index: &IndexID) -> Result<u64> {
+        let mut conn = self.db.acquire().await?;
+
+        let table_name = filter_table_name(&index);
+
+        // Add all the new file entries
+        let (row, ): (i64, ) = sqlx::query_as(&format!("SELECT count(*) FROM {table_name}"))
+            .fetch_one(&mut conn).await?;
+
+        Ok(row as u64)
     }
 
     pub async fn lease_blob(&self) -> Result<BlobID> {
