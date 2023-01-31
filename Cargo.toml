@@ -49,10 +49,10 @@ pyo3 = { version = "0.17", features = ["anyhow", "chrono"], optional = true }
 pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"], optional = true }
 pyo3-log = { version = "0.7", optional = true }
 
-azure_core = "0.7"
-azure_identity = "*"
-azure_storage = "0.8"
-azure_storage_blobs = "0.8"
+azure_core = "0.8"
+azure_identity = "0.9"
+azure_storage = "0.9"
+azure_storage_blobs = "0.9"
 
 [dev-dependencies]
 rand = "*"

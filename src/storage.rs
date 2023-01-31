@@ -511,7 +511,16 @@ impl AzureBlobStore {
     async fn new(config: AzureBlobConfig) -> Result<Self> {
         let client = Self::get_container_client(&config)?;
         if !client.exists().await? {
-            client.create().await?;
+            if let Err(err) = client.create().await {
+                let http_error = err.as_http_error();
+                let ignore = match http_error {
+                    Some(http) => http.error_code() == Some("ContainerAlreadyExists"),
+                    None => false,
+                };
+                if !ignore {
+                    return Err(err.into())
+                }
+            };
         }
         let http_client = reqwest::ClientBuilder::new().build()?;
 
@@ -645,7 +654,15 @@ impl AzureBlobStore {
 
     pub async fn delete(&self, label: &str) -> Result<()> {
         let client = self.client.blob_client(label);
-        client.delete().await?;
+        if let Err(err) = client.delete().await {
+            let ignore = match err.as_http_error() {
+                Some(err) => err.status() == 404,
+                None => false,
+            };
+            if !ignore {
+                return Err(err.into())
+            }
+        };
         return Ok(())
     }
 }
@@ -677,6 +694,19 @@ mod test {
         assert_eq!(store.get("test").await.unwrap(), body);
 
     }
+
+    #[tokio::test]
+    async fn delete_file() {
+        let store = connect().await;
+        let body = b"a body".repeat(10);
+
+        store.delete("delete-file-test").await.unwrap();
+        store.delete("delete-file-test").await.unwrap();
+        store.put("delete-file-test", body.clone()).await.unwrap();
+        store.delete("delete-file-test").await.unwrap();
+        store.delete("delete-file-test").await.unwrap();
+    }
+
 
     #[tokio::test]
     async fn stream() {
