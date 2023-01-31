@@ -71,22 +71,27 @@ def pretty_classification(item):
 
 
 async def ingest_call(session, ce, item):
-    await asyncio.sleep(3 + random.random() * 3)
-    print(item['classification'])
-    print(ce.get_access_control_parts(item['classification']))
+    # await asyncio.sleep(3 + random.random() * 3)
+    # print(item['classification'])
+    # print(ce.get_access_control_parts(item['classification']))
 
+    expiry = None
+    if 'expiry_ts' in item and item['expiry_ts'] is not None:
+        expiry = arrow.get(item['expiry_ts']).int_timestamp
 
-    # body = {
-    #     'hash': item['sha256'],
-    #     'access': ,
-    #     'expiry': arrow.get(item['expiry_ts']).int_timestamp
-    # }
+    body = {
+        'hash': item['sha256'],
+        'access': prepare_classification(ce, item['classification']),
+        'expiry': expiry,
+        'block': True,
+    }
 
-
-
-    # async with session.post(config.HAUNTEDHOUSE_URL + "/ingest/sha256", body=body) as resp:
-    #     if resp.status != 200:
-    #         raise ValueError()
+    print("Submitting", item['sha256'])
+    async with session.post(config.HAUNTEDHOUSE_URL + "/ingest/sha256/", json=body) as resp:
+        resp.raise_for_status()
+        print("Finished", item['sha256'])
+        # if resp.status != 200:
+        #     raise ValueError()
 
     return item['_seq_no']
 
@@ -99,17 +104,18 @@ async def main():
     classification_definition = client._connection.get('api/v4/help/classification_definition')
     ce = Classification(classification_definition['original_definition'])
     assert ce.enforce
-    print(ce.original_definition.keys())
+    # print(ce.original_definition.keys())
 
-    for item in ce.list_all_classification_combinations(long_format=True):
-        print(item)
-        # print('\t', ce.normalize_classification(item))
-        print(pretty_classification(prepare_classification(ce, item)))
-        print()
+    # for item in ce.list_all_classification_combinations(long_format=True):
+    #     print(item)
+    #     # print('\t', ce.normalize_classification(item))
+    #     print(pretty_classification(prepare_classification(ce, item)))
+    #     print()
 
-    return
-
-    async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + config.HAUNTEDHOUSE_KEY}) as session:
+    # return
+    conn = aiohttp.TCPConnector(limit=200)
+    timeout = aiohttp.ClientTimeout(total=60 * 60 * 4)
+    async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + config.HAUNTEDHOUSE_KEY}, timeout=timeout, connector=conn) as session:
 
         completed_sequence_no = None
         next_sequence_no = None
@@ -119,11 +125,12 @@ async def main():
 
         while True:
 
-            if len(tasks) < 1000:
+            if len(tasks) < 2000:
                 if next_sequence_no is None:
                     batch = client.search.file("*", sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
                 else:
-                    batch = client.search.file(f"_seq_no: {{{next_sequence_no} TO *]", sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
+                    batch = client.search.file(f"_seq_no: {{{next_sequence_no} TO *]",
+                                               sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
 
                 for item in batch['items']:
                     # Get the current highest sequence number being processed
@@ -155,5 +162,79 @@ async def main():
                 await asyncio.sleep(60)
 
 
+async def socket_listener(ws: aiohttp.ClientWebSocketResponse, current, waiting, numbers):
+
+    while True:
+        message = await ws.receive_json()
+        if message['success']:
+            seq = int(message['token'])
+            current.remove(seq)
+            waiting.append(seq)
+
+            if current:
+                oldest_running = min(current)
+            else:
+                oldest_running = numbers['next']
+            finished = [seq for seq in waiting if seq < oldest_running]
+            if finished:
+                numbers['completed'] = max(finished)
+                print("cursor head", numbers['completed'])
+        else:
+            print(message['error'])
+
+
+async def socket_main():
+    client = get_client(config.ASSEMBLYLINE_URL, apikey=(config.ASSEMBLYLINE_USER, config.ASSEMBLYLINE_API_KEY))
+
+    classification_definition = client._connection.get('api/v4/help/classification_definition')
+    ce = Classification(classification_definition['original_definition'])
+    assert ce.enforce
+
+    numbers = {}
+    current_sequence_numbers = []
+    waiting_sequence_numbers = []
+
+    conn = aiohttp.TCPConnector(limit=10)
+    timeout = aiohttp.ClientTimeout(total=60 * 60 * 4)
+    async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + config.HAUNTEDHOUSE_KEY}, timeout=timeout, connector=conn) as session:
+        async with session.ws_connect(config.HAUNTEDHOUSE_URL + "/ingest/stream/") as ws:
+            asyncio.create_task(socket_listener(ws, current_sequence_numbers, waiting_sequence_numbers, numbers))
+
+            while True:
+                if len(current_sequence_numbers) < 5000:
+                    if 'next' not in numbers:
+                        batch = client.search.file("*", sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
+                    else:
+                        batch = client.search.file(f"_seq_no: {{{numbers['next']} TO *]",
+                                                   sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
+
+                    if len(batch['items']) == 0:
+                        print("No more files to fetch, sleeping")
+                        await asyncio.sleep(60)
+
+                    for item in batch['items']:
+                        # Get the current highest sequence number being processed
+                        numbers['next'] = max(numbers.get('next', item['_seq_no']), item['_seq_no'])
+
+                        # Track all active sequence numbers, and launch a task
+                        current_sequence_numbers.append(item['_seq_no'])
+
+                        expiry = None
+                        if 'expiry_ts' in item and item['expiry_ts'] is not None:
+                            expiry = arrow.get(item['expiry_ts']).int_timestamp
+
+                        body = {
+                            'token': str(item['_seq_no']),
+                            'hash': item['sha256'],
+                            'access': prepare_classification(ce, item['classification']),
+                            'expiry': expiry,
+                            'block': True,
+                        }
+                        await ws.send_json(body)
+
+                else:
+                    await asyncio.sleep(0.5)
+
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(socket_main())

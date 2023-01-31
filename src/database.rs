@@ -10,7 +10,7 @@ use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkError};
 
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
 pub struct IndexGroup(String);
 
 impl IndexGroup {
@@ -48,7 +48,7 @@ impl std::fmt::Display for IndexGroup {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, PartialOrd, Ord)]
 pub struct IndexID(String);
 
 impl IndexID {
@@ -157,6 +157,12 @@ impl Database {
     pub async fn list_indices(&self) -> Result<Vec<(IndexGroup, IndexID)>> {
         match self {
             Database::SQLite(local) => local.list_indices().await,
+        }
+    }
+
+    pub async fn count_files(&self, id: &IndexID) -> Result<u64> {
+        match self {
+            Database::SQLite(local) => local.count_files(id).await,
         }
     }
 

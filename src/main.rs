@@ -57,7 +57,7 @@ fn load_config(path: Option<PathBuf>) -> Result<crate::config::Config> {
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "haunted-house=info")
+        std::env::set_var("RUST_LOG", "haunted_house=info")
     }
     env_logger::init();
 
@@ -65,7 +65,6 @@ async fn main() -> Result<()> {
     match args.cmd {
         Commands::LintConfig { config } => {
             let config = load_config(config)?;
-            println!("Config");
             let config_body = serde_json::to_string_pretty(&config)?;
             println!("{}", config_body);
         },

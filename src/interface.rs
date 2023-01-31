@@ -1,23 +1,27 @@
 
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use anyhow::Result;
 
 use chrono::serde::ts_seconds_option;
-use log::{error, debug};
-use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest};
+use futures::{StreamExt, SinkExt};
+use log::{error, debug, info};
+use poem::web::websocket::Message;
+use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 use crate::auth::Role;
-use crate::core::HouseCore;
-use crate::database::{BlobID, IndexID};
+use crate::core::{HouseCore, IngestStatus};
+use crate::database::{BlobID, IndexID, IndexGroup};
 use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -45,6 +49,7 @@ struct TokenMiddlewareImpl<E> {
     core: Arc<HouseCore>,
 }
 
+type RoleList = HashSet<Role>;
 
 #[poem::async_trait]
 impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
@@ -66,6 +71,11 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
 
         if roles.contains(&Role::Ingest) {
             req.extensions_mut().insert(IngestInterface::new(self.core.clone()));
+        }
+
+        if !roles.is_empty() {
+            req.extensions_mut().insert(roles);
+            req.extensions_mut().insert(StatusInterface::new(self.core.clone()));
         }
 
         // call the next endpoint.
@@ -109,8 +119,38 @@ impl<E: Endpoint> Endpoint for LoggerMiddlewareImpl<E> {
     }
 }
 
+struct StatusInterface {
+    core: Arc<HouseCore>
+}
 
+impl StatusInterface {
+    pub fn new(core: Arc<HouseCore>) -> Self {
+        Self{core}
+    }
 
+    pub async fn get_status(&self) -> Result<StatusReport> {
+        let ingest = self.core.ingest_status().await?;
+        let mut indices = self.core.database.list_indices().await?;
+        indices.sort();
+
+        let mut file_count: HashMap<IndexGroup, u64> = Default::default();
+
+        for (group, index) in indices.iter() {
+            let mut count = *file_count.get(group).unwrap_or(&0);
+            count += self.core.database.count_files(index).await?;
+            file_count.insert(group.clone(), count);
+        }
+
+        let mut file_counts: Vec<_> = file_count.into_iter().collect();
+        file_counts.sort();
+
+        Ok(StatusReport {
+            ingest,
+            active_filters: indices,
+            file_counts
+        })
+    }
+}
 
 
 struct WorkerInterface {
@@ -168,6 +208,7 @@ impl SearcherInterface {
     }
 }
 
+#[derive(Clone)]
 struct IngestInterface {
     core: Arc<HouseCore>
 }
@@ -292,15 +333,157 @@ async fn work_error(Data(interface): Data<&WorkerInterface>, Json(error): Json<W
 
 #[derive(Serialize, Deserialize)]
 pub struct IngestRequest {
+    #[serde(default)]
+    token: Option<String>,
     hash: String,
+    #[serde(default = "default_blocking")]
+    block: bool,
     access: crate::access::AccessControl,
     #[serde(with = "ts_seconds_option")]
     expiry: Option<chrono::DateTime<chrono::Utc>>
 }
+fn default_blocking() -> bool { true }
+
+#[derive(Serialize, Deserialize)]
+pub struct IngestResponse {
+    token: Option<String>,
+    hash: String,
+    success: bool,
+    error: String,
+}
+
 
 #[handler]
 async fn insert_sha(Data(interface): Data<&IngestInterface>, Json(request): Json<IngestRequest>) -> Result<()> {
-    interface.ingest(request).await
+    if request.block {
+        interface.ingest(request).await
+    } else {
+        let interface = interface.clone();
+        tokio::spawn(async move {
+            interface.ingest(request).await;
+        });
+        return Ok(())
+    }
+}
+
+#[handler]
+async fn ingest_stream(Data(interface): Data<&IngestInterface>, ws: poem::web::websocket::WebSocket) -> impl IntoResponse {
+    info!("Starting new websocket ingester");
+    let interface = interface.clone();
+    ws.protocols(vec!["ingest-stream"])
+    .on_upgrade(|mut socket| async move {
+        tokio::spawn(async move {
+            let mut active: JoinSet<(String, Option<String>, Result<()>)> = JoinSet::new();
+            loop {
+                tokio::select! {
+                    message = socket.next() => {
+                        let message = match message {
+                            Some(Ok(message)) => message,
+                            Some(Err(err)) => {
+                                error!("Websocket error: {err}");
+                                break
+                            },
+                            None => {
+                                info!("Websocket closed");
+                                break
+                            }
+                        };
+
+                        let message = match message {
+                            Message::Text(message) => serde_json::from_str::<IngestRequest>(&message),
+                            Message::Binary(message) => serde_json::from_slice::<IngestRequest>(&message),
+                            Message::Ping(_) => continue,
+                            Message::Pong(_) => continue,
+                            Message::Close(_) => {
+                                info!("Websocket going to close");
+                                break
+                            },
+                        };
+
+                        let mut message: IngestRequest = match message {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let response = IngestResponse {
+                                    token: None,
+                                    hash: Default::default(),
+                                    success: false,
+                                    error: format!("Could not decode message: {err}")
+                                };
+
+                                if let Ok(response) = serde_json::to_string(&response) {
+                                    _ = socket.send(Message::Text(response)).await;
+                                }
+                                continue
+                            }
+                        };
+
+                        let interface = interface.clone();
+                        active.spawn(async move {
+                            let hash = message.hash.clone();
+                            let token = message.token.take();
+                            let resp = interface.ingest(message).await;
+                            return (hash, token, resp)
+                        });
+                    },
+                    item = active.join_next(), if !active.is_empty() => {
+                        let item = match item {
+                            Some(Ok(item)) => item,
+                            Some(Err(err)) => {
+                                error!("JoinSet error: {err}");
+                                continue
+                            },
+                            None => continue
+                        };
+
+                        let (hash, token, result) = item;
+                        let response = match result {
+                            Ok(()) => IngestResponse{
+                                token,
+                                hash,
+                                error: Default::default(),
+                                success: true
+                            },
+                            Err(err) => IngestResponse {
+                                token,
+                                hash,
+                                error: format!("{}", err),
+                                success: false
+                            },
+                        };
+
+                        let response = match serde_json::to_string(&response) {
+                            Ok(buffer) => buffer,
+                            Err(err) => {
+                                error!("Serialization error: {err}");
+                                continue
+                            }
+                        };
+                        if let Err(err) = socket.send(Message::Text(response)).await {
+                            error!("WebSocket send error: {err}");
+                        }
+                    }
+                };
+            }
+            info!("Stopping websocket ingester");
+        })
+    })
+}
+
+#[handler]
+async fn get_status() -> Result<()> {
+    return Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct StatusReport {
+    ingest: IngestStatus,
+    active_filters: Vec<(IndexGroup, IndexID)>,
+    file_counts: Vec<(IndexGroup, u64)>,
+}
+
+#[handler]
+async fn get_detailed_status(interface: Data<&StatusInterface>) -> Result<Json<StatusReport>> {
+    Ok(Json(interface.get_status().await?))
 }
 
 pub async fn serve(bind_address: String, core: Arc<HouseCore>) {
@@ -316,7 +499,11 @@ pub async fn _serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), st
         .at("/work/", get(get_work))
         .at("/work/finished/", post(finish_work))
         .at("/work/error/", post(work_error))
-        .at("/insert/sha256/", post(insert_sha))
+        .at("/ingest/sha256/", post(insert_sha))
+        .at("/ingest/stream/", get(ingest_stream))
+        .at("/status/online", get(get_status))
+        .at("/status/detailed", get(get_detailed_status))
+
 
         .with(TokenMiddleware::new(core))
         .with(LoggerMiddleware);

@@ -19,10 +19,16 @@ use tokio::task::JoinHandle;
 use weak_self::WeakSelf;
 
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestStatus {
+    pub active_batch: Option<u64>,
+    pub queue_size: u64,
+}
+
 #[derive(Debug)]
 pub enum IngestMessage {
     IngestMessage(Vec<u8>, AccessControl, Option<DateTime<Utc>>, oneshot::Sender<Result<()>>),
-    Status(oneshot::Sender<(bool, usize)>)
+    Status(oneshot::Sender<IngestStatus>)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,7 +110,7 @@ impl HouseCore {
         return Ok(core)
     }
 
-    pub async fn ingest_status(&self) -> Result<(bool, usize)> {
+    pub async fn ingest_status(&self) -> Result<IngestStatus> {
         let (send, recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::Status(send))?;
         return Ok(recv.await?);
@@ -151,13 +157,25 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
     }
 }
 
+async fn wait_for_batch_or_ready(mut job: &mut Option<JoinHandle<()>>, instant: tokio::time::Instant) -> Result<()> {
+    match &mut job {
+        Some(task) => {
+            task.await?;
+        },
+        None => {
+            tokio::time::sleep_until(instant).await;
+        },
+    };
+    Ok(())
+}
+
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
 
-    let mut pending_timers: HashMap<IndexGroup, DateTime<Utc>> = Default::default();
+    let mut pending_timers: HashMap<IndexGroup, tokio::time::Instant> = Default::default();
     let mut pending_batch: HashMap<IndexGroup, HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
 
     let mut current_batch: Option<JoinHandle<()>> = None;
-    let mut batch_check_timer = tokio::time::interval(std::time::Duration::from_millis(50.max(1000 * core.config.batch_limit_seconds/2)));
+    let mut last_batch_size = 0;
 
     loop {
 
@@ -174,9 +192,9 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 let at_size_limit = values.len() >= core.config.batch_limit_size as usize;
                 let batch_start = match pending_timers.get(key) {
                     Some(start) => start.clone(),
-                    None => Utc::now(),
+                    None => tokio::time::Instant::now(),
                 };
-                if at_size_limit || (Utc::now() - batch_start).num_seconds() > core.config.batch_limit_seconds as i64 {
+                if at_size_limit || batch_start.elapsed().as_secs() > core.config.batch_limit_seconds {
                     let key = key.clone();
                     if let Some(values) = pending_batch.remove(&key) {
                         let mut batch = HashMap::new();
@@ -189,6 +207,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                             }
                         }
 
+                        last_batch_size = batch.len();
                         current_batch = Some(tokio::spawn(run_batch_ingest(core.clone(), key.clone(), batch)));
                         if !remains.is_empty() {
                             pending_batch.insert(key, remains);
@@ -198,6 +217,12 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 }
             }
         }
+
+        // get how long in the future the next pending batch is mature
+        let batch_ready_time = pending_timers
+            .iter()
+            .map(|(_, time)| time)
+            .fold(tokio::time::Instant::now() + tokio::time::Duration::from_secs(60), |a, b| a.min(*b));
 
         // Wait for more ingest messages
         tokio::select!{
@@ -250,7 +275,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                                 let mut batch: HashMap<Vec<u8>, _> = Default::default();
                                 batch.insert(hash, (access, vec![respond]));
                                 entry.insert(batch);
-                                pending_timers.insert(index_group, Utc::now());
+                                pending_timers.insert(index_group, tokio::time::Instant::now());
                             },
                         }
                     },
@@ -259,12 +284,20 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         for (_, buffered) in pending_batch.iter() {
                             total += buffered.len();
                         }
-                        _ = response.send((current_batch.is_some(), total));
+                        _ = response.send(IngestStatus {
+                            active_batch: if current_batch.is_some() {
+                                Some(last_batch_size as u64)
+                            } else {
+                                None
+                            },
+                            queue_size: total as u64
+                        });
                     }
                 }
             }
-            // At the interval break this wait and go check the batches again
-            _ = batch_check_timer.tick() => { continue; }
+
+            // If the current batch finishes, or another batch should be checked
+            _ = wait_for_batch_or_ready(&mut current_batch, batch_ready_time) => { continue; }
         }
     }
     return Ok(())
