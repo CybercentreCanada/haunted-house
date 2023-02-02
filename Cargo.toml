@@ -13,6 +13,7 @@ serde_json = "1.0"
 # toml = "0.6"
 # serde_yaml = "0.9"
 postcard = { version = "1.0.2", features = ["alloc"] }
+nom = "7"
 bytes = "*"
 # humansize = "2"
 parse-size = { version = "1", features = ["std"] }
@@ -53,6 +54,7 @@ azure_core = "0.8"
 azure_identity = "0.9"
 azure_storage = "0.9"
 azure_storage_blobs = "0.9"
+
 
 [dev-dependencies]
 rand = "*"

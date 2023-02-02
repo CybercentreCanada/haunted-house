@@ -1,6 +1,9 @@
 use std::collections::HashSet;
+use std::fmt::Display;
+use std::str::FromStr;
 
 use serde::{Serialize, Deserialize};
+use anyhow::Result;
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
@@ -10,6 +13,25 @@ pub enum AccessControl {
     Token(String),
     Always,
     // Never,
+}
+
+impl Display for AccessControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessControl::Or(items) => f.write_fmt(format_args!("Or({})", items.iter().map(|x|x.to_string()).collect::<Vec<String>>().join(", "))),
+            AccessControl::And(items) => f.write_fmt(format_args!("And({})", items.iter().map(|x|x.to_string()).collect::<Vec<String>>().join(", "))),
+            AccessControl::Token(value) => f.write_fmt(format_args!("\"{value}\"")),
+            AccessControl::Always => f.write_str("Always"),
+        }
+    }
+}
+
+impl FromStr for AccessControl {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(parse::access(s)?)
+    }
 }
 
 impl core::ops::BitAnd<AccessControl> for &AccessControl {
@@ -203,7 +225,7 @@ impl AccessControl {
                 }
 
                 let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(AccessControl::into_and).collect();
-        
+
                 if common.len() == 0 {
                     return AccessControl::into_or(unfactored);
                 }
@@ -259,26 +281,6 @@ impl AccessControl {
         };
     }
 
-    pub fn parse(data: &str, and_split: &str, or_split: &str) -> AccessControl {
-        let mut anded = vec![];
-        for segment in data.split(and_split) {
-            let mut ored = vec![];
-            for segment in segment.split(or_split) {
-                let segment = segment.trim();
-                if segment.len() > 0 {
-                    ored.push(AccessControl::Token(segment.to_owned()));
-                }
-            }
-            if ored.len() > 0 {
-                anded.push(AccessControl::into_or(ored));
-            }
-        }
-        if anded.len() > 0 {
-            return AccessControl::into_and(anded);
-        }
-        return AccessControl::Always;
-    }
-
     pub fn can_access(&self, fields: &HashSet<String>) -> bool {
         match self {
             AccessControl::Or(sub) => {
@@ -303,6 +305,56 @@ impl AccessControl {
     }
 }
 
+
+mod parse {
+
+    use nom::branch::alt;
+    use nom::bytes::complete::{tag_no_case, tag, is_not};
+    use nom::character::complete::multispace0;
+    use nom::multi::{separated_list1, many1};
+    use nom::sequence::{delimited, tuple};
+    use nom::{IResult};
+    use super::AccessControl;
+
+    pub fn access(input: &str) -> anyhow::Result<AccessControl> {
+        let (remain, access) = match parse_access(input) {
+            Ok(result) => result,
+            Err(err) => return Err(anyhow::anyhow!("Could not parse access string: {err}")),
+        };
+        if !remain.is_empty() {
+            return Err(anyhow::anyhow!("Could not parse access string trailing data: {remain}"))
+        }
+        return Ok(access)
+    }
+
+    fn parse_access<'a>(input: &'a str) -> IResult<&'a str, AccessControl> {
+        let (remain, access) = delimited(multispace0, alt((parse_literal, parse_and, parse_or, parse_always)), multispace0)(input)?;
+        return Ok((remain, access))
+    }
+
+    fn parse_and(input: &str) -> IResult<&str, AccessControl> {
+        let (remain, (_, _, _, mut inner, _)) = tuple((tag_no_case("and"), multispace0, tag("("), separated_list1(tag(","), parse_access), tag(")")))(input)?;
+        inner.sort();
+        return Ok((remain, AccessControl::And(inner)))
+    }
+
+    fn parse_or(input: &str) -> IResult<&str, AccessControl> {
+        let (remain, (_, _, _, mut inner, _)) = tuple((tag_no_case("or"), multispace0, tag("("), separated_list1(tag(","), parse_access), tag(")")))(input)?;
+        inner.sort();
+        return Ok((remain, AccessControl::Or(inner)))
+    }
+
+    fn parse_literal(input: &str) -> IResult<&str, AccessControl> {
+        let (remain, (_, value, _)) = tuple((tag("\""), many1(alt((is_not("\""), tag("\\\"")))), tag("\"")))(input)?;
+        let literal = value.join("");
+        return Ok((remain, AccessControl::Token(literal)));
+    }
+
+    fn parse_always(input: &str) -> IResult<&str, AccessControl> {
+        let (remain, _) = tag_no_case("always")(input)?;
+        return Ok((remain, AccessControl::Always))
+    }
+}
 
 // S//T//REL:A
 // TS//T//REL:A
@@ -394,7 +446,7 @@ mod test {
         assert_eq!(expr.simplify(), a_or_b);
 
         let expr = AccessControl::And(vec![
-            AccessControl::Or(vec![a.clone(), AccessControl::Or(vec![b.clone(), a.clone()])]), 
+            AccessControl::Or(vec![a.clone(), AccessControl::Or(vec![b.clone(), a.clone()])]),
             (b | a)
         ]);
         assert_eq!(expr.simplify(), a_or_b);
@@ -403,16 +455,18 @@ mod test {
         // assert_eq!(expr.simplify(), AccessControl::And(vec![a.clone(), b.clone(), AccessControl::Or(vec![c.clone(), d.clone()])]));
     }
 
+    use super::parse::access;
+
     #[test]
     fn parse() {
         let a = &AccessControl::Token("A".to_owned());
         let b = &AccessControl::Token("B".to_owned());
         let c = &AccessControl::Token("C".to_owned());
-        let x = &AccessControl::Token("Rel:X".to_owned());
-        let y = &AccessControl::Token("Rel:Y".to_owned());
+        let x = &AccessControl::Token("X".to_owned());
+        let y = &AccessControl::Token("Y".to_owned());
 
-        assert_eq!(AccessControl::parse("A//B//C/Rel:X", "/", ","), a & b & c & x);
-        assert_eq!(AccessControl::parse("A//C/Rel:X", "/", ","), a & c & x);
-        assert_eq!(AccessControl::parse("A//B/Rel:X,Rel:Y", "/", ","), a & b & (x | y));
+        assert_eq!(access(r#"and("A","B", "C" , "X"   )   "#).unwrap(), a & b & c & x);
+        assert_eq!(access(r#"and (  "A", "C" , "X"   )"#).unwrap(), a & c & x);
+        assert_eq!(access(r#"and (  "A", "C" , OR("X", "Y")   )"#).unwrap(), a & c & (x | y));
     }
 }
