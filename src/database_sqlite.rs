@@ -328,11 +328,12 @@ impl SQLiteInterface {
         // Update size in index table
         loop {
             debug!("update {index_group} {index_id} get old index entry");
+            let mut trans = conn.begin().await?;
             // Get
             let old: Option<(Vec<u8>, )> = sqlx::query_as(
                 "SELECT data FROM index_index WHERE label = ?")
                 .bind(index_id.as_str())
-                .fetch_optional(&mut conn).await?;
+                .fetch_optional(&mut trans).await?;
 
             // modify
             let entry = match &old {
@@ -362,7 +363,6 @@ impl SQLiteInterface {
             let entry = postcard::to_allocvec(&entry)?;
 
             // write
-            let mut trans = conn.begin().await?;
             debug!("update {index_group} {index_id} add old blob to garbage collection");
             self._schedule_blob_gc(&mut trans, old_blob_id, chrono::Utc::now()).await?;
             self._release_blob_gc(&mut trans, blob_id).await?;
@@ -383,6 +383,8 @@ impl SQLiteInterface {
             if res.rows_affected() > 0 {
                 trans.commit().await?;
                 return Ok(())
+            } else {
+                trans.rollback().await?;
             }
         }
     }
