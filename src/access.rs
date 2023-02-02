@@ -345,7 +345,7 @@ mod parse {
     }
 
     fn parse_literal(input: &str) -> IResult<&str, AccessControl> {
-        let (remain, (_, value, _)) = tuple((tag("\""), many1(alt((is_not("\""), tag("\\\"")))), tag("\"")))(input)?;
+        let (remain, (_, value, _)) = tuple((tag("\""), many1(alt((tag("\\\\"), tag("\\\""), is_not("\"")))), tag("\"")))(input)?;
         let literal = value.join("");
         return Ok((remain, AccessControl::Token(literal)));
     }
