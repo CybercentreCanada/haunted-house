@@ -1,8 +1,4 @@
 import asyncio
-import json
-import random
-import time
-from pprint import pprint
 
 import arrow
 import aiohttp
@@ -70,98 +66,6 @@ def pretty_classification(item):
     raise NotImplementedError()
 
 
-async def ingest_call(session, ce, item):
-    # await asyncio.sleep(3 + random.random() * 3)
-    # print(item['classification'])
-    # print(ce.get_access_control_parts(item['classification']))
-
-    expiry = None
-    if 'expiry_ts' in item and item['expiry_ts'] is not None:
-        expiry = arrow.get(item['expiry_ts']).int_timestamp
-
-    body = {
-        'hash': item['sha256'],
-        'access': prepare_classification(ce, item['classification']),
-        'expiry': expiry,
-        'block': True,
-    }
-
-    print("Submitting", item['sha256'])
-    async with session.post(config.HAUNTEDHOUSE_URL + "/ingest/sha256/", json=body) as resp:
-        resp.raise_for_status()
-        print("Finished", item['sha256'])
-        # if resp.status != 200:
-        #     raise ValueError()
-
-    return item['_seq_no']
-
-
-async def main():
-    # config = json.load(open('config.json'))
-
-    client = get_client(config.ASSEMBLYLINE_URL, apikey=(config.ASSEMBLYLINE_USER, config.ASSEMBLYLINE_API_KEY))
-
-    classification_definition = client._connection.get('api/v4/help/classification_definition')
-    ce = Classification(classification_definition['original_definition'])
-    assert ce.enforce
-    # print(ce.original_definition.keys())
-
-    # for item in ce.list_all_classification_combinations(long_format=True):
-    #     print(item)
-    #     # print('\t', ce.normalize_classification(item))
-    #     print(pretty_classification(prepare_classification(ce, item)))
-    #     print()
-
-    # return
-    conn = aiohttp.TCPConnector(limit=200)
-    timeout = aiohttp.ClientTimeout(total=60 * 60 * 4)
-    async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + config.HAUNTEDHOUSE_KEY}, timeout=timeout, connector=conn) as session:
-
-        completed_sequence_no = None
-        next_sequence_no = None
-        current_sequence_numbers = []
-        waiting_sequence_numbers = []
-        tasks = set()
-
-        while True:
-
-            if len(tasks) < 2000:
-                if next_sequence_no is None:
-                    batch = client.search.file("*", sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
-                else:
-                    batch = client.search.file(f"_seq_no: {{{next_sequence_no} TO *]",
-                                               sort="_seq_no asc", rows=config.BATCH_SIZE, fl=FL)
-
-                for item in batch['items']:
-                    # Get the current highest sequence number being processed
-                    if next_sequence_no is None:
-                        next_sequence_no = item['_seq_no']
-                    next_sequence_no = max(next_sequence_no, item['_seq_no'])
-
-                    # Track all active sequence numbers, and launch a task
-                    current_sequence_numbers.append(item['_seq_no'])
-                    tasks.add(asyncio.create_task(ingest_call(session, ce, item)))
-
-            if tasks:
-                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for finished in done:
-                    seq = await finished
-                    current_sequence_numbers.remove(seq)
-                    waiting_sequence_numbers.append(seq)
-
-                    if current_sequence_numbers:
-                        oldest_running = min(current_sequence_numbers)
-                    else:
-                        oldest_running = next_sequence_no
-                    finished = [seq for seq in waiting_sequence_numbers if seq < oldest_running]
-                    if finished:
-                        completed_sequence_no = max(finished)
-                        # print(completed_sequence_no, len(finished), len(tasks))
-            else:
-                print("Waiting for more")
-                await asyncio.sleep(60)
-
-
 async def socket_listener(ws: aiohttp.ClientWebSocketResponse, current, waiting, numbers):
 
     while True:
@@ -177,8 +81,10 @@ async def socket_listener(ws: aiohttp.ClientWebSocketResponse, current, waiting,
                 oldest_running = numbers['next']
             finished = [seq for seq in waiting if seq < oldest_running]
             if finished:
-                numbers['completed'] = max(finished)
-                print("cursor head", numbers['completed'])
+                new_completed = max(finished)
+                if new_completed != numbers['completed']:
+                    numbers['completed'] = new_completed
+                    print("cursor head", numbers['completed'])
         else:
             print(message['error'])
 
