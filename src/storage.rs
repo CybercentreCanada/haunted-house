@@ -655,10 +655,20 @@ impl AzureBlobStore {
     pub async fn delete(&self, label: &str) -> Result<()> {
         let client = self.client.blob_client(label);
         if let Err(err) = client.delete().await {
-            let ignore = match err.as_http_error() {
-                Some(err) => err.status() == 404,
+            let mut ignore = match err.as_http_error() {
+                Some(err) => {
+                    println!("{}", err);
+                    err.status() == 404
+                },
                 None => false,
             };
+            if &azure_core::error::ErrorKind::DataConversion == err.kind() {
+                if err.to_string() == "header not found x-ms-delete-type-permanent" {
+                    ignore = true;
+                }
+            }
+            // println!("{}", err);
+            // println!("{:?}", err);
             if !ignore {
                 return Err(err.into())
             }
@@ -701,10 +711,15 @@ mod test {
         let body = b"a body".repeat(10);
 
         store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
         store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
         store.put("delete-file-test", body.clone()).await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_some());
         store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
         store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
     }
 
 
