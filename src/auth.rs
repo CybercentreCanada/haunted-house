@@ -100,16 +100,16 @@ impl Authenticator {
         }
     }
 
-    pub fn is_role_assigned(&self, token: &str, role: Role) -> bool {
-        match self {
-            Authenticator::Static(data) => match data.get(token) {
-                Some(roles) => roles.contains(&role),
-                None => false,
-            },
-            #[cfg(feature = "python")]
-            Authenticator::Python(obj) => obj.is_role_assigned(token, role),
-        }
-    }
+    // pub fn is_role_assigned(&self, token: &str, role: Role) -> bool {
+    //     match self {
+    //         Authenticator::Static(data) => match data.get(token) {
+    //             Some(roles) => roles.contains(&role),
+    //             None => false,
+    //         },
+    //         #[cfg(feature = "python")]
+    //         Authenticator::Python(obj) => obj.is_role_assigned(token, role),
+    //     }
+    // }
 }
 
 #[cfg(feature = "python")]
