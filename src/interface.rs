@@ -1,7 +1,6 @@
 
 
 use std::collections::{HashSet, HashMap};
-use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use anyhow::Result;
@@ -48,8 +47,6 @@ struct TokenMiddlewareImpl<E> {
     ep: E,
     core: Arc<HouseCore>,
 }
-
-type RoleList = HashSet<Role>;
 
 #[poem::async_trait]
 impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
@@ -360,7 +357,7 @@ async fn insert_sha(Data(interface): Data<&IngestInterface>, Json(request): Json
     } else {
         let interface = interface.clone();
         tokio::spawn(async move {
-            interface.ingest(request).await;
+            _ = interface.ingest(request).await;
         });
         return Ok(())
     }
