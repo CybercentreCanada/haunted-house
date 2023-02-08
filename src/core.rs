@@ -525,8 +525,8 @@ async fn _single_search_watcher(core: Arc<HouseCore>, code: String, mut messages
                 };
 
                 match results.value {
-                    WorkResultValue::Filter(index, blob, file_ids) => {
-                        core.database.finish_filter_work(results.id, &code, &mut cache, index, blob, file_ids).await?;
+                    WorkResultValue::Filter(index, _blob, file_ids) => {
+                        core.database.finish_filter_work(results.id, &code, &mut cache, index, file_ids).await?;
                     }
                     WorkResultValue::Yara(files) => {
                         core.database.finish_yara_work(results.id, &results.search, files).await?;

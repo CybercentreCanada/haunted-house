@@ -75,22 +75,7 @@ async fn main() -> Result<()> {
             // Initialize authenticator
             let auth = Authenticator::from_config(config.authentication)?;
 
-            // Get cache
-            // let cache = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
-
-            // let db_config = match self.database_config.take() {
-            //     Some(config) => config,
-            //     None => DatabaseConfig::SQLiteTemp()
-            // };
-
-            let bind_address = match config.bind_address {
-                None => "localhost:8080".to_owned(),
-                Some(address) => address,
-            };
-            // let config = self.config.clone();
-
-            // Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
-
+            // Setup the storage
             let index_storage = crate::storage::connect(config.blobs).await?;
             let file_storage = crate::storage::connect(config.files).await?;
 
@@ -118,6 +103,10 @@ async fn main() -> Result<()> {
 
             // Start http interface
             info!("Starting server interface.");
+            let bind_address = match config.bind_address {
+                None => "localhost:8080".to_owned(),
+                Some(address) => address,
+            };
             let api_job = tokio::task::spawn(crate::interface::serve(bind_address, core.clone()));
 
             // Wait for server to stop

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write, SeekFrom, Seek};
+use std::io::{Write, SeekFrom, Seek};
 use std::os::unix::prelude::FileExt;
-use std::path::{PathBuf, Path};
+use std::path::{PathBuf};
 
 use anyhow::Result;
 use bitvec::vec::BitVec;

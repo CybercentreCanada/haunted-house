@@ -722,7 +722,7 @@ impl SQLiteInterface {
         Ok(self.work_notification.notified().await)
     }
 
-    pub async fn finish_filter_work(&self, id: i64, code: &String, search_cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
+    pub async fn finish_filter_work(&self, id: i64, code: &String, search_cache: &mut SearchCache, index: IndexID, file_ids: Vec<u64>) -> Result<()> {
         let mut conn = self.db.acquire().await?;
         let table_name = filter_table_name(&index);
 

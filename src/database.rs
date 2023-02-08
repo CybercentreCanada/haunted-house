@@ -33,9 +33,9 @@ impl IndexGroup {
         IndexGroup(format!("99999999"))
     }
 
-    pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
-        self.0.as_bytes()
-    }
+    // pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
+    //     self.0.as_bytes()
+    // }
 
     pub fn as_str<'a>(&'a self) -> &'a str {
         &self.0
@@ -60,9 +60,9 @@ impl IndexID {
         Self(data.to_owned())
     }
 
-    pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
-        self.0.as_bytes()
-    }
+    // pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
+    //     self.0.as_bytes()
+    // }
 
     pub fn as_str<'a>(&'a self) -> &'a str {
         &self.0
@@ -89,9 +89,9 @@ impl BlobID {
         Self(format!("{:x}", uuid::Uuid::new_v4().as_u128()))
     }
 
-    pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
-        self.0.as_bytes()
-    }
+    // pub fn as_bytes<'a>(&'a self) -> &'a [u8] {
+    //     self.0.as_bytes()
+    // }
 
     pub fn as_str<'a>(&'a self) -> &'a str {
         &self.0
@@ -214,9 +214,9 @@ impl Database {
         }
     }
 
-    pub async fn finish_filter_work(&self, id: i64, search: &String, cache: &mut SearchCache, index: IndexID, blob: BlobID, file_ids: Vec<u64>) -> Result<()> {
+    pub async fn finish_filter_work(&self, id: i64, search: &String, cache: &mut SearchCache, index: IndexID, file_ids: Vec<u64>) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.finish_filter_work(id, search, cache, index, blob, file_ids).await
+            Database::SQLite(local) => local.finish_filter_work(id, search, cache, index, file_ids).await
         }
     }
 
