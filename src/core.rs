@@ -178,6 +178,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     let mut last_batch_size = 0;
 
     loop {
+        debug!("Ingest loop");
 
         // Check if its time to launch an index building job
         if let Some(job) = &mut current_batch {
@@ -211,6 +212,8 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         current_batch = Some(tokio::spawn(run_batch_ingest(core.clone(), key.clone(), batch)));
                         if !remains.is_empty() {
                             pending_batch.insert(key, remains);
+                        } else {
+                            pending_timers.remove(&key);
                         }
                     }
                     break;
@@ -221,8 +224,12 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
         // get how long in the future the next pending batch is mature
         let batch_ready_time = pending_timers
             .iter()
-            .map(|(_, time)| time)
-            .fold(tokio::time::Instant::now() + tokio::time::Duration::from_secs(60), |a, b| a.min(*b));
+            .map(|(_, time)| *time + tokio::time::Duration::from_secs(core.config.batch_limit_seconds))
+            .fold(tokio::time::Instant::now() + tokio::time::Duration::from_secs(60), |a, b| a.min(b));
+
+        if current_batch.is_none() {
+            debug!("Batch ready time: {}", (batch_ready_time - tokio::time::Instant::now()).as_secs_f32());
+        }
 
         // Wait for more ingest messages
         tokio::select!{
@@ -297,7 +304,10 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
             }
 
             // If the current batch finishes, or another batch should be checked
-            _ = wait_for_batch_or_ready(&mut current_batch, batch_ready_time) => { continue; }
+            _ = wait_for_batch_or_ready(&mut current_batch, batch_ready_time) => {
+                debug!("Batch finish or ready");
+                continue;
+            }
         }
     }
     return Ok(())
