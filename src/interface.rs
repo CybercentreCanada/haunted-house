@@ -3,22 +3,25 @@
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use anyhow::Result;
+use anyhow::{Result, Context};
 
 use chrono::serde::ts_seconds_option;
 use futures::{StreamExt, SinkExt};
 use log::{error, debug, info};
+use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
-use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse};
+use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse, listener};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
+use sha2::digest::typenum::private::IsLessPrivate;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::auth::Role;
+use crate::config::TLSConfig;
 use crate::core::{HouseCore, IngestStatus};
 use crate::database::{BlobID, IndexID, IndexGroup};
 use crate::query::Query;
@@ -483,13 +486,13 @@ async fn get_detailed_status(interface: Data<&StatusInterface>) -> Result<Json<S
     Ok(Json(interface.get_status().await?))
 }
 
-pub async fn serve(bind_address: String, core: Arc<HouseCore>) {
-    if let Err(err) = _serve(bind_address, core).await {
-        error!("Error with http interface: {err}");
+pub async fn serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<HouseCore>) {
+    if let Err(err) = _serve(bind_address, tls, core).await {
+        error!("Error with http interface: {err} {}", err.root_cause());
     }
 }
 
-pub async fn _serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), std::io::Error> {
+pub async fn _serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<HouseCore>) -> Result<(), anyhow::Error> {
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
@@ -501,11 +504,63 @@ pub async fn _serve(bind_address: String, core: Arc<HouseCore>) -> Result<(), st
         .at("/status/online", get(get_status))
         .at("/status/detailed", get(get_detailed_status))
 
-
-        .with(TokenMiddleware::new(core))
+        .with(TokenMiddleware::new(core.clone()))
         .with(LoggerMiddleware);
 
-    Server::new(TcpListener::bind(bind_address))
+    let listener = TcpListener::bind(bind_address);
+    let tls_config = match tls {
+        Some(tls) => {
+            OpensslTlsConfig::new()
+                .cert_from_data(tls.certificate_pem)
+                .key_from_data(tls.key_pem)
+        },
+        None => {
+            use openssl::{rsa::Rsa, x509::X509, pkey::PKey, asn1::{Asn1Integer, Asn1Time}, bn::BigNum};
+
+            // Generate our keypair
+            let key = Rsa::generate(1 << 11)?;
+            let pkey = PKey::from_rsa(key)?;
+
+            // Use that keypair to sign a certificate
+            let mut builder = X509::builder()?;
+
+            // Set serial number to 1
+            let one = BigNum::from_u32(1)?;
+            let serial_number = Asn1Integer::from_bn(&one)?;
+            builder.set_serial_number(&serial_number)?;
+
+            // set subject/issuer name
+            let mut name = openssl::x509::X509NameBuilder::new()?;
+            name.append_entry_by_text("C", "CA")?;
+            name.append_entry_by_text("ST", "ON")?;
+            name.append_entry_by_text("O", "Inside the house")?;
+            name.append_entry_by_text("CN", "localhost")?;
+            let name = name.build();
+            builder.set_issuer_name(&name)?;
+            builder.set_subject_name(&name)?;
+
+            // Set not before/after
+            let not_before = Asn1Time::from_unix((chrono::Utc::now() - chrono::Duration::days(1)).timestamp())?;
+            builder.set_not_before(&not_before)?;
+            let not_after = Asn1Time::from_unix((chrono::Utc::now() + chrono::Duration::days(366)).timestamp())?;
+            builder.set_not_after(&not_after)?;
+
+            // set public key
+            builder.set_pubkey(&pkey)?;
+
+            // sign and build
+            builder.sign(&pkey, openssl::hash::MessageDigest::sha256()).context("Could not sign certificate.")?;
+            let cert = builder.build();
+
+            OpensslTlsConfig::new()
+                .cert_from_data(cert.to_pem().context("Could not extract self signed certificate")?)
+                .key_from_data(pkey.rsa()?.private_key_to_pem()?)
+        }
+    };
+    let listener = listener.openssl_tls(tls_config);
+
+    Server::new(listener)
         .run(app)
-        .await
+        .await.context("Error in server runtime.")?;
+    Ok(())
 }

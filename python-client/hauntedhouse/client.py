@@ -33,7 +33,7 @@ class SearchStatus(pydantic.BaseModel):
 
 
 class Client:
-    def __init__(self, address: str, api_key: str, classification: dict):
+    def __init__(self, address: str, api_key: str, classification: dict, verify: bool = True):
         self.address = address
         self.access_engine = Classification(classification)
 
@@ -42,7 +42,7 @@ class Client:
         self.ingest_task: None | asyncio.Task = None
         self.ingest_futures: dict[str, asyncio.Future] = {}
 
-        conn = aiohttp.TCPConnector(limit=10)
+        conn = aiohttp.TCPConnector(limit=10, verify_ssl=verify)
         # timeout = aiohttp.ClientTimeout(total=60 * 60 * 4)
         self.session = aiohttp.ClientSession(
             base_url=self.address,

@@ -1,4 +1,5 @@
 /target
+.env
 .venv
 .direnv
 .mypy_cache

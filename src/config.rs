@@ -36,6 +36,11 @@ pub enum CacheConfig {
     },
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TLSConfig {
+    pub key_pem: String,
+    pub certificate_pem: String
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -45,5 +50,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub files: crate::storage::BlobStorageConfig,
     pub blobs: crate::storage::BlobStorageConfig,
+
     pub bind_address: Option<String>,
+    pub tls: Option<TLSConfig>,
 }

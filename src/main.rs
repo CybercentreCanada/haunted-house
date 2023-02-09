@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
                 None => "localhost:8080".to_owned(),
                 Some(address) => address,
             };
-            let api_job = tokio::task::spawn(crate::interface::serve(bind_address, core.clone()));
+            let api_job = tokio::task::spawn(crate::interface::serve(bind_address, config.tls, core.clone()));
 
             // Wait for server to stop
             api_job.await.context("Error in HTTP interface.")?;

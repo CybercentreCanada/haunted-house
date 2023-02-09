@@ -14,6 +14,7 @@
 #         return '"' + item['Token'].replace('"', '\\"') + '"'
 #     raise NotImplementedError()
 
+import argparse
 import json
 import asyncio
 import time
@@ -37,7 +38,7 @@ HAUNTED_HOUSE_API_KEY = os.environ['HAUNTEDHOUSE_API_KEY']
 BATCH_SIZE = int(os.getenv('AL_BATCH_SIZE', '1000'))
 
 
-async def socket_main() -> None:
+async def socket_main(verify) -> None:
     al_client = get_client(ASSEMBLYLINE_URL, apikey=(ASSEMBLYLINE_USER, ASSEMBLYLINE_API_KEY))
 
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
@@ -51,7 +52,7 @@ async def socket_main() -> None:
     waiting_sequence_numbers: list[tuple[int, int]] = []
     futures: set[asyncio.Future[str]] = set()
 
-    async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY, classification_definition['original_definition']) as house_client:
+    async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY, classification_definition['original_definition'], verify=verify) as house_client:
         assert house_client.access_engine.enforce
 
         while True:
@@ -123,5 +124,13 @@ async def socket_main() -> None:
                 print("Finished, waiting for new files")
                 await asyncio.sleep(60)
 
+
 if __name__ == '__main__':
-    asyncio.run(socket_main())
+    parser = argparse.ArgumentParser(
+        prog='ingest',
+        description='Ingest files from assemblyline into hauntedhouse',
+    )
+    parser.add_argument("--trust-all", help="ignore server verification", action='store_true')
+    args = parser.parse_args()
+
+    asyncio.run(socket_main(verify=not args.trust_all))
