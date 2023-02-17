@@ -24,7 +24,10 @@ uuid = { version = "*", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde", "std"] }
 time = { version = "0.3" }
 parse_duration = "2"
+
 tempfile = "3"
+rand = "0.8"
+
 log = "*"
 env_logger = "0.9"
 bitvec = "*"
@@ -59,7 +62,6 @@ azure_storage_blobs = "0.9"
 
 
 [dev-dependencies]
-rand = "*"
 assertor = "*"
 
 [features]
