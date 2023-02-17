@@ -107,6 +107,12 @@ impl std::fmt::Display for BlobID {
 impl From<String> for BlobID { fn from(value: String) -> Self { Self(value) } }
 impl From<&str> for BlobID { fn from(value: &str) -> Self { Self(value.to_owned()) } }
 
+// #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
+// struct YaraTaskId(i64);
+
+// #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
+// struct FilterTaskId(i64);
+
 pub enum Database {
     // Rocks(RocksInterface),
     SQLite(SQLiteInterface),
@@ -208,8 +214,10 @@ impl Database {
         }
     }
 
-    pub async fn release_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<()> {
-        todo!()
+    pub async fn release_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        match self {
+            Database::SQLite(local) => local.release_tasks_assigned_before(time).await
+        }
     }
 
     pub async fn release_filter_task(&self, id: i64) -> Result<bool> {
@@ -225,11 +233,15 @@ impl Database {
     }
 
     pub async fn get_filter_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
-        todo!()
+        match self {
+            Database::SQLite(local) => local.get_filter_assignments_before(time).await
+        }
     }
 
     pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
-        todo!()
+        match self {
+            Database::SQLite(local) => local.get_yara_assignments_before(time).await
+        }
     }
 
     pub async fn get_work_notification(&self) -> Result<()> {

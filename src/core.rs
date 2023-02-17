@@ -8,6 +8,7 @@ use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkRe
 use crate::storage::BlobStorage;
 use crate::access::AccessControl;
 use crate::filter::TrigramFilter;
+use crate::worker_watcher::worker_watcher;
 use bitvec::vec::BitVec;
 use futures::future::select_all;
 use log::{error, debug, info};
@@ -121,6 +122,7 @@ impl HouseCore {
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
         tokio::spawn(search_watcher(core.clone(), receive_search));
+        tokio::spawn(worker_watcher(core.clone()));
         tokio::spawn(garbage_collector(core.clone()));
 
         return Ok(core)

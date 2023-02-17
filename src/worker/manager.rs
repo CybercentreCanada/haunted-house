@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
@@ -6,6 +7,7 @@ use anyhow::{Context, Result};
 
 use itertools::Itertools;
 use log::{info, error, debug};
+use rand::{thread_rng, Rng};
 use reqwest::StatusCode;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -146,6 +148,15 @@ enum TaskId {
     Filter(i64)
 }
 
+impl Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskId::Yara(id) => f.write_fmt(format_args!("yara({id})")),
+            TaskId::Filter(id) => f.write_fmt(format_args!("filter({id})")),
+        }
+    }
+}
+
 impl WorkerData {
 
     pub fn new(connection: mpsc::UnboundedSender<WorkerMessage>, file_cache: BlobCache, index_cache: BlobCache, server_address: String, tls: WorkerTLSConfig, token: String, port: u16) -> Result<Self> {
@@ -211,30 +222,47 @@ impl WorkerData {
         return Ok(work)
     }
 
-    async fn report_error(&self, id: TaskId, error: String) -> Result<()> {
+    async fn _post<B: serde::Serialize>(&self, url: String, body: B) {
+        loop {
+            let res = self.client.post(&url)
+                .json(&body)
+                .send().await;
+
+            match res {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return
+                    }
+                    if status.is_client_error() {
+                        error!("HTTP Error reaching server (will not retry): {status}");
+                        return
+                    }
+                    error!("HTTP Error reaching server (will retry): {status}");
+                },
+                Err(err) => {
+                    error!("Error reaching server (will retry): {err}");
+                },
+            };
+
+            let delay: f64 = thread_rng().gen();
+            tokio::time::sleep(tokio::time::Duration::from_secs_f64(1.0 + 5.0 * delay)).await;
+        }
+    }
+
+    async fn report_error(&self, id: TaskId, error: String) {
         error!("{error}");
         let error = match id {
             TaskId::Filter(id) => WorkError::Filter(id, error),
             TaskId::Yara(id) => WorkError::Yara(id, error),
         };
-        let resp = self.client.post(format!("{}/work/error/", self.server_address))
-            .json(&error)
-            .send().await?;
 
-        if let Err(err) = resp.error_for_status() {
-            error!("Error reporting error: {err}");
-        }
-
-        return Ok(())
+        self._post(format!("{}/work/error/", self.server_address), error).await;
     }
 
-    async fn report_result(&self, result: WorkResult) -> Result<()> {
-        let resp = self.client.post(format!("{}/work/finished/", self.server_address))
-            .json(&result)
-            .send().await?;
-        resp.error_for_status().context("Error reporting result")?;
+    async fn report_result(&self, result: WorkResult) {
+        self._post(format!("{}/work/finished/", self.server_address), result).await;
         _ = self.connection.send(WorkerMessage::WorkDone);
-        Ok(())
     }
 }
 
@@ -292,10 +320,10 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
                     match job.await {
                         Ok(Ok(_)) => {},
                         Ok(Err(err)) => {
-                            data.report_error(id, format!("worker error: {err}")).await?;
+                            data.report_error(id, format!("worker error in {id}: {err}")).await;
                         },
                         Err(err) => {
-                            data.report_error(id, format!("task error: {err}")).await?;
+                            data.report_error(id, format!("task error in {id}: {err}")).await;
                         },
                     };
                 }
@@ -381,7 +409,7 @@ async fn do_filter_task(data: Arc<WorkerData>, filter_task: FilterTask) -> Resul
         value: WorkResultValue::Filter(filter_task.filter_id, filter_task.filter_blob, file_ids),
     };
 
-    data.report_result(result).await.context("Failed to report results")?;
+    data.report_result(result).await;
     return Ok(())
 }
 
@@ -435,5 +463,6 @@ async fn do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()> 
         id: yara_task.id,
         search: yara_task.search,
         value: WorkResultValue::Yara(filtered),
-    }).await
+    }).await;
+    return Ok(())
 }

@@ -574,9 +574,38 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
-    // pub async fn release_filter_task(&self, id: i64) -> Result<bool>{
-    //     self._release_filter_task(&self.db, id).await
-    // }
+    pub async fn get_filter_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
+        let mut conn = self.db.acquire().await?;
+        let req: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT assigned_worker, id FROM filter_tasks WHERE assigned_time < ?")
+            .bind(time.to_rfc3339())
+            .fetch_all(&mut conn).await?;
+        return Ok(req)
+    }
+
+    pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
+        let mut conn = self.db.acquire().await?;
+        let req: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT assigned_worker, id FROM yara_tasks WHERE assigned_time < ?")
+            .bind(time.to_rfc3339())
+            .fetch_all(&mut conn).await?;
+        return Ok(req)
+    }
+
+    pub async fn release_tasks_assigned_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        let mut conn = self.db.acquire().await?;
+        let filter_req = sqlx::query(
+            "UPDATE filter_tasks SET assigned_worker = NULL, assigned_time = NULL
+            WHERE assigned_time < ?")
+            .bind(time.to_rfc3339())
+            .execute(&mut conn).await?;
+        let yara_req = sqlx::query(
+            "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
+            WHERE assigned_time < ?")
+            .bind(time.to_rfc3339())
+            .execute(&mut conn).await?;
+        return Ok(filter_req.rows_affected() + yara_req.rows_affected())
+    }
 
     pub async fn release_filter_task(&self, id: i64) -> Result<bool> {
         let mut conn = self.db.acquire().await?;

@@ -9,7 +9,6 @@
 ## Important
 - only accept results from the right worker
 - azure retry for connection errors
-- result/error submit retrying
 
 ## Nice to have/performance
 - add config flag to tune filter memory use
