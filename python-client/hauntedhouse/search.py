@@ -24,7 +24,7 @@ async def main(yara_file, access, verify):
     # Get the
     al_client = get_client(ASSEMBLYLINE_URL, apikey=(ASSEMBLYLINE_USER, ASSEMBLYLINE_API_KEY))
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
-    return
+    classification_definition = classification_definition['original_definition']
 
     async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY, classification=classification_definition, verify=verify) as client:
 
@@ -39,6 +39,8 @@ async def main(yara_file, access, verify):
 
         if search_status.hits:
             print(search_status.hits)
+        else:
+            print("No hits")
 
 
 if __name__ == '__main__':
@@ -48,7 +50,7 @@ if __name__ == '__main__':
     )
     parser.add_argument("yara_file")
     parser.add_argument("--trust-all", help="ignore server verification", action='store_true')
-    parser.add_argument("--access", nargs="+")
+    parser.add_argument("--access")
     args = parser.parse_args()
 
     asyncio.run(main(args.yara_file, args.access, verify=not args.trust_all))

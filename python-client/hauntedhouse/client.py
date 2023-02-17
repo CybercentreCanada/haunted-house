@@ -91,6 +91,8 @@ class Client:
         return SearchStatus(**await result.json())
 
     def prepare_access(self, access: str) -> list[str]:
+        if not access:
+            return []
         parts = self.access_engine.get_access_control_parts(access)
         terms = []
         terms.extend([
