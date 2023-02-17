@@ -1,0 +1,55 @@
+import asyncio
+import os
+import argparse
+
+from assemblyline_client import get_client
+
+from .client import Client
+
+
+HAUNTED_HOUSE_URL = os.environ['HAUNTEDHOUSE_URL']
+HAUNTED_HOUSE_API_KEY = os.environ['HAUNTEDHOUSE_API_KEY']
+
+ASSEMBLYLINE_URL = os.environ['ASSEMBLYLINE_URL']
+ASSEMBLYLINE_USER = os.environ['ASSEMBLYLINE_USER']
+ASSEMBLYLINE_API_KEY = os.environ['ASSEMBLYLINE_API_KEY']
+
+
+async def main(yara_file, access, verify):
+
+    # Read the signature we are going to search with
+    with open(yara_file) as handle:
+        body = handle.read()
+
+    # Get the
+    al_client = get_client(ASSEMBLYLINE_URL, apikey=(ASSEMBLYLINE_USER, ASSEMBLYLINE_API_KEY))
+    classification_definition = al_client._connection.get('api/v4/help/classification_definition')
+    return
+
+    async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY, classification=classification_definition, verify=verify) as client:
+
+        search_status = await client.start_search(body, access, archive_only=False)
+
+        while not search_status.finished:
+            await asyncio.sleep(10)
+            search_status = await client.search_status(search_status.code)
+
+        if search_status.errors:
+            print(search_status.errors)
+
+        if search_status.hits:
+            print(search_status.hits)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        prog='search',
+        description='run a search against a hauntedhouse server',
+    )
+    parser.add_argument("yara_file")
+    parser.add_argument("--trust-all", help="ignore server verification", action='store_true')
+    parser.add_argument("--access", nargs="+")
+    args = parser.parse_args()
+
+    asyncio.run(main(args.yara_file, args.access, verify=not args.trust_all))
+

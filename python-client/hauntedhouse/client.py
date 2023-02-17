@@ -70,7 +70,7 @@ class Client:
             start_date = '9000-01-01T00:00:00.000'
 
         # Send the search request
-        result = await self.session.post('/search', json={
+        result = await self.session.post('/search/', json={
             'access': access_fields,
             'query': query_from_yara(yara_rule),
             'yara_signature': yara_rule,
@@ -200,15 +200,37 @@ class Client:
                 future.set_exception(IngestError(message.get('error', '')))
 
 
+# class Expression:
+#     def __init__(self, query: str) -> None:
+#         self.query = query
+
+#     @classmethod
+#     def literal(cls, some_string: bytes) -> Expression:
+#         return cls(f"{{{some_string.hex()}}}")
+
+#     @classmethod
+#     def and_(cls, *args: Expression) -> Expression:
+#         return cls(f"({' & '.join(x.query for x in args)})")
+
+#     @classmethod
+#     def or_(cls, *args: Expression) -> Expression:
+#         return cls(f"({' | '.join(x.query for x in args)})")
+
+#     @classmethod
+#     def min_of(cls, howmany: int, *of: Expression) -> Expression:
+#         return cls(f"(min {howmany} of ({', '.join(x.query for x in of)}))")
+
+
+# yaraparse.UrsaExpression = Expression
+
+
 def query_from_yara(yara_rule: str) -> dict:
     rules = yaraparse.parse_yara(yara_rule)
 
     if len(rules) == 0:
         raise ValueError("A yara rule couldn't be found")
     elif len(rules) == 1:
-        rule = rules[0].parse().data
+        return rules[0].parse().query
     else:
         raise ValueError("Only a single yara rule expected")
-
-    raise NotImplementedError(rule)
 

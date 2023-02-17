@@ -3,13 +3,11 @@
 # todo
 
 ## Integration
-- file scraping from assemblyline
-- query/classification building client
 - documentation
-- assemblyline blob storage
+- configuration env variable substitution
 
 ## Important
-- worker loss detection/task timeout
+- only accept results from the right worker
 - azure retry for connection errors
 - result/error submit retrying
 
@@ -20,5 +18,4 @@
 - keep a cache of which indices are assigned to what worker
 - task retry
 - use more single value structs for better build time error detection
-- pyi files
 - worker that runs without downloading the entire filter file

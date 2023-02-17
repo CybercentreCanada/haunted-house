@@ -4,17 +4,18 @@ description = "Client for hauntedhouse yara search engine."
 readme = "readme.md"
 requires-python = ">=3.10"
 license = {text = "MIT Licence"}
+version = "0.0.1"
 dependencies = [
     "aiohttp",
     "assemblyline",
+    "assemblyline_client",
     "pydantic",
     "mquery_query_lib",
     "arrow",
 ]
-dynamic = ["version"]
 
 [build-system]
-requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
