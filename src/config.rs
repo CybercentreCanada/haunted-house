@@ -43,6 +43,12 @@ pub struct TLSConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub enum WorkerTLSConfig {
+    AllowAll,
+    Certificate(String)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub authentication: Authentication,
     pub database: Database,
@@ -53,4 +59,22 @@ pub struct Config {
 
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    pub api_token: String,
+    // pub authentication: Authentication,
+    // pub database: Database,
+    // pub core: crate::core::CoreConfig,
+    pub file_cache: CacheConfig,
+    pub blob_cache: CacheConfig,
+    pub files: crate::storage::BlobStorageConfig,
+    pub blobs: crate::storage::BlobStorageConfig,
+
+    pub bind_address: Option<String>,
+    pub tls: Option<TLSConfig>,
+
+    pub server_address: String,
+    pub server_tls: WorkerTLSConfig
 }

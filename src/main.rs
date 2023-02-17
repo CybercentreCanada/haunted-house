@@ -15,13 +15,20 @@ mod interface;
 mod ursadb;
 mod varint;
 mod blob_cache;
+mod worker;
+mod worker_watcher;
 
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use auth::Authenticator;
 use clap::Parser;
-use log::info;
+use itertools::Itertools;
+use log::{info, error};
+use tokio::sync::mpsc;
+use worker::{worker_manager, WorkerData};
 
 use crate::blob_cache::BlobCache;
 use crate::core::HouseCore;
@@ -40,6 +47,10 @@ enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>
     },
+    Worker {
+        #[arg(short, long)]
+        config: Option<PathBuf>
+    },
     LintConfig {
         #[arg(short, long)]
         config: Option<PathBuf>
@@ -48,6 +59,12 @@ enum Commands {
 
 
 fn load_config(path: Option<PathBuf>) -> Result<crate::config::Config> {
+    let config = path.unwrap_or(PathBuf::from("./config.json"));
+    let config_body = std::fs::read_to_string(config)?;
+    Ok(serde_json::from_str(&config_body)?)
+}
+
+fn load_worker_config(path: Option<PathBuf>) -> Result<crate::config::WorkerConfig> {
     let config = path.unwrap_or(PathBuf::from("./config.json"));
     let config_body = std::fs::read_to_string(config)?;
     Ok(serde_json::from_str(&config_body)?)
@@ -102,15 +119,95 @@ async fn main() -> Result<()> {
                 .context("Error launching core.")?;
 
             // Start http interface
-            info!("Starting server interface.");
             let bind_address = match config.bind_address {
                 None => "localhost:8080".to_owned(),
                 Some(address) => address,
             };
+            info!("Starting server interface on {bind_address}");
             let api_job = tokio::task::spawn(crate::interface::serve(bind_address, config.tls, core.clone()));
 
             // Wait for server to stop
             api_job.await.context("Error in HTTP interface.")?;
+        },
+        Commands::Worker { config } => {
+            // Load the config file
+            let config = load_worker_config(config)?;
+
+            // Setup the storage
+            let index_storage = crate::storage::connect(config.blobs).await?;
+            let file_storage = crate::storage::connect(config.files).await?;
+
+            // Initialize authenticator
+            let token = config.api_token;
+
+            // Get cache
+            let (file_cache, _file_temp) = match config.file_cache {
+                config::CacheConfig::TempDir { size } => {
+                    let temp_dir = tempfile::tempdir()?;
+                    (BlobCache::new(file_storage.clone(), size, temp_dir.path().to_owned()), Some(temp_dir))
+                }
+                config::CacheConfig::Directory { path, size } => {
+                    (BlobCache::new(file_storage.clone(), size, PathBuf::from(path)), None)
+                }
+            };
+            let (index_cache, _index_temp) = match config.blob_cache {
+                config::CacheConfig::TempDir { size } => {
+                    let temp_dir = tempfile::tempdir()?;
+                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned()), Some(temp_dir))
+                }
+                config::CacheConfig::Directory { path, size } => {
+                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path)), None)
+                }
+            };
+
+            // Figure out where the worker status interface will be hosted
+            let bind_address = config.bind_address.unwrap_or("localhost:8080".to_owned());
+            let mut addresses = tokio::net::lookup_host(&bind_address).await?.collect_vec();
+            let bind_address = match addresses.pop() {
+                Some(x) => x,
+                None => {
+                    return Err(anyhow::anyhow!("Couldn't resolve bind address: {}", bind_address));
+                }
+            };
+            info!("Status interface binding on: {bind_address}");
+
+            //
+            let address = config.server_address;
+            let verify = config.server_tls;
+            let (sender, recv) = mpsc::unbounded_channel();
+            let data = Arc::new(WorkerData::new(sender.clone(), file_cache, index_cache, address, verify, token, bind_address.port())?);
+
+            // Watch for exit signal
+            tokio::spawn({
+                let data = data.clone();
+                async move {
+                    match tokio::signal::ctrl_c().await {
+                        Ok(()) => {
+                            data.stop();
+                        },
+                        Err(err) => {
+                            error!("Error waiting for exit signal: {err}");
+                        },
+                    }
+                }
+            });
+
+            // Run the worker
+            let exit_notice = Arc::new(tokio::sync::Notify::new());
+            let api = tokio::spawn(worker::interface::serve(bind_address, config.tls, sender, exit_notice.clone()));
+            let manager = tokio::spawn(worker_manager(data.clone(), recv));
+
+            // Run the worker
+            let result = tokio::select! {
+                res = api => res,
+                res = manager => res,
+            };
+
+            match result {
+                Ok(Err(err)) => error!("Server crashed: {err} {}", err.root_cause()),
+                Err(err) => error!("Server crashed: {err}"),
+                _ => {}
+            };
         }
     }
 

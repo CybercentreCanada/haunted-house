@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Write, SeekFrom, Seek};
 use std::os::unix::prelude::FileExt;
-use std::path::{PathBuf};
 
 use anyhow::Result;
 use bitvec::vec::BitVec;
@@ -183,7 +182,9 @@ impl TrigramFilter {
         })
     }
 
-    pub async fn build(file: std::fs::File, input: Vec<PathBuf>) -> Result<Self> {
+    #[cfg(test)]
+    pub async fn build(file: std::fs::File, input: Vec<std::path::PathBuf>) -> Result<Self> {
+
         let mut data: Vec<BitVec> = vec![];
 
         for source_file in input.into_iter() {
@@ -241,7 +242,7 @@ impl TrigramFilter {
 
     pub fn run_query(&self, query: &Query) -> Result<HashSet<u64>> {
         match query {
-            Query::Not(query) => todo!(),
+            // Query::Not(query) => todo!(),
             Query::Or(parts) => {
                 let (mut accumulated, remain) = match parts.split_first() {
                     Some((first, remain)) => {
@@ -287,23 +288,23 @@ impl TrigramFilter {
         self.trigram_query(&mut trigrams)
     }
 
-    fn multi_buffer_query(&self, targets: &Vec<Vec<u8>>) -> Result<HashSet<u64>> {
-        // Get the trigrams we are interested in
-        let mut trigrams: Vec<u32> = Default::default();
-        for segment in targets {
-            if segment.len() < 3 {
-                continue;
-            }
-            let mut trigram: u32 = (segment[0] as u32) << 8 | (segment[1] as u32);
-            for index in 2..segment.len() {
-                trigram = (trigram & 0x00FFFF) << 8 | (segment[index] as u32);
-                trigrams.push(trigram);
-            }
-        }
-        trigrams.sort();
-        trigrams.dedup();
-        self.trigram_query(&mut trigrams)
-    }
+    // fn multi_buffer_query(&self, targets: &Vec<Vec<u8>>) -> Result<HashSet<u64>> {
+    //     // Get the trigrams we are interested in
+    //     let mut trigrams: Vec<u32> = Default::default();
+    //     for segment in targets {
+    //         if segment.len() < 3 {
+    //             continue;
+    //         }
+    //         let mut trigram: u32 = (segment[0] as u32) << 8 | (segment[1] as u32);
+    //         for index in 2..segment.len() {
+    //             trigram = (trigram & 0x00FFFF) << 8 | (segment[index] as u32);
+    //             trigrams.push(trigram);
+    //         }
+    //     }
+    //     trigrams.sort();
+    //     trigrams.dedup();
+    //     self.trigram_query(&mut trigrams)
+    // }
 
     fn trigram_query(&self, trigrams: &mut Vec<u32>) -> Result<HashSet<u64>> {
         if trigrams.len() == 0 {

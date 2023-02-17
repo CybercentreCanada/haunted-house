@@ -47,6 +47,12 @@ pub struct CoreConfig {
     pub yara_job_size: u64,
     #[serde(default="default_max_result_set_size")]
     pub max_result_set_size: u64,
+    #[serde(default="default_task_deadline")]
+    pub task_deadline: std::time::Duration,
+    #[serde(default="default_task_start_time")]
+    pub task_start_time: std::time::Duration,
+    #[serde(default="default_task_heartbeat_interval")]
+    pub task_heartbeat_interval: std::time::Duration,
 }
 
 fn default_batch_limit_seconds() -> u64 { chrono::Duration::hours(1).num_seconds() as u64 }
@@ -56,24 +62,29 @@ fn default_index_soft_bytes_max() -> u64 { 50 << 30 }
 fn default_index_soft_entries_max() -> u64 { 50 << 30 }
 fn default_yara_job_size() -> u64 { 1000 }
 fn default_max_result_set_size() -> u64 { 100_000 }
+fn default_task_deadline() -> std::time::Duration { std::time::Duration::from_secs(60 * 60) }
+fn default_task_start_time() -> std::time::Duration { std::time::Duration::from_secs(60) }
+fn default_task_heartbeat_interval() -> std::time::Duration { std::time::Duration::from_secs(60 * 2) }
 
-impl Default for CoreConfig {
-    fn default() -> Self {
-        Self {
-            batch_limit_seconds: default_batch_limit_seconds(),
-            batch_limit_size: default_batch_limit_size(),
-            garbage_collection_interval: default_garbage_collection_interval(),
-            index_soft_bytes_max: default_index_soft_bytes_max(),
-            index_soft_entries_max: default_index_soft_entries_max(),
-            yara_job_size: default_yara_job_size(),
-            max_result_set_size: default_max_result_set_size(),
-        }
-    }
-}
+// impl Default for CoreConfig {
+//     fn default() -> Self {
+//         Self {
+//             batch_limit_seconds: default_batch_limit_seconds(),
+//             batch_limit_size: default_batch_limit_size(),
+//             garbage_collection_interval: default_garbage_collection_interval(),
+//             index_soft_bytes_max: default_index_soft_bytes_max(),
+//             index_soft_entries_max: default_index_soft_entries_max(),
+//             yara_job_size: default_yara_job_size(),
+//             max_result_set_size: default_max_result_set_size(),
+//         }
+//     }
+// }
 
 pub struct HouseCore {
     weak_self: WeakSelf<Self>,
     pub database: Database,
+    // pub quit_trigger: tokio::sync::watch::Sender<bool>,
+    // pub quit_signal: tokio::sync::watch::Receiver<bool>,
     pub file_storage: BlobStorage,
     pub index_storage: BlobStorage,
     pub index_cache: BlobCache,
@@ -89,9 +100,14 @@ impl HouseCore {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
         let (send_search, receive_search) = mpsc::unbounded_channel();
 
+        // Stop flag
+        // let (quit_trigger, quit_signal) = tokio::sync::watch::channel(false);
+
         let core = Arc::new(Self {
             weak_self: WeakSelf::new(),
             database,
+            // quit_trigger,
+            // quit_signal,
             file_storage,
             index_storage,
             index_cache,

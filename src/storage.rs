@@ -656,7 +656,7 @@ impl AzureBlobStore {
         if let Err(err) = client.delete().await {
             let mut ignore = match err.as_http_error() {
                 Some(err) => {
-                    println!("{}", err);
+                    // println!("{}", err);
                     err.status() == 404
                 },
                 None => false,
@@ -735,6 +735,11 @@ mod test {
             buff.extend(data.unwrap());
         }
         assert_eq!(buff, body);
+
+        let mut stream = store.stream("Not a file").await.unwrap();
+        while let Some(data) = stream.recv().await {
+            assert!(data.is_err());
+        }
     }
 
 
@@ -760,5 +765,9 @@ mod test {
 
             assert_eq!(std::fs::read(input_file.path()).unwrap(), std::fs::read(output_file.path()).unwrap())
         }
+
+        assert!(store.upload("Not a file", std::path::PathBuf::from("/not-a-file")).await.is_err());
+        let output_file = tempfile::NamedTempFile::new().unwrap();
+        assert!(store.download("Not a file", output_file.path().to_owned()).await.is_err());
     }
 }

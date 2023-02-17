@@ -208,6 +208,30 @@ impl Database {
         }
     }
 
+    pub async fn release_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        todo!()
+    }
+
+    pub async fn release_filter_task(&self, id: i64) -> Result<bool> {
+        match self {
+            Database::SQLite(local) => local.release_filter_task(id).await
+        }
+    }
+
+    pub async fn release_yara_task(&self, id: i64) -> Result<bool> {
+        match self {
+            Database::SQLite(local) => local.release_yara_task(id).await
+        }
+    }
+
+    pub async fn get_filter_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
+        todo!()
+    }
+
+    pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
+        todo!()
+    }
+
     pub async fn get_work_notification(&self) -> Result<()> {
         match self {
             Database::SQLite(local) => local.get_work_notification().await

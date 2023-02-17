@@ -10,13 +10,13 @@ use futures::{StreamExt, SinkExt};
 use log::{error, debug, info};
 use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
-use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse, listener};
+use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse};
 use poem::web::{TypedHeader, Data, Json};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
-use sha2::digest::typenum::private::IsLessPrivate;
+use serde_with::{serde_as, DisplayFromStr};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
@@ -84,7 +84,7 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
 }
 
 
-struct LoggerMiddleware;
+pub struct LoggerMiddleware;
 
 impl<E: Endpoint> Middleware<E> for LoggerMiddleware {
     type Output = LoggerMiddlewareImpl<E>;
@@ -94,7 +94,7 @@ impl<E: Endpoint> Middleware<E> for LoggerMiddleware {
     }
 }
 
-struct LoggerMiddlewareImpl<E> {
+pub struct LoggerMiddlewareImpl<E> {
     ep: E,
 }
 
@@ -230,10 +230,11 @@ impl IngestInterface {
 }
 
 
-
+#[serde_as]
 #[derive(Deserialize)]
 pub struct SearchRequest {
     pub access: HashSet<String>,
+    #[serde_as(as = "DisplayFromStr")]
     pub query: Query,
     pub yara_signature: String,
     pub start_date: Option<chrono::DateTime<chrono::Utc>>,

@@ -574,6 +574,20 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
+    // pub async fn release_filter_task(&self, id: i64) -> Result<bool>{
+    //     self._release_filter_task(&self.db, id).await
+    // }
+
+    pub async fn release_filter_task(&self, id: i64) -> Result<bool> {
+        let mut conn = self.db.acquire().await?;
+        let req = sqlx::query(
+            "UPDATE filter_tasks SET assigned_worker = NULL, assigned_time = NULL
+            WHERE id = ?")
+            .bind(id)
+            .execute(&mut conn).await?;
+        return Ok(req.rows_affected() > 0)
+    }
+
     async fn claim_yara_task(&self, id: i64, worker: &String) -> Result<bool> {
         let mut conn = self.db.acquire().await?;
         let req = sqlx::query(
@@ -586,7 +600,11 @@ impl SQLiteInterface {
         return Ok(req.rows_affected() > 0)
     }
 
-    async fn release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>
+    pub async fn release_yara_task(&self, id: i64) -> Result<bool>{
+        self._release_yara_task(&self.db, id).await
+    }
+
+    async fn _release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let req = sqlx::query(
