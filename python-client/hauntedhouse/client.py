@@ -60,7 +60,8 @@ class Client:
     async def close(self):
         await self.session.close()
 
-    async def start_search(self, yara_rule: str, access_control: str, archive_only=False) -> SearchStatus:
+    async def start_search(self, yara_rule: str, access_control: str, group: str = '',
+                           archive_only=False) -> SearchStatus:
         # Parse the access string into a set of key words
         access_fields = self.prepare_access(access_control)
 
@@ -73,6 +74,7 @@ class Client:
         result = await self.session.post('/search/', json={
             'access': access_fields,
             'query': query_from_yara(yara_rule),
+            'group': group,
             'yara_signature': yara_rule,
             'start_date': start_date,
             'end_date': None,
@@ -200,30 +202,6 @@ class Client:
                 future.set_result(message.get("token", ""))
             else:
                 future.set_exception(IngestError(message.get('error', '')))
-
-
-# class Expression:
-#     def __init__(self, query: str) -> None:
-#         self.query = query
-
-#     @classmethod
-#     def literal(cls, some_string: bytes) -> Expression:
-#         return cls(f"{{{some_string.hex()}}}")
-
-#     @classmethod
-#     def and_(cls, *args: Expression) -> Expression:
-#         return cls(f"({' & '.join(x.query for x in args)})")
-
-#     @classmethod
-#     def or_(cls, *args: Expression) -> Expression:
-#         return cls(f"({' | '.join(x.query for x in args)})")
-
-#     @classmethod
-#     def min_of(cls, howmany: int, *of: Expression) -> Expression:
-#         return cls(f"(min {howmany} of ({', '.join(x.query for x in of)}))")
-
-
-# yaraparse.UrsaExpression = Expression
 
 
 def query_from_yara(yara_rule: str) -> dict:

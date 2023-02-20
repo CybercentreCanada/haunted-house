@@ -236,6 +236,7 @@ pub struct SearchRequest {
     pub access: HashSet<String>,
     #[serde_as(as = "DisplayFromStr")]
     pub query: Query,
+    pub group: String,
     pub yara_signature: String,
     pub start_date: Option<chrono::DateTime<chrono::Utc>>,
     pub end_date: Option<chrono::DateTime<chrono::Utc>>,

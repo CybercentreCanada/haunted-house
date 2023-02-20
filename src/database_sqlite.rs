@@ -156,8 +156,11 @@ impl SQLiteInterface {
 
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
-            data BLOB NOT NULL
+            data BLOB NOT NULL,
+            group TEXT,
+            start_time TEXT,
         )")).execute(&mut con).await.context("error creating table searches")?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_group_start ON searches(group, start_time)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists filter_tasks (
             id INTEGER PRIMARY KEY,
@@ -506,7 +509,7 @@ impl SQLiteInterface {
 
         // Add operation to the search table
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
-        sqlx::query("INSERT INTO searches(code, data) VALUES(?, ?)")
+        sqlx::query("INSERT INTO searches(code, data, group, start_time) VALUES(?, ?, ?, ?)")
             .bind(&code)
             .bind(&postcard::to_allocvec(&SearchRecord{
                 code: code.clone(),
@@ -517,6 +520,8 @@ impl SQLiteInterface {
                 hit_files: Default::default(),
                 truncated: false,
             })?)
+            .bind(req.group)
+            .bind(chrono::Utc::now().to_rfc3339())
             .execute(&mut conn).await?;
 
         for (blob, index) in pending {
