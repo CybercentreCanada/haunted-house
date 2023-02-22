@@ -246,8 +246,10 @@ pub struct SearchRequest {
 #[derive(Serialize)]
 pub struct SearchRequestResponse {
     pub code: String,
+    pub group: String,
     pub finished: bool,
     pub errors: Vec<String>,
+    pub total_indices: u64,
     pub pending_indices: u64,
     pub pending_candidates: u64,
     pub hits: Vec<String>,

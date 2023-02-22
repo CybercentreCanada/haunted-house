@@ -93,10 +93,12 @@ fn filter_table_name(name: &IndexID) -> String {
 #[derive(Serialize, Deserialize)]
 struct SearchRecord {
     code: String,
+    group: String,
     yara_signature: String,
     query: Query,
     access: HashSet<String>,
     errors: Vec<String>,
+    initial_indices: u64,
     // pending_indices: Vec<BlobID>,
     // pending_files: BTreeSet<Vec<u8>>,
     hit_files: BTreeSet<Vec<u8>>,
@@ -516,6 +518,8 @@ impl SQLiteInterface {
                 yara_signature: req.yara_signature,
                 errors: Default::default(),
                 access: req.access,
+                group: req.group.clone(),
+                initial_indices: pending.len() as u64,
                 query: req.query.clone(),
                 hit_files: Default::default(),
                 truncated: false,
@@ -558,8 +562,10 @@ impl SQLiteInterface {
 
         Ok(SearchRequestResponse{
             code,
+            group: search.group,
             finished: pending_indices == 0 && pending_files == 0,
             errors: search.errors,
+            total_indices: search.initial_indices,
             pending_indices: pending_indices as u64,
             pending_candidates: pending_files as u64,
             hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
