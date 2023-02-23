@@ -5,6 +5,7 @@ import uuid
 
 import arrow
 import aiohttp
+import requests
 import pydantic
 from assemblyline.common.classification import Classification
 from mquery_query_lib import yaraparse
@@ -43,13 +44,15 @@ class Client:
         self.ingest_futures: dict[str, asyncio.Future] = {}
 
         conn = aiohttp.TCPConnector(limit=10, verify_ssl=verify)
-        # timeout = aiohttp.ClientTimeout(total=60 * 60 * 4)
         self.session = aiohttp.ClientSession(
             base_url=self.address,
             headers={'Authorization': 'Bearer ' + api_key},
-            # timeout=timeout,
             connector=conn
         )
+
+        self.sync_session = requests.Session()
+        self.sync_session.verify = verify
+        self.sync_session.headers['Authorization'] = 'Bearer ' + api_key
 
     async def __aenter__(self):
         return self
@@ -84,6 +87,30 @@ class Client:
         # Parse the message
         return SearchStatus(**await result.json())
 
+    def start_search_sync(self, yara_rule: str, access_control: str, group: str = '',
+                          archive_only=False) -> SearchStatus:
+        # Parse the access string into a set of key words
+        access_fields = self.prepare_access(access_control)
+
+        # If we only want archived material set the start date to the far future
+        start_date = None
+        if archive_only:
+            start_date = '9000-01-01T00:00:00.000'
+
+        # Send the search request
+        result = self.sync_session.post(self.address + '/search/', json={
+            'access': access_fields,
+            'query': query_from_yara(yara_rule),
+            'group': group,
+            'yara_signature': yara_rule,
+            'start_date': start_date,
+            'end_date': None,
+        })
+        result.raise_for_status()
+
+        # Parse the message
+        return SearchStatus(**result.json())
+
     async def search_status(self, code: str) -> SearchStatus:
         # Send the request
         result = await self.session.get('/search/' + code)
@@ -91,6 +118,14 @@ class Client:
 
         # Parse the message
         return SearchStatus(**await result.json())
+
+    def search_status_sync(self, code: str) -> SearchStatus:
+        # Send the request
+        result = self.sync_session.get('/search/' + code)
+        result.raise_for_status()
+
+        # Parse the message
+        return SearchStatus(**result.json())
 
     def prepare_access(self, access: str) -> list[str]:
         if not access:
