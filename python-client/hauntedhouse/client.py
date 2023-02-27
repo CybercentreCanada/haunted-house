@@ -25,8 +25,11 @@ class DuplicateToken(KeyError):
 
 class SearchStatus(pydantic.BaseModel):
     code: str
+    description: str
+    group: str
     finished: bool
     errors: list[str]
+    total_indices: int
     pending_indices: int
     pending_candidates: int
     hits: list[str]
