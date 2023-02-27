@@ -93,6 +93,7 @@ class Client:
                           archive_only=False) -> SearchStatus:
         # Parse the access string into a set of key words
         access_fields = self.prepare_access(access_control)
+        search_view = self.prepare_classification(access_control)
 
         # If we only want archived material set the start date to the far future
         start_date = None
@@ -101,6 +102,7 @@ class Client:
 
         # Send the search request
         result = self.sync_session.post(self.address + '/search/', json={
+            'view': search_view,
             'access': access_fields,
             'query': query_from_yara(yara_rule),
             'group': group,
