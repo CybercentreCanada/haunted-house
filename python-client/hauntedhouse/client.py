@@ -25,7 +25,6 @@ class DuplicateToken(KeyError):
 
 class SearchStatus(pydantic.BaseModel):
     code: str
-    description: str
     group: str
     finished: bool
     errors: list[str]
@@ -114,17 +113,21 @@ class Client:
         # Parse the message
         return SearchStatus(**result.json())
 
-    async def search_status(self, code: str) -> SearchStatus:
+    async def search_status(self, code: str, access: str) -> SearchStatus:
+        access_parts = self.prepare_access(access)
+
         # Send the request
-        result = await self.session.get('/search/' + code)
+        result = await self.session.get('/search/' + code, json={'access': access_parts})
         result.raise_for_status()
 
         # Parse the message
         return SearchStatus(**await result.json())
 
-    def search_status_sync(self, code: str) -> SearchStatus:
+    def search_status_sync(self, code: str, access: str) -> SearchStatus:
+        access_parts = self.prepare_access(access)
+
         # Send the request
-        result = self.sync_session.get('/search/' + code)
+        result = self.sync_session.get('/search/' + code, json={'access': access_parts})
         result.raise_for_status()
 
         # Parse the message
