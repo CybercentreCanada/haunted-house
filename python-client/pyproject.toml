@@ -2,9 +2,9 @@
 name = "hauntedhouse"
 description = "Client for hauntedhouse yara search engine."
 readme = "readme.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = {text = "MIT Licence"}
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
     "aiohttp",
     "assemblyline",
