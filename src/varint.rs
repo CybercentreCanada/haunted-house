@@ -18,6 +18,7 @@ pub fn encode(mut value: u64) -> Vec<u8> {
     return buffer;
 }
 
+#[cfg(test)]
 pub fn decode(data: Vec<u8>) -> Result<u64> {
     let mut buffer: Vec<u8> = Default::default();
     for byte in data {

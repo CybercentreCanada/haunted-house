@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use auth::Authenticator;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use log::{info, error};
 use tokio::sync::mpsc;
@@ -63,7 +63,7 @@ impl FromStr for ConfigMode {
 }
 
 
-#[derive(clap::Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     Server {
         #[arg(short, long)]
