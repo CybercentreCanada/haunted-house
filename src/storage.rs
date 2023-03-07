@@ -68,10 +68,10 @@ impl<'source> FromPyObject<'source> for BlobStorageConfig {
 
 pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
     match config {
-        BlobStorageConfig::TempDir { size } => {
+        BlobStorageConfig::TempDir { .. } => {
             LocalDirectory::new_temp().context("Error setting up local blob store")
         }
-        BlobStorageConfig::Directory { path, size } => {
+        BlobStorageConfig::Directory { path, .. } => {
             Ok(BlobStorage::Local(LocalDirectory::new(path)))
         },
         BlobStorageConfig::Azure(azure) =>
@@ -182,19 +182,19 @@ pub fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
 #[derive(Clone)]
 pub struct LocalDirectory {
     path: PathBuf,
-    temp: Option<Arc<TempDir>>
+    _temp: Option<Arc<TempDir>>
 }
 
 impl LocalDirectory {
     pub fn new(path: PathBuf) -> Self {
-        Self {path, temp: None}
+        Self {path, _temp: None}
     }
 
     pub fn new_temp() -> Result<BlobStorage> {
         let temp = tempfile::tempdir()?;
         Ok(BlobStorage::Local(Self {
             path: temp.path().to_path_buf(),
-            temp: Some(Arc::new(temp))
+            _temp: Some(Arc::new(temp))
         }))
     }
 

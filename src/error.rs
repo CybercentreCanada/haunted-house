@@ -3,7 +3,7 @@
 #[derive(Debug, PartialEq)]
 pub enum ErrorKinds {
     BlobTooLargeForCache,
-    InvalidHashProduced,
+    // InvalidHashProduced,
     IndexHasInvalidMagic,
     IndexHasUnsupportedVersion,
     IndexHasUnsupportedType,

@@ -42,6 +42,7 @@ impl BlobHandle {
         Ok(self.data.file.reopen()?)
     }
 
+    #[cfg(test)]
     pub async fn read_all(&self) -> Result<Vec<u8>> {
         Ok(tokio::fs::read(self.data.file.path()).await?)
     }
@@ -91,7 +92,9 @@ enum BlobCacheCommand {
     Open(String, oneshot::Sender<Result<BlobHandle>>),
     OpenNew(String, u64, oneshot::Sender<Result<BlobHandle>>),
     Resize(String, u64, oneshot::Sender<Result<u64>>),
+    #[cfg(test)]
     Capacity(oneshot::Sender<(u64, u64)>),
+    #[cfg(test)]
     Flush(oneshot::Sender<()>),
     LoadFinished(String),
     HandleDropped(String),
@@ -136,12 +139,14 @@ impl BlobCache {
         Ok(recv.await?)
     }
 
+    #[cfg(test)]
     pub async fn capacity(&self) -> Result<(u64, u64)> {
         let (send, recv) = oneshot::channel();
         _ = self.connection.send(BlobCacheCommand::Capacity(send)).await;
         Ok(recv.await?)
     }
 
+    #[cfg(test)]
     pub async fn flush(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
         _ = self.connection.send(BlobCacheCommand::Flush(send)).await;
@@ -216,9 +221,11 @@ impl Inner {
                 found.extend(self.pending.keys().cloned());
                 _ = respond.send(found);
             },
+            #[cfg(test)]
             BlobCacheCommand::Capacity(respond) => {
                 _ = respond.send((self.capacity - self.committed_capacity, self.capacity));
             },
+            #[cfg(test)]
             BlobCacheCommand::Flush(respond) => {
                 self.free_space(self.capacity);
                 _ = respond.send(());

@@ -2,7 +2,7 @@ use anyhow::Result;
 
 pub fn encode(mut value: u64) -> Vec<u8> {
     let mut buffer = Vec::new();
-    
+
     loop {
         let mut fragment = value & 0b0111_1111;
         value >>= 7;
