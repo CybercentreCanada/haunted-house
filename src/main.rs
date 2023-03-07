@@ -18,8 +18,8 @@ mod blob_cache;
 mod worker;
 mod worker_watcher;
 
-use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Result, Context};
@@ -41,6 +41,28 @@ struct Args {
     cmd: Commands
 }
 
+#[derive(Debug, Clone)]
+enum ConfigMode {
+    Server,
+    Worker
+}
+
+impl FromStr for ConfigMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.to_lowercase();
+        if s == "server" {
+            return Ok(ConfigMode::Server);
+        }
+        if s == "worker" {
+            return Ok(ConfigMode::Worker);
+        }
+        return Err(anyhow::anyhow!("unknown config type: {s}"))
+    }
+}
+
+
 #[derive(clap::Subcommand, Debug, Clone)]
 enum Commands {
     Server {
@@ -52,8 +74,11 @@ enum Commands {
         config: Option<PathBuf>
     },
     LintConfig {
+        mode: ConfigMode,
         #[arg(short, long)]
-        config: Option<PathBuf>
+        config: Option<PathBuf>,
+        #[arg(short, long)]
+        default: bool,
     }
 }
 
@@ -80,22 +105,44 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     match args.cmd {
-        Commands::LintConfig { config } => {
-            let config = load_config(config)?;
-            let config_body = serde_json::to_string_pretty(&config)?;
-            println!("{}", config_body);
+        Commands::LintConfig { mode, config, default } => {
+            match mode {
+                ConfigMode::Server => {
+                    let config = if default {
+                        Default::default()
+                    } else {
+                        load_config(config)?
+                    };
+                    let config_body = serde_json::to_string_pretty(&config)?;
+                    println!("{}", config_body);
+                },
+                ConfigMode::Worker => {
+                    let config = if default {
+                        Default::default()
+                    } else {
+                        load_worker_config(config)?
+                    };
+                    let config_body = serde_json::to_string_pretty(&config)?;
+                    println!("{}", config_body);
+                },
+            }
         },
         Commands::Server { config } => {
             // Load the config file
+            info!("Loading configuration");
             let config = load_config(config)?;
 
             // Initialize authenticator
+            info!("Initializing Authenticator");
             let auth = Authenticator::from_config(config.authentication)?;
 
             // Setup the storage
+            info!("Connect to index storage");
             let index_storage = crate::storage::connect(config.blobs).await?;
+            info!("Connect to file storage");
             let file_storage = crate::storage::connect(config.files).await?;
 
+            info!("Setup cache");
             let (cache, _temp) = match config.cache {
                 config::CacheConfig::TempDir { size } => {
                     let temp_dir = tempfile::tempdir()?;
@@ -131,16 +178,20 @@ async fn main() -> Result<()> {
         },
         Commands::Worker { config } => {
             // Load the config file
+            info!("Loading config from: {config:?}");
             let config = load_worker_config(config)?;
 
             // Setup the storage
+            info!("Connect to blob storage");
             let index_storage = crate::storage::connect(config.blobs).await?;
+            info!("Connect to file storage");
             let file_storage = crate::storage::connect(config.files).await?;
 
             // Initialize authenticator
             let token = config.api_token;
 
             // Get cache
+            info!("Setup caches");
             let (file_cache, _file_temp) = match config.file_cache {
                 config::CacheConfig::TempDir { size } => {
                     let temp_dir = tempfile::tempdir()?;
@@ -161,6 +212,7 @@ async fn main() -> Result<()> {
             };
 
             // Figure out where the worker status interface will be hosted
+            info!("Determine bind address");
             let bind_address = config.bind_address.unwrap_or("localhost:8080".to_owned());
             let mut addresses = tokio::net::lookup_host(&bind_address).await?.collect_vec();
             let bind_address = match addresses.pop() {

@@ -67,19 +67,11 @@ fn default_task_deadline() -> std::time::Duration { std::time::Duration::from_se
 fn default_task_start_time() -> std::time::Duration { std::time::Duration::from_secs(60) }
 fn default_task_heartbeat_interval() -> std::time::Duration { std::time::Duration::from_secs(60 * 2) }
 
-// impl Default for CoreConfig {
-//     fn default() -> Self {
-//         Self {
-//             batch_limit_seconds: default_batch_limit_seconds(),
-//             batch_limit_size: default_batch_limit_size(),
-//             garbage_collection_interval: default_garbage_collection_interval(),
-//             index_soft_bytes_max: default_index_soft_bytes_max(),
-//             index_soft_entries_max: default_index_soft_entries_max(),
-//             yara_job_size: default_yara_job_size(),
-//             max_result_set_size: default_max_result_set_size(),
-//         }
-//     }
-// }
+impl Default for CoreConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").unwrap()
+    }
+}
 
 pub struct HouseCore {
     weak_self: WeakSelf<Self>,

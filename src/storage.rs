@@ -26,6 +26,17 @@ pub enum BlobStorageConfig {
     Azure (AzureBlobConfig)
 }
 
+impl Default for BlobStorageConfig {
+    fn default() -> Self {
+        BlobStorageConfig::Azure(AzureBlobConfig {
+            account: "azure-account".to_string(),
+            access_key: "azure-key".to_string(),
+            container: "retrohunt".to_owned(),
+            use_emulator: false
+        })
+    }
+}
+
 #[cfg(feature = "python")]
 impl<'source> FromPyObject<'source> for BlobStorageConfig {
     fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
