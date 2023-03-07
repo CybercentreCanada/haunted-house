@@ -7,7 +7,7 @@ use crate::access::AccessControl;
 use crate::core::{SearchCache, CoreConfig};
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
-use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, WorkError};
+use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
@@ -196,13 +196,13 @@ impl Database {
         }
     }
 
-    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         match self {
             Database::SQLite(local) => local.initialize_search(req).await
         }
     }
 
-    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         match self {
             Database::SQLite(local) => local.search_status(code).await
         }
@@ -268,5 +268,10 @@ impl Database {
         }
     }
 
+    // pub async fn tag_prompt(&self, req: PromptQuery) -> Result<PromptResult> {
+    //     match self {
+    //         Database::SQLite(local) => local.tag_prompt(req).await
+    //     }
+    // }
 }
 

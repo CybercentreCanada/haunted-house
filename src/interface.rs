@@ -10,8 +10,9 @@ use futures::{StreamExt, SinkExt};
 use log::{error, debug, info};
 use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
-use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse};
+use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse, Response};
 use poem::web::{TypedHeader, Data, Json};
+use poem::http::{StatusCode};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
@@ -20,6 +21,7 @@ use serde_with::{serde_as, DisplayFromStr};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
+use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::config::TLSConfig;
 use crate::core::{HouseCore, IngestStatus};
@@ -199,13 +201,17 @@ impl SearcherInterface {
         Self{core}
     }
 
-    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         self.core.initialize_search(req).await
     }
 
-    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         self.core.search_status(code).await
     }
+
+    // pub async fn tag_prompt(&self, req: PromptQuery) -> Result<PromptResult> {
+    //     self.core.database.tag_prompt(req).await
+    // }
 }
 
 #[derive(Clone)]
@@ -233,6 +239,7 @@ impl IngestInterface {
 #[serde_as]
 #[derive(Deserialize)]
 pub struct SearchRequest {
+    pub view: AccessControl,
     pub access: HashSet<String>,
     #[serde_as(as = "DisplayFromStr")]
     pub query: Query,
@@ -242,6 +249,11 @@ pub struct SearchRequest {
     pub end_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Explicitly not seralizable
+pub struct InternalSearchStatus {
+    pub view: AccessControl,
+    pub resp: SearchRequestResponse
+}
 
 #[derive(Serialize)]
 pub struct SearchRequestResponse {
@@ -258,13 +270,59 @@ pub struct SearchRequestResponse {
 
 #[handler]
 async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<SearchRequest>) -> Result<Json<SearchRequestResponse>> {
-    Ok(Json(interface.initialize_search(request).await?))
+    if !request.view.can_access(&request.access) {
+        return Err(anyhow::anyhow!("Search access too high."))
+    }
+
+    Ok(Json(interface.initialize_search(request).await?.resp))
 }
 
-#[handler]
-async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>) -> Result<Json<SearchRequestResponse>> {
-    Ok(Json(interface.search_status(code).await?))
+#[derive(Serialize, Deserialize, Default)]
+pub struct Access {
+    pub access: HashSet<String>,
 }
+
+
+#[handler]
+async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>, query: Option<poem::web::Query<Access>>, body: Option<Json<Access>>) -> (StatusCode, Response) {
+    let status = match interface.search_status(code).await {
+        Ok(status) => status,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}").into_response())
+    };
+
+    let status = match status {
+        Some(status) => status,
+        None => return (StatusCode::NOT_FOUND, "Search code not found.".into_response())
+    };
+
+    let access = match body {
+        Some(body) => body.0,
+        None => match query {
+            Some(query) => query.0,
+            None => Default::default()
+        }
+    };
+
+    if !status.view.can_access(&access.access) {
+        return (StatusCode::NOT_FOUND, "Search code not found.".into_response())
+    }
+
+    return (StatusCode::OK, Json(status.resp).into_response())
+}
+
+// pub struct ListRequest {
+
+// }
+
+// pub struct ListResponse {
+
+// }
+
+// #[handler]
+// async fn list_searches(Data(interface): Data<&SearcherInterface>, query: Option<poem::web::Query<ListRequest>>, body: Option<Json<ListRequest>>) -> (StatusCode, Response) {
+//     todo!()
+// }
+
 
 #[derive(Serialize, Deserialize)]
 pub struct FilterTask {
@@ -490,6 +548,31 @@ async fn get_detailed_status(interface: Data<&StatusInterface>) -> Result<Json<S
     Ok(Json(interface.get_status().await?))
 }
 
+// #[derive(Serialize, Deserialize, Default)]
+// pub struct PromptQuery {
+//     tag: String,
+//     value: Option<String>,
+// }
+
+// #[derive(Serialize, Deserialize)]
+// pub struct PromptResult {
+//     tag_suggestions: Vec<String>,
+//     value_suggestions: Vec<String>,
+// }
+
+// #[handler]
+// async fn tag_prompt(interface: Data<&SearcherInterface>, body: Option<Json<PromptQuery>>, query: Option<poem::web::Query<PromptQuery>>) -> Result<Json<PromptResult>> {
+//     let query = match query {
+//         Some(query) => query.0,
+//         None => match body {
+//             Some(query) => query.0,
+//             None => Default::default()
+//         }
+//     };
+
+//     Ok(Json(interface.tag_prompt(query).await?))
+// }
+
 pub async fn serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<HouseCore>) {
     if let Err(err) = _serve(bind_address, tls, core).await {
         error!("Error with http interface: {err} {}", err.root_cause());
@@ -500,6 +583,8 @@ pub async fn _serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<Hous
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
+        // .at("/search/", get(list_searches))
+        // .at("/tags/prompt", get(tag_prompt))
         .at("/work/", get(get_work))
         .at("/work/finished/", post(finish_work))
         .at("/work/error/", post(work_error))

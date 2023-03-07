@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::auth::Authenticator;
 use crate::blob_cache::BlobCache;
 use crate::database::{Database, IndexGroup};
-use crate::interface::{SearchRequestResponse, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue, WorkError};
+use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue, WorkError};
 use crate::storage::BlobStorage;
 use crate::access::AccessControl;
 use crate::filter::TrigramFilter;
@@ -126,12 +126,12 @@ impl HouseCore {
         return Ok(recv.await?);
     }
 
-    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         let res = self.database.initialize_search(req).await?;
         return Ok(res)
     }
 
-    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         self.database.search_status(code).await
     }
 

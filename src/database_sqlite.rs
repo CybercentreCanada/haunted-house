@@ -11,7 +11,7 @@ use sqlx::pool::{PoolOptions, PoolConnection};
 use crate::access::AccessControl;
 use crate::core::{SearchCache, CoreConfig};
 use crate::database::{IndexGroup, BlobID, IndexID};
-use crate::interface::{SearchRequest, SearchRequestResponse, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
+use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
 use crate::query::Query;
 
 impl<'r> Decode<'r, sqlx::Sqlite> for IndexGroup {
@@ -96,6 +96,7 @@ struct SearchRecord {
     group: String,
     yara_signature: String,
     query: Query,
+    view: AccessControl,
     access: HashSet<String>,
     errors: Vec<String>,
     initial_indices: u64,
@@ -149,6 +150,7 @@ impl SQLiteInterface {
         let mut con = pool.acquire().await?;
 
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists index_index (
             label TEXT PRIMARY KEY,
@@ -159,10 +161,46 @@ impl SQLiteInterface {
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
             data BLOB NOT NULL,
-            group TEXT,
-            start_time TEXT,
+            search_group TEXT,
+            start_time TEXT
         )")).execute(&mut con).await.context("error creating table searches")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_group_start ON searches(group, start_time)")).execute(&mut con).await?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_group_start ON searches(search_group, start_time)")).execute(&mut con).await?;
+
+        // description TEXT,
+        // sqlx::query(&format!("create virtual table if not exists search_description (
+        //     description, content='searches', content_rowid='code'
+        // )")).execute(&mut con).await.context("error creating table searches_description")?;
+
+        // sqlx::query(&format!("
+        // CREATE TRIGGER search_insert AFTER INSERT ON search BEGIN
+        //   INSERT INTO search_description(rowid, description) VALUES (new.code, new.description);
+        // END
+        // ")).execute(&mut con).await.context("error creating search_description trigger")?;
+
+        // sqlx::query(&format!("
+        // CREATE TRIGGER search_delete AFTER DELETE ON search BEGIN
+        //   INSERT INTO search_description(search_description, rowid, description) VALUES ('delete', old.code, old.description);
+        // END
+        // ")).execute(&mut con).await.context("error creating search_description trigger")?;
+
+        // sqlx::query(&format!("
+        // CREATE TRIGGER search_update AFTER UPDATE ON search BEGIN
+        //     INSERT INTO search_description(search_description, rowid, description) VALUES ('delete', old.code, old.description);
+        //     INSERT INTO search_description(rowid, description) VALUES (new.code, new.description);
+        // END;
+        // ")).execute(&mut con).await.context("error creating search_description trigger")?;
+
+        // sqlx::query(&format!("create table if not exists tags (
+        //     tagid INTEGER PRIMARY KEY,
+        //     code TEXT,
+        //     key TEXT NOT NULL,
+        //     value TEXT NOT NULL,
+        //     UNIQUE(code, key, value),
+        //     FOREIGN KEY(code) REFERENCES searches(code)
+        // )")).execute(&mut con).await.context("error creating table tags")?;
+        // sqlx::query(&format!("CREATE INDEX IF NOT EXISTS tags_keys ON tags(key, value)")).execute(&mut con).await?;
+        // sqlx::query(&format!("CREATE INDEX IF NOT EXISTS tags_code_keys ON tags(code, key)")).execute(&mut con).await?;
+        // sqlx::query(&format!("CREATE INDEX IF NOT EXISTS tags_value ON tags(value, key)")).execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists filter_tasks (
             id INTEGER PRIMARY KEY,
@@ -486,7 +524,7 @@ impl SQLiteInterface {
         Ok(trans.commit().await?)
     }
 
-    pub async fn initialize_search(&self, req: SearchRequest) -> Result<SearchRequestResponse> {
+    pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         // Turn the expiry dates into a group range
         let start = match req.start_date {
             Some(value) => IndexGroup::create(&Some(value)),
@@ -511,13 +549,14 @@ impl SQLiteInterface {
 
         // Add operation to the search table
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
-        sqlx::query("INSERT INTO searches(code, data, group, start_time) VALUES(?, ?, ?, ?)")
+        sqlx::query("INSERT INTO searches(code, data, search_group, start_time) VALUES(?, ?, ?, ?)")
             .bind(&code)
             .bind(&postcard::to_allocvec(&SearchRecord{
                 code: code.clone(),
                 yara_signature: req.yara_signature,
                 errors: Default::default(),
                 access: req.access,
+                view: req.view,
                 group: req.group.clone(),
                 initial_indices: pending.len() as u64,
                 query: req.query.clone(),
@@ -526,6 +565,7 @@ impl SQLiteInterface {
             })?)
             .bind(req.group)
             .bind(chrono::Utc::now().to_rfc3339())
+            // .bind(req.description)
             .execute(&mut conn).await?;
 
         for (blob, index) in pending {
@@ -539,16 +579,19 @@ impl SQLiteInterface {
         }
 
         self.work_notification.notify_waiters();
-        self.search_status(code).await
+        match self.search_status(code).await? {
+            Some(result) => Ok(result),
+            None => Err(anyhow::anyhow!("Result status could not be read.")),
+        }
     }
 
-    pub async fn search_status(&self, code: String) -> Result<SearchRequestResponse> {
+    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         let mut conn = self.db.acquire().await?;
         let data: Option<SearchRecord> = self._get_search(&mut conn, &code).await?;
 
         let search: SearchRecord = match data {
             Some(search) => search,
-            None => return Err(anyhow::anyhow!("Search code not found"))
+            None => return Ok(None)
         };
 
         let (pending_indices, ): (i64, ) = sqlx::query_as(
@@ -560,17 +603,22 @@ impl SQLiteInterface {
             .bind(&code)
             .fetch_one(&mut conn).await.context("Couldn't list yara tasks for search")?;
 
-        Ok(SearchRequestResponse{
-            code,
-            group: search.group,
-            finished: pending_indices == 0 && pending_files == 0,
-            errors: search.errors,
-            total_indices: search.initial_indices,
-            pending_indices: pending_indices as u64,
-            pending_candidates: pending_files as u64,
-            hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
-            truncated: search.truncated,
-        })
+        Ok(Some(
+            InternalSearchStatus {
+                view: search.view,
+                resp: SearchRequestResponse{
+                    code,
+                    group: search.group,
+                    finished: pending_indices == 0 && pending_files == 0,
+                    errors: search.errors,
+                    total_indices: search.initial_indices,
+                    pending_indices: pending_indices as u64,
+                    pending_candidates: pending_files as u64,
+                    hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
+                    truncated: search.truncated,
+                }
+            }
+        ))
     }
 
     async fn claim_filter_task(&self, id: i64, worker: &String) -> Result<bool> {
