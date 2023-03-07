@@ -3,16 +3,19 @@ name = "haunted-house"
 version = "0.1.0"
 edition = "2021"
 
-#[lib]
-#name = "haunted_house"
-#crate-type = ["cdylib"]
+
+[[bin]]
+name = "operator"
+required-features = ["operator"]
+
+[profile.release]
+lto = true
 
 [dependencies]
 serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0"
 serde_with = "2.2"
 # toml = "0.6"
-# serde_yaml = "0.9"
 postcard = { version = "1.0.2", features = ["alloc"] }
 nom = "7"
 bytes = "*"
@@ -60,6 +63,10 @@ azure_identity = "0.9"
 azure_storage = "0.9"
 azure_storage_blobs = "0.9"
 
+kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
+schemars = { version = "0.8.6", optional = true }
+k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 assertor = "*"
@@ -67,5 +74,6 @@ assertor = "*"
 [features]
 python = ["pyo3", "dep:pyo3-asyncio", "dep:pyo3-log"]
 extension-module = ["python", "pyo3/extension-module"]
+operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
 #default = ["extension-module"]
 default = []
