@@ -1,50 +1,63 @@
-
-
-
-# def pretty_classification(item):
-#     if isinstance(item, str):
-#         return item
-#     if 'And' in item:
-#         parts = [pretty_classification(x) for x in item["And"]]
-#         return 'And(' + ', '.join(parts) + ')'
-#     if 'Or' in item:
-#         parts = [pretty_classification(x) for x in item["Or"]]
-#         return 'Or(' + ', '.join(parts) + ')'
-#     if 'Token' in item:
-#         return '"' + item['Token'].replace('"', '\\"') + '"'
-#     raise NotImplementedError()
-
 import argparse
 import json
 import asyncio
-import time
 import os
+import logging
+import sys
+import time
 
 from assemblyline_client import get_client
+import pydantic
 
 from .client import Client, DuplicateToken
 
 
+logger = logging.getLogger(__name__)
 FL = 'classification,sha256,expiry_ts,_seq_no,_primary_term'
 
 
-ASSEMBLYLINE_URL = os.environ['ASSEMBLYLINE_URL']
-ASSEMBLYLINE_USER = os.environ['ASSEMBLYLINE_USER']
-ASSEMBLYLINE_API_KEY = os.environ['ASSEMBLYLINE_API_KEY']
+def get_env_data_as_dict(dotenv_path):
+    result = {}
+    with open(dotenv_path) as file_obj:
+        lines = file_obj.read().splitlines()  # Removes \n from lines
 
-HAUNTED_HOUSE_URL = os.environ['HAUNTEDHOUSE_URL']
-HAUNTED_HOUSE_API_KEY = os.environ['HAUNTEDHOUSE_API_KEY']
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if "#" in line:
+            line = line.split("#")[0].strip()
+        key, value = line.split("=", maxsplit=1)
+        result[key] = value
+    return result
 
-BATCH_SIZE = int(os.getenv('AL_BATCH_SIZE', '1000'))
+
+class Config(pydantic.BaseModel):
+    assemblyline_url: str
+    assemblyline_user: str
+    assemblyline_api_key: str
+    hauntedhouse_url: str
+    hauntedhouse_api_key: str
+    write_path: str
+    batch_size: int = pydantic.Field(default=1000)
+    allow_disabled_access: bool = pydantic.Field(default=False)
+    trust_all: bool = pydantic.Field(default=False)
 
 
-async def socket_main(verify) -> None:
-    al_client = get_client(ASSEMBLYLINE_URL, apikey=(ASSEMBLYLINE_USER, ASSEMBLYLINE_API_KEY))
-
+async def socket_main(config: Config, verify: bool) -> None:
+    logger.info("Connect to assemblyline for classification configuration")
+    al_client = get_client(config.assemblyline_url, apikey=(config.assemblyline_user, config.assemblyline_api_key))
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
 
-    last_seq_no = -1
-    completed_seq_no = -1
+    try:
+        with open(os.path.join(config.write_path, "state.json"), 'r') as handle:
+            data = json.load(handle)
+            completed_seq_no = data['completed']
+            last_seq_no = data['completed']
+    except FileNotFoundError:
+        last_seq_no = -1
+        completed_seq_no = -1
+
     successful_search = False
 
     recent_tokens: dict[str, float] = {}
@@ -52,8 +65,13 @@ async def socket_main(verify) -> None:
     waiting_sequence_numbers: list[tuple[int, int]] = []
     futures: set[asyncio.Future[str]] = set()
 
-    async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY, classification_definition['original_definition'], verify=verify) as house_client:
-        assert house_client.access_engine.enforce
+    logger.info("Connect to hauntedhouse")
+    async with Client(config.hauntedhouse_url, config.hauntedhouse_api_key,
+                      classification_definition['original_definition'], verify=verify) as house_client:
+        if not config.allow_disabled_access:
+            assert house_client.access_engine.enforce
+
+        logger.info("Starting loop")
 
         while True:
 
@@ -81,12 +99,16 @@ async def socket_main(verify) -> None:
                         new_completed = max(finished)
                         if new_completed != completed_seq_no:
                             completed_seq_no = new_completed
-                            print("cursor head", completed_seq_no)
+                            logger.info("cursor head", completed_seq_no)
+                            with open(os.path.join(config.write_path, "state.json"), 'w') as handle:
+                                json.dump({
+                                    'completed': completed_seq_no
+                                }, handle)
 
                 recent_tokens = {key: value for key, value in recent_tokens.items() if value > (time.time() - 1000)}
 
                 # if done:
-                #     print("current active 1", len(futures))
+                #     logger.info("current active 1", len(futures))
 
             # When there are fewer than some large number of currently batched files, add more
             if len(current_sequence_numbers) < 10000:
@@ -94,7 +116,7 @@ async def socket_main(verify) -> None:
                     query = "*"
                 else:
                     query = f"_seq_no: [{last_seq_no} TO *]"
-                batch = al_client.search.file(query, sort="_seq_no asc", rows=BATCH_SIZE, fl=FL)
+                batch = al_client.search.file(query, sort="_seq_no asc", rows=config.batch_size, fl=FL)
 
                 futures_before = len(futures)
                 for item in batch['items']:
@@ -118,10 +140,10 @@ async def socket_main(verify) -> None:
                 successful_search = len(futures) > futures_before
 
                 # if batch['items']:
-                #     print("current active 2", len(futures))
+                #     logger.info("current active 2", len(futures))
 
             if not futures and not successful_search:
-                print("Finished, waiting for new files")
+                logger.info("Finished, waiting for new files")
                 await asyncio.sleep(60)
 
 
@@ -131,6 +153,20 @@ if __name__ == '__main__':
         description='Ingest files from assemblyline into hauntedhouse',
     )
     parser.add_argument("--trust-all", help="ignore server verification", action='store_true')
+    parser.add_argument("config", help="path to config file")
     args = parser.parse_args()
 
-    asyncio.run(socket_main(verify=not args.trust_all))
+    if args.config.endswith(".json"):
+        config = Config(**json.load(open(args.config)))
+    else:
+        config = Config(**get_env_data_as_dict(args.config))
+
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+
+    if config.trust_all is True:
+        trust_all = True
+    else:
+        trust_all = args.trust_all
+
+    asyncio.run(socket_main(config, verify=not trust_all))

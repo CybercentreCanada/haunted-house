@@ -26,13 +26,14 @@ async def main(yara_file, access, verify):
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
     classification_definition = classification_definition['original_definition']
 
-    async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY, classification=classification_definition, verify=verify) as client:
+    async with Client(HAUNTED_HOUSE_URL, HAUNTED_HOUSE_API_KEY,
+                      classification=classification_definition, verify=verify) as client:
 
         search_status = await client.start_search(body, access, archive_only=False)
 
         while not search_status.finished:
             await asyncio.sleep(10)
-            search_status = await client.search_status(search_status.code)
+            search_status = await client.search_status(search_status.code, access)
 
         if search_status.errors:
             print(search_status.errors)

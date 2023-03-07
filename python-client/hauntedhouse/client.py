@@ -247,7 +247,7 @@ class Client:
                 future.set_exception(IngestError(message.get('error', '')))
 
 
-def query_from_yara(yara_rule: str) -> dict:
+def query_from_yara(yara_rule: str) -> str:
     rules = yaraparse.parse_yara(yara_rule)
 
     if len(rules) == 0:
