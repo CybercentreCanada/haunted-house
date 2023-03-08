@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use log::{error, info};
 use tempfile::NamedTempFile;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -107,7 +107,9 @@ pub struct BlobCache {
 
 impl BlobCache {
 
-    pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Self {
+    pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&path).context(format!("Failed to create cache directory: {path:?}"))?;
+
         let (daemon, send) = Inner::new(storage, capacity, path);
 
         tokio::spawn(async {
@@ -116,9 +118,9 @@ impl BlobCache {
             }
         });
 
-        Self {
+        Ok(Self {
             connection: send
-        }
+        })
     }
 
     pub async fn open(&self, id: String) -> Result<BlobHandle> {
@@ -442,7 +444,7 @@ impl Inner {
                         _ = finished.send(Some(Ok(entry)));
                     },
                     Err(err) => {
-                        _ = finished.send(Some(Err(err.into())));
+                        _ = finished.send(Some(Err(err.context("error in download result"))));
                     },
                 }
                 _ = command.send(BlobCacheCommand::LoadFinished(id)).await;
@@ -545,7 +547,7 @@ mod test {
             path: storage_dir.path().to_owned(),
             size: 100 << 30
         }).await.unwrap();
-        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
+        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
         let mut rng = rand::thread_rng();
         let sample_size = 128;
@@ -579,7 +581,7 @@ mod test {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
         let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned(), size: 1 << 30 }).await.unwrap();
-        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
+        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
         {
             let mut rng = rand::thread_rng();
@@ -600,7 +602,7 @@ mod test {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
         let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned(), size: 1 << 30 }).await.unwrap();
-        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned());
+        let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
         let mut rng = rand::thread_rng();
         let sample_size = 512;

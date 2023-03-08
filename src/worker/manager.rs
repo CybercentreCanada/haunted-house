@@ -392,8 +392,8 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
 
 async fn do_filter_task(data: Arc<WorkerData>, filter_task: FilterTask) -> Result<()> {
     // Download filter file
-    let index_blob = data.index_cache.open(filter_task.filter_blob.to_string()).await?;
-    let index_file = index_blob.open()?;
+    let index_blob = data.index_cache.open(filter_task.filter_blob.to_string()).await.context("Error downloading filter.")?;
+    let index_file = index_blob.open().context("Error opening filter.")?;
 
     // Run query
     let file_ids = tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {

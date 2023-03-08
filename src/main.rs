@@ -144,10 +144,10 @@ async fn main() -> Result<()> {
             let (cache, _temp) = match config.cache {
                 config::CacheConfig::TempDir { size } => {
                     let temp_dir = tempfile::tempdir()?;
-                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned()), Some(temp_dir))
+                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
                 }
                 config::CacheConfig::Directory { path, size } => {
-                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path)), None)
+                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
                 }
             };
 
@@ -193,19 +193,19 @@ async fn main() -> Result<()> {
             let (file_cache, _file_temp) = match config.file_cache {
                 config::CacheConfig::TempDir { size } => {
                     let temp_dir = tempfile::tempdir()?;
-                    (BlobCache::new(file_storage.clone(), size, temp_dir.path().to_owned()), Some(temp_dir))
+                    (BlobCache::new(file_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
                 }
                 config::CacheConfig::Directory { path, size } => {
-                    (BlobCache::new(file_storage.clone(), size, PathBuf::from(path)), None)
+                    (BlobCache::new(file_storage.clone(), size, PathBuf::from(path))?, None)
                 }
             };
             let (index_cache, _index_temp) = match config.blob_cache {
                 config::CacheConfig::TempDir { size } => {
                     let temp_dir = tempfile::tempdir()?;
-                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned()), Some(temp_dir))
+                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
                 }
                 config::CacheConfig::Directory { path, size } => {
-                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path)), None)
+                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
                 }
             };
 
