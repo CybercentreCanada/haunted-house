@@ -99,7 +99,7 @@ async def socket_main(config: Config, verify: bool) -> None:
                         new_completed = max(finished)
                         if new_completed != completed_seq_no:
                             completed_seq_no = new_completed
-                            logger.info("cursor head", completed_seq_no)
+                            logger.info(f"cursor head {completed_seq_no}")
                             with open(os.path.join(config.write_path, "state.json"), 'w') as handle:
                                 json.dump({
                                     'completed': completed_seq_no

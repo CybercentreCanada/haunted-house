@@ -129,7 +129,7 @@ class Client:
         access_parts = self.prepare_access(access)
 
         # Send the request
-        result = self.sync_session.get('/search/' + code, json={'access': access_parts})
+        result = self.sync_session.get(self.address + '/search/' + code, json={'access': access_parts})
         result.raise_for_status()
 
         # Parse the message
