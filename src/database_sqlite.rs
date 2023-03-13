@@ -114,6 +114,13 @@ impl SQLiteInterface {
             format!("sqlite::memory:")
         } else {
             let path = Path::new(url);
+
+            if let Some(parent) = path.parent() {
+                if parent != Path::new("") && parent != Path::new("/") && !parent.exists() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+            }
+
             if path.is_absolute() {
                 format!("sqlite://{}?mode=rwc", url)
             } else {
