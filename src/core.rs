@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
 use crate::blob_cache::BlobCache;
+use crate::bloom::{self, SimpleFilter};
 use crate::database::{Database, IndexGroup};
-use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkResultValue, WorkError};
+use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkError};
 use crate::storage::BlobStorage;
 use crate::access::AccessControl;
 use crate::filter::TrigramFilter;
@@ -16,14 +17,18 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot};
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc, Duration};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use weak_self::WeakSelf;
 
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestStatus {
-    pub active_batch: Option<u64>,
+    pub active_workers: u64,
     pub queue_size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchStatus {
 }
 
 #[derive(Debug)]
@@ -34,10 +39,12 @@ pub enum IngestMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreConfig {
-    #[serde(default="default_batch_limit_size")]
-    pub batch_limit_size: u64,
-    #[serde(default="default_batch_limit_seconds")]
-    pub batch_limit_seconds: u64,
+    #[serde(default="default_index_workers")]
+    pub index_workers: u64,
+    #[serde(default="default_search_workers")]
+    pub search_workers: u64,
+    #[serde(default="default_target_density")]
+    pub target_density: f64,
     #[serde(default="default_garbage_collection_interval")]
     pub garbage_collection_interval: std::time::Duration,
     #[serde(default="default_index_soft_entries_max")]
@@ -56,8 +63,9 @@ pub struct CoreConfig {
     pub task_heartbeat_interval: std::time::Duration,
 }
 
-fn default_batch_limit_seconds() -> u64 { chrono::Duration::hours(1).num_seconds() as u64 }
-fn default_batch_limit_size() -> u64 { 100 }
+fn default_target_density() -> f64 { 0.5 }
+fn default_index_workers() -> u64 { 8 }
+fn default_search_workers() -> u64 { 8 }
 fn default_garbage_collection_interval() -> std::time::Duration { std::time::Duration::from_secs(60) }
 fn default_index_soft_bytes_max() -> u64 { 50 << 30 }
 fn default_index_soft_entries_max() -> u64 { 50 << 30 }
@@ -115,6 +123,7 @@ impl HouseCore {
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
         tokio::spawn(search_watcher(core.clone(), receive_search));
         tokio::spawn(worker_watcher(core.clone()));
+        tokio::spawn(search_workers(core.clone()));
         tokio::spawn(garbage_collector(core.clone()));
 
         return Ok(core)
@@ -167,79 +176,25 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
     }
 }
 
-async fn wait_for_batch_or_ready(mut job: &mut Option<JoinHandle<()>>, instant: tokio::time::Instant) -> Result<()> {
-    match &mut job {
-        Some(task) => {
-            task.await?;
-        },
-        None => {
-            tokio::time::sleep_until(instant).await;
-        },
-    };
-    Ok(())
-}
+// async fn wait_for_batch_or_ready(mut job: &mut Option<JoinHandle<()>>, instant: tokio::time::Instant) -> Result<()> {
+//     match &mut job {
+//         Some(task) => {
+//             task.await?;
+//         },
+//         None => {
+//             tokio::time::sleep_until(instant).await;
+//         },
+//     };
+//     Ok(())
+// }
 
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
 
-    let mut pending_timers: HashMap<IndexGroup, tokio::time::Instant> = Default::default();
-    let mut pending_batch: HashMap<IndexGroup, HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>> = Default::default();
-
-    let mut current_batch: Option<JoinHandle<()>> = None;
-    let mut last_batch_size = 0;
+    let mut buffer: VecDeque<(Vec<u8>, AccessControl, IndexGroup, oneshot::Sender<Result<()>>)> = Default::default();
+    let mut active: JoinSet<()> = JoinSet::new();
 
     loop {
         debug!("Ingest loop");
-
-        // Check if its time to launch an index building job
-        if let Some(job) = &mut current_batch {
-            if job.is_finished() {
-                current_batch = None;
-            }
-        }
-
-        //
-        if current_batch.is_none() {
-            for (key, values) in pending_batch.iter() {
-                let at_size_limit = values.len() >= core.config.batch_limit_size as usize;
-                let batch_start = match pending_timers.get(key) {
-                    Some(start) => start.clone(),
-                    None => tokio::time::Instant::now(),
-                };
-                if at_size_limit || batch_start.elapsed().as_secs() > core.config.batch_limit_seconds {
-                    let key = key.clone();
-                    if let Some(values) = pending_batch.remove(&key) {
-                        let mut batch = HashMap::new();
-                        let mut remains = HashMap::new();
-                        for row in values.into_iter() {
-                            if batch.len() < core.config.batch_limit_size as usize {
-                                batch.insert(row.0, row.1);
-                            } else {
-                                remains.insert(row.0, row.1);
-                            }
-                        }
-
-                        last_batch_size = batch.len();
-                        current_batch = Some(tokio::spawn(run_batch_ingest(core.clone(), key.clone(), batch)));
-                        if !remains.is_empty() {
-                            pending_batch.insert(key, remains);
-                        } else {
-                            pending_timers.remove(&key);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        // get how long in the future the next pending batch is mature
-        let batch_ready_time = pending_timers
-            .iter()
-            .map(|(_, time)| *time + tokio::time::Duration::from_secs(core.config.batch_limit_seconds))
-            .fold(tokio::time::Instant::now() + tokio::time::Duration::from_secs(60), |a, b| a.min(b));
-
-        if current_batch.is_none() {
-            debug!("Batch ready time: {}", (batch_ready_time - tokio::time::Instant::now()).as_secs_f32());
-        }
 
         // Wait for more ingest messages
         tokio::select!{
@@ -262,291 +217,169 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         let index_group = IndexGroup::create(&expiry);
                         let today_group = IndexGroup::create(&Some(Utc::now()));
                         if index_group.as_str() <= today_group.as_str() {
-                            continue
-                        }
-
-                        // Try to update in place without changing indices
-                        debug!("Ingesting {}", hex::encode(&hash));
-                        if core.database.update_file_access(&hash, &access, &index_group).await? {
-                            debug!("Ingesting {} by updating file data", hex::encode(&hash));
                             _ = respond.send(Ok(()));
                             continue
                         }
 
-                        // Merge into the next
-                        match pending_batch.entry(index_group.clone()) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                debug!("Ingesting {} merging into index group {}", hex::encode(&hash), index_group.as_str());
-                                match entry.get_mut().entry(hash) {
-                                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                        entry.get_mut().0 = entry.get_mut().0.or(&access).simplify();
-                                        entry.get_mut().1.push(respond);
-                                    },
-                                    std::collections::hash_map::Entry::Vacant(entry) => {
-                                        entry.insert((access, vec![respond]));
-                                    },
-                                }
-                            },
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                debug!("Ingesting {} creating index group {}", hex::encode(&hash), index_group.as_str());
-                                let mut batch: HashMap<Vec<u8>, _> = Default::default();
-                                batch.insert(hash, (access, vec![respond]));
-                                entry.insert(batch);
-                                pending_timers.insert(index_group, tokio::time::Instant::now());
-                            },
+                        // Add to current running or buffer
+                        if active.len() >= core.config.index_workers as usize {
+                            buffer.push_back((hash, access, index_group, respond))
+                        } else {
+                            let core = core.clone();
+                            active.spawn(async move {
+                                match tokio::spawn(_run_ingest(core, index_group, hash, access)).await {
+                                    Ok(res) => respond.send(res),
+                                    Err(err) => respond.send(Err(anyhow::anyhow!("{err}"))),
+                                };
+                            });
                         }
                     },
                     IngestMessage::Status(response) => {
-                        let mut total = 0;
-                        for (_, buffered) in pending_batch.iter() {
-                            total += buffered.len();
-                        }
                         _ = response.send(IngestStatus {
-                            active_batch: if current_batch.is_some() {
-                                Some(last_batch_size as u64)
-                            } else {
-                                None
-                            },
-                            queue_size: total as u64
+                            active_workers: active.len() as u64,
+                            queue_size: buffer.len() as u64
                         });
                     }
                 }
             }
 
             // If the current batch finishes, or another batch should be checked
-            _ = wait_for_batch_or_ready(&mut current_batch, batch_ready_time) => {
-                debug!("Batch finish or ready");
-                continue;
+            _ = active.join_next(), if !active.is_empty() => {
+                if active.len() < core.config.index_workers as usize {
+                    if let Some((hash, access, index_group, respond)) = buffer.pop_front() {
+                        let core = core.clone();
+                        active.spawn(async move {
+                            match tokio::spawn(_run_ingest(core, index_group, hash, access)).await {
+                                Ok(res) => respond.send(res),
+                                Err(err) => respond.send(Err(anyhow::anyhow!("{err}"))),
+                            };
+                        });
+                    }
+                }
             }
         }
     }
     return Ok(())
 }
 
-async fn run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) {
-    if let Err(err) = _run_batch_ingest(core, index_group, new_items).await {
-        error!("Error building index batch: {err}");
+
+async fn _run_ingest(core: Arc<HouseCore>, index_group: IndexGroup, hash: Vec<u8>, access: AccessControl) -> Result<()> {
+    // Try to update in place without changing indices
+    debug!("Ingesting {}", hex::encode(&hash));
+    if core.database.update_file_access(&hash, &access, &index_group).await? {
+        debug!("Ingesting {} by updating file data", hex::encode(&hash));
+        return Ok(())
     }
+
+    // Collect the file and build its trigrams
+    let mut trigrams = BitVec::repeat(false, 1 << 24);
+    {
+        // Get file content
+        let label = hex::encode(&hash);
+        let mut stream = core.file_storage.stream(&label).await?;
+
+        // Read the initial block
+        let mut buffer = vec![];
+        while buffer.len() <= 2 {
+            let sub_buffer = match stream.recv().await {
+                Some(sub_buffer) => sub_buffer?,
+                None => break,
+            };
+
+            buffer.extend(sub_buffer);
+        }
+
+        // Initialize trigram
+        if buffer.len() >= 2 {
+            let mut trigram: u32 = (buffer[0] as u32) << 8 | (buffer[1] as u32);
+            let mut index_start = 2;
+
+            loop {
+                for byte in &buffer[index_start..] {
+                    trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+                    trigrams.set(trigram as usize, true);
+                }
+
+                buffer = match stream.recv().await {
+                    Some(buffer) => buffer?,
+                    None => break,
+                };
+                if buffer.is_empty() {
+                    break;
+                }
+                index_start = 0;
+            }
+        }
+    }
+
+    // Try filter configurations until we find one that matches
+    for power in bloom::START_POWER..=bloom::END_POWER {
+        let size = 1 << power;
+        let filter = SimpleFilter::build(size, &trigrams)?;
+        if power == bloom::END_POWER || filter.density() < core.config.target_density {
+            let size = core.database.insert_file(&hash, &access, &index_group, &filter).await?;
+            todo!("build hash block");
+            return Ok(());
+        }
+    }
+
+    return Ok(())
 }
 
-async fn _run_batch_ingest(core: Arc<HouseCore>, index_group: IndexGroup, mut new_items: HashMap<Vec<u8>, (AccessControl, Vec<oneshot::Sender<Result<()>>>)>) -> Result<()> {
-    debug!("Ingest {} batch {} items", index_group.as_str(), new_items.len());
-    // Check if any of our new items are already handled
-    {
-        let mut to_remove = vec![];
-        for (hash, (access, responses)) in new_items.iter_mut() {
-            if core.database.update_file_access(hash, access, &index_group).await? {
-                while let Some(res) = responses.pop() {
-                    _ = res.send(Ok(()));
-                }
-                to_remove.push(hash.clone());
-            }
-        }
-        for key in to_remove {
-            if let Some((_, respond)) = new_items.remove(&key) {
-                for resp in respond {
-                    _ = resp.send(Ok(()));
-                }
-            }
-        }
-        if new_items.is_empty() {
-            debug!("Ingest {} batch finished with updates", index_group.as_str());
-            return Ok(())
-        }
-    }
 
-    // Buildup the file data
-    debug!("Ingest {} collecting file data", index_group.as_str());
-    let files_being_ingested = new_items.len();
-    let mut data = vec![];
-    let mut meta = vec![];
-    let mut remaining_responses = vec![];
-    let mut outstanding = Vec::from_iter(new_items.keys().cloned());
-    let mut active: Vec<JoinHandle<(Vec<u8>, Result<BitVec>)>> = Vec::new();
-    while !new_items.is_empty() {
-        while !outstanding.is_empty() && active.len() < 10 {
-            if let Some(hash) = outstanding.pop(){
-                debug!("Ingest {} requesting hash {}", index_group.as_str(), hex::encode(&hash));
-                active.push(tokio::spawn(prepare_vector(core.clone(), hash)));
-            }
+async fn search_workers(core: Arc<HouseCore>){
+    let mut workers = tokio::task::JoinSet::new();
+
+    loop {
+        while workers.len() < core.config.search_workers as usize {
+            workers.spawn(_search_worker(core.clone()));
         }
 
-        let (result, _, remain) = select_all(active.into_iter()).await;
-        active = remain;
-
-        let (hash, result) = result?;
-        debug!("Ingest {} finished hash {}", index_group.as_str(), hex::encode(&hash));
-        if let Some((access, responses)) = new_items.remove(&hash) {
-            match result {
-                Ok(bits) => {
-                    data.push(bits);
-                    meta.push((hash, access));
-                    remaining_responses.extend(responses);
+        if let Some(res) = workers.join_next().await {
+            match res {
+                Ok(res) => if let Err(err) = res {
+                    error!("Error in search worker: {err}")
                 },
                 Err(err) => {
-                    error!("Error gathering file for {}: {err}", hex::encode(&hash));
-                    for res in responses {
-                        _ = res.send(Err(anyhow::format_err!("Error gathering file {err}")));
-                    }
-                }
+                    error!("Error in search worker: {err}")
+                },
             }
         }
     }
-
-    debug!("Ingest {} batch finished collecting file data.", index_group.as_str());
-
-    // Pick an index to merge into
-    let selected_index = core.database.select_index_to_grow(&index_group).await?;
-
-    // Merge into a new index file
-    match selected_index {
-        None => {
-            debug!("Ingest {} building a new index", index_group.as_str());
-            let final_size = TrigramFilter::guess_max_size(data.len());
-            let new_blob = core.database.lease_blob().await
-                .context("Leasing new blob id.")?;
-            let new_index_file = core.index_cache.open_new(new_blob.to_string(), final_size).await
-                .context("Opening a new file empty file in the cache space.")?;
-            let out_handle = new_index_file.open()
-                .context("Opening cache file to write new filter.")?;
-            debug!("Ingest {} build filter file", index_group.as_str());
-            tokio::task::spawn_blocking(move || {
-                TrigramFilter::build_from_data(out_handle, data)?;
-                anyhow::Ok(())
-            }).await??;
-
-            // Upload the new index file
-            let size = new_index_file.size_to_fit().await?;
-            debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
-            core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
-
-            // Add the new values into the database corresponding to this index
-            debug!("Ingest {} update filter database", index_group.as_str());
-            core.database.create_index_data(&index_group, new_blob, meta, size as u64).await?;
-        }
-        Some((index_id, old_blob, new_data_offset)) => {
-            debug!("Ingest {} merging into filter {} {}", index_group.as_str(), index_id.as_str(), old_blob.as_str());
-            // let data_size = core.index_storage.size(old_blob.as_str()).await?.ok_or(anyhow::anyhow!("Bad index id"))?;
-            // let index_file = core.local_cache.open(data_size).await?;
-            // let index_file_handle = index_file.open()?;
-
-            debug!("Ingest {} downloading {}", index_group.as_str(), old_blob.as_str());
-            let index_file = core.index_cache.open(old_blob.to_string()).await?;
-            let index_file_handle = index_file.open()?;
-            let old_data_size = index_file.size().await?;
-            debug!("Ingest {index_group} downloaded {old_blob} ({} bytes)", old_data_size);
-
-            debug!("Ingest {} creating local scratch space", index_group.as_str());
-            let final_size = TrigramFilter::guess_max_size(data.len()) + old_data_size;
-            let new_blob = core.database.lease_blob().await?;
-            let new_index_file = core.index_cache.open_new(new_blob.to_string(), final_size).await?;
-            let out_handle = new_index_file.open()?;
-            debug!("Ingest {} merging data into index file", index_group.as_str());
-            let _: Result<()> = tokio::task::spawn_blocking(move || {
-                TrigramFilter::merge_in_data(out_handle, index_file_handle, data, new_data_offset)?;
-                return Ok(())
-            }).await?;
-
-            // Upload the new index file
-            let size = new_index_file.size_to_fit().await?;
-            debug!("Ingest {index_group} upload new index file as {new_blob} ({size} bytes)");
-            core.index_storage.upload(new_blob.as_str(), new_index_file.path()).await?;
-
-            // Add the new values into the database corresponding to this index
-            debug!("Ingest {} update filter database", index_group.as_str());
-            core.database.update_index_data(&index_group, index_id, old_blob, new_blob, meta, new_data_offset, size as u64).await?;
-        }
-    };
-
-    info!("Ingested batch of {} files into {}", files_being_ingested, index_group.as_str());
-    for res in remaining_responses {
-        _ = res.send(Ok(()));
-    }
-    core.garbage_collection_notification.notify_one();
-    Ok(())
 }
 
-async fn prepare_vector(core: Arc<HouseCore>, hash: Vec<u8>) -> (Vec<u8>, Result<BitVec>) {
-    let label = hex::encode(&hash);
-    let stream = match core.file_storage.stream(&label).await {
-        Ok(stream) => stream,
-        Err(err) => return (hash, Err(err)),
-    };
-
-    let result = TrigramFilter::build_file(stream).await;
-
-    return (hash, result)
+async fn _search_worker(core: Arc<HouseCore>) -> Result<()> {
+    todo!()
 }
 
 
 async fn search_watcher(core: Arc<HouseCore>, mut results: mpsc::UnboundedReceiver<WorkResult>){
-
-    let mut workers: HashMap<String, mpsc::UnboundedSender<WorkResult>> = Default::default();
-
     loop {
-        workers.retain(|_, sender|!sender.is_closed());
 
-        let message = match results.recv().await {
-            Some(result) => result,
-            None => return,
-        };
+        let result = tokio::spawn(async move {
+            loop {
+                // workers.retain(|_, sender|!sender.is_closed());
 
-        let message = if let Some(sock) = workers.get(&message.search) {
-            match sock.send(message) {
-                Ok(()) => continue,
-                Err(err) => err.0,
+                let message = match results.recv().await {
+                    Some(result) => result,
+                    None => return Ok(()),
+                };
+                core.database.finish_yara_work(message.id, &message.search, message.yara_hits).await?;
             }
-        } else {
-            message
-        };
+        });
 
-        let (send, recv) = mpsc::unbounded_channel();
-        let search = message.search.clone();
-        _ = send.send(message);
-        workers.insert(search.clone(), send);
-        tokio::spawn(single_search_watcher(core.clone(), search, recv));
-    }
-}
-
-async fn single_search_watcher(core: Arc<HouseCore>, code: String, results: mpsc::UnboundedReceiver<WorkResult>){
-    if let Err(err) = _single_search_watcher(core, code, results).await {
-        error!("{err}");
-    }
-}
-
-pub struct SearchCache {
-    pub seen: HashSet<Vec<u8>>,
-    pub access: Option<HashSet<String>>,
-}
-
-async fn _single_search_watcher(core: Arc<HouseCore>, code: String, mut messages: mpsc::UnboundedReceiver<WorkResult>) -> Result<()> {
-
-    let mut cache = SearchCache{
-        seen: Default::default(),
-        access: None
-    };
-
-    loop {
-        tokio::select! {
-            results = messages.recv() => {
-                let results = match results {
-                    Some(results) => results,
-                    None => break,
-                };
-
-                match results.value {
-                    WorkResultValue::Filter(index, _blob, file_ids) => {
-                        core.database.finish_filter_work(results.id, &code, &mut cache, index, file_ids).await?;
-                    }
-                    WorkResultValue::Yara(files) => {
-                        core.database.finish_yara_work(results.id, &results.search, files).await?;
-                    }
-                };
+        match result.await {
+            Ok(res) => match res {
+                Ok(()) => return,
+                Err(err) => {
+                    error!("Error handling worker results: {err}")
+                }
             },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            Err(err) => {
+                error!("Error handling worker results: {err}")
+            }
         }
     }
-    return Ok(())
 }
 
 

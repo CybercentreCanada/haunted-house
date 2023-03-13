@@ -33,7 +33,7 @@ rand = "0.8"
 
 log = "*"
 env_logger = "0.9"
-bitvec = "*"
+bitvec = { version = "*", features = ["serde"] }
 hex = "*"
 sha2 = "*"
 itertools = "*"

@@ -14,6 +14,7 @@ mod ursadb;
 mod varint;
 mod blob_cache;
 mod worker;
+mod bloom;
 mod worker_watcher;
 
 use std::path::PathBuf;

@@ -16,8 +16,6 @@ RUN test -f "/out/release/haunted-house"
 FROM debian:bullseye-slim
 
 # Get required apt packages
-# RUN apt-get update && apt-get install -yy libssl1.1 && rm -rf /var/lib/apt/lists/*
-# (Already installed on this base image)
 RUN apt-get update && apt-get install -yy ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # lock root

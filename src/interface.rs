@@ -24,8 +24,8 @@ use tokio::task::JoinSet;
 use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::config::TLSConfig;
-use crate::core::{HouseCore, IngestStatus};
-use crate::database::{BlobID, IndexID, IndexGroup};
+use crate::core::{HouseCore, IngestStatus, SearchStatus};
+use crate::database::{IndexGroup, SearchStage};
 use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -259,11 +259,10 @@ pub struct InternalSearchStatus {
 pub struct SearchRequestResponse {
     pub code: String,
     pub group: String,
-    pub finished: bool,
+    pub stage: SearchStage,
     pub errors: Vec<String>,
-    pub total_indices: u64,
-    pub pending_indices: u64,
-    pub pending_candidates: u64,
+    pub suspect_files: u64,
+    pub pending_files: u64,
     pub hits: Vec<String>,
     pub truncated: bool,
 }
@@ -325,15 +324,6 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
 
 
 #[derive(Serialize, Deserialize)]
-pub struct FilterTask {
-    pub id: i64,
-    pub search: String,
-    pub filter_id: IndexID,
-    pub filter_blob: BlobID,
-    pub query: Query,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct YaraTask {
     pub id: i64,
     pub search: String,
@@ -343,20 +333,18 @@ pub struct YaraTask {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct WorkPackage {
-    pub filter: Vec<FilterTask>,
     pub yara: Vec<YaraTask>
 }
 
 impl WorkPackage {
     pub fn is_empty(&self) -> bool {
-        self.filter.is_empty() && self.yara.is_empty()
+        self.yara.is_empty()
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct WorkRequest {
     pub worker: String,
-    pub cached_filters: HashSet<BlobID>
 }
 
 #[handler]
@@ -365,16 +353,10 @@ async fn get_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<W
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum WorkResultValue {
-    Filter(IndexID, BlobID, Vec<u64>),
-    Yara(Vec<Vec<u8>>),
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct WorkResult {
     pub id: i64,
     pub search: String,
-    pub value: WorkResultValue
+    pub yara_hits: Vec<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -539,8 +521,7 @@ async fn get_status() -> Result<()> {
 #[derive(Serialize, Deserialize)]
 struct StatusReport {
     ingest: IngestStatus,
-    active_filters: Vec<(IndexGroup, IndexID)>,
-    file_counts: Vec<(IndexGroup, u64)>,
+    search: SearchStatus,
 }
 
 #[handler]
