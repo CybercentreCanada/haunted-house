@@ -4,6 +4,7 @@ use std::path::{PathBuf};
 use std::sync::{Arc};
 
 use anyhow::{Result, Context};
+use aws_sdk_s3::types::ByteStream;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use futures::StreamExt;
@@ -16,6 +17,7 @@ use pyo3::{Python, PyAny, Py, FromPyObject};
 use pyo3::types::{PyTuple, PyBytes};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 
@@ -23,7 +25,8 @@ use tokio::sync::mpsc;
 pub enum BlobStorageConfig {
     TempDir{size: u64},
     Directory {path: PathBuf, size: u64},
-    Azure (AzureBlobConfig)
+    Azure (AzureBlobConfig),
+    S3(S3Config),
 }
 
 impl Default for BlobStorageConfig {
@@ -87,6 +90,8 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
         },
         BlobStorageConfig::Azure(azure) =>
             Ok(BlobStorage::Azure(AzureBlobStore::new(azure).await?)),
+        BlobStorageConfig::S3(config) =>
+            Ok(BlobStorage::S3(S3BlobStore::new(config).await?)),
     }
 }
 
@@ -95,7 +100,8 @@ pub enum BlobStorage {
     Local(LocalDirectory),
     #[cfg(feature = "python")]
     Python(PythonBlobStore),
-    Azure(AzureBlobStore)
+    Azure(AzureBlobStore),
+    S3(S3BlobStore),
 }
 
 impl BlobStorage {
@@ -105,6 +111,7 @@ impl BlobStorage {
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.size(label).await,
             BlobStorage::Azure(obj) => obj.size(label).await,
+            BlobStorage::S3(obj) => obj.size(label).await,
         }
     }
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
@@ -113,6 +120,7 @@ impl BlobStorage {
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.stream(label).await,
             BlobStorage::Azure(obj) => obj.stream(label).await,
+            BlobStorage::S3(obj) => obj.stream(label).await,
         }
     }
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
@@ -121,6 +129,7 @@ impl BlobStorage {
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.download(label, path).await,
             BlobStorage::Azure(obj) => obj.download(label, path).await,
+            BlobStorage::S3(obj) => obj.download(label, path).await,
         }
     }
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
@@ -129,22 +138,27 @@ impl BlobStorage {
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.upload(label, path).await,
             BlobStorage::Azure(obj) => obj.upload(label, path).await,
+            BlobStorage::S3(obj) => obj.upload(label, path).await,
         }
     }
+    #[cfg(test)]
     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.put(label, &data).await,
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.put(label, &data).await,
             BlobStorage::Azure(obj) => obj.put(label, data).await,
+            BlobStorage::S3(obj) => obj.put(label, data).await,
         }
     }
+    #[cfg(test)]
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
         match self {
             BlobStorage::Local(obj) => obj.get(label).await,
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.get(label).await,
             BlobStorage::Azure(obj) => obj.get(label).await,
+            BlobStorage::S3(obj) => obj.get(label).await,
         }
     }
     pub async fn delete(&self, label: &str) -> Result<()> {
@@ -153,6 +167,7 @@ impl BlobStorage {
             #[cfg(feature = "python")]
             BlobStorage::Python(obj) => obj.delete(label).await,
             BlobStorage::Azure(obj) => obj.delete(label).await,
+            BlobStorage::S3(obj) => obj.delete(label).await,
         }
     }
 }
@@ -247,13 +262,13 @@ impl LocalDirectory {
         tokio::fs::copy(source, dest).await?;
         return Ok(())
     }
-
+    #[cfg(test)]
     async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
         let dest = self.get_path(&label);
         tokio::fs::write(dest, data).await?;
         return Ok(())
     }
-
+    #[cfg(test)]
     async fn get(&self, label: &str) -> Result<Vec<u8>> {
         let path = self.get_path(&label);
         Ok(tokio::fs::read(path).await?)
@@ -482,7 +497,7 @@ impl std::io::Read for PythonStream {
 
 #[derive(Clone)]
 pub struct AzureBlobStore {
-    config: AzureBlobConfig,
+    // config: AzureBlobConfig,
     http_client: reqwest::Client,
     client: ContainerClient,
 }
@@ -534,7 +549,7 @@ impl AzureBlobStore {
         }
         let http_client = reqwest::ClientBuilder::new().build()?;
 
-        Ok(Self{ config, http_client, client })
+        Ok(Self{ http_client, client })
     }
 
     fn get_container_client(config: &AzureBlobConfig) -> Result<ContainerClient> {
@@ -651,12 +666,14 @@ impl AzureBlobStore {
         return Ok(())
     }
 
+    #[cfg(test)]
     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         let client = self.client.blob_client(label);
         client.put_block_blob(data).await?;
         return Ok(())
     }
 
+    #[cfg(test)]
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
         let client = self.client.blob_client(label);
         Ok(client.get_content().await?)
@@ -687,12 +704,224 @@ impl AzureBlobStore {
     }
 }
 
+#[derive(Clone)]
+pub struct S3BlobStore {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    // region_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    endpoint_url: Option<String>,
+    region_name: String,
+    bucket: String,
+    #[serde(default)]
+    no_tls_verify: bool,
+}
+
+pub struct NoCertificateVerification {}
+
+impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+impl S3BlobStore {
+    async fn new(config: S3Config) -> Result<Self> {
+        // Ok(S3BlobStore { client: bucket })
+        let mut loader = aws_config::from_env();
+
+        // Override the region
+        loader = loader.region(aws_types::region::Region::new(config.region_name));
+
+        // configure endpoint
+        if let Some(endpoint_url) = config.endpoint_url {
+            loader = loader.endpoint_url(endpoint_url);
+        }
+
+        // Configure keys
+        if let Some(key) = config.access_key_id {
+            std::env::set_var("AWS_ACCESS_KEY_ID", key)
+        }
+        if let Some(secret) = config.secret_access_key {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", secret)
+        }
+
+        // Configure the use of ssl
+        loader = loader.http_connector({
+
+            let https_connector = if config.no_tls_verify {
+                let root_store = rustls::RootCertStore::empty();
+                let mut tls_config = rustls::ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+                tls_config
+                    .dangerous()
+                    .set_certificate_verifier(Arc::new(NoCertificateVerification {}));
+
+                hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_tls_config(tls_config)
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .build()
+            } else {
+                hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_native_roots()
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .build()
+            };
+
+            aws_smithy_client::hyper_ext::Adapter::builder()
+                .build(https_connector)
+        });
+
+        // Build the client
+        let sdk_config = loader.load().await;
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(true)
+            .build();
+
+        let client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        if let Err(err) = client.head_bucket().bucket(&config.bucket).send().await {
+            let err = err.into_service_error();
+            if err.is_not_found() {
+                client.create_bucket().bucket(&config.bucket).send().await?;
+            }
+        }
+
+        Ok(S3BlobStore {
+            client,
+            bucket: config.bucket,
+        })
+    }
+
+    pub async fn size(&self, label: &str) -> Result<Option<u64>> {
+        let request = self.client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(label)
+            .send().await;
+
+        let res = match request {
+            Ok(res) => res,
+            Err(err) => {
+                let err = err.into_service_error();
+                if err.is_not_found() {
+                    return Ok(None)
+                }
+                return Err(err.into())
+            },
+        };
+
+        return Ok(Some(res.content_length() as u64))
+    }
+
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+        let mut request = self.client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(label)
+            .send().await?;
+
+        let (send, recv) = mpsc::channel(64);
+        tokio::spawn(async move {
+            // let mut chunks = request.body.chunks(1 << 20);
+            while let Some(buffer) = request.body.next().await {
+                _ = match buffer {
+                    Ok(data) => send.send(Ok(data.to_vec())).await,
+                    Err(err) => send.send(Err(err.into())).await,
+                };
+            }
+        });
+
+        return Ok(recv)
+    }
+
+    pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
+        let mut request = self.client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(label)
+            .send().await?;
+
+        let mut out = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+        while let Some(buffer) = request.body.next().await {
+            out.write_all(&buffer?).await?;
+        }
+        out.flush().await?;
+        return Ok(())
+    }
+
+    pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
+        self.client
+            .put_object()
+            .content_type("application/octet-stream")
+            .bucket(&self.bucket)
+            .key(label)
+            .body(ByteStream::from_path(path).await?)
+            .send().await?;
+        return Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
+        self.client
+            .put_object()
+            .content_type("application/octet-stream")
+            .content_length(data.len() as i64)
+            .bucket(&self.bucket)
+            .key(label)
+            .body(data.into())
+            .send().await?;
+        return Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
+        let request = self.client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(label)
+            .send().await?;
+        let bytes = request.body.collect().await?;
+        return Ok(bytes.to_vec())
+    }
+
+    pub async fn delete(&self, label: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(label)
+            .send().await?;
+        Ok(())
+    }
+}
+
 
 #[cfg(test)]
 mod test {
     use std::io::Write;
 
     use crate::storage::{AzureBlobStore, AzureBlobConfig};
+
+    use super::S3BlobStore;
 
     async fn connect() -> AzureBlobStore {
         AzureBlobStore::new(AzureBlobConfig{
@@ -704,7 +933,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn get_put_size() {
+    async fn azure_get_put_size() {
         let store = connect().await;
 
         let body = b"a body".repeat(10);
@@ -716,7 +945,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn delete_file() {
+    async fn azure_delete_file() {
         let store = connect().await;
         let body = b"a body".repeat(10);
 
@@ -734,7 +963,7 @@ mod test {
 
 
     #[tokio::test]
-    async fn stream() {
+    async fn azure_stream() {
         let store = connect().await;
 
         let body = b"a body".repeat(10);
@@ -755,7 +984,7 @@ mod test {
 
 
     #[tokio::test]
-    async fn upload_download() {
+    async fn azure_upload_download() {
         let store = connect().await;
 
         for _ in 0 .. 3 {
@@ -765,8 +994,8 @@ mod test {
                 for _ in 0..100 {
                     assert_eq!(handle.write(&(b"123".repeat(100))).unwrap(), 300);
                 }
-                println!("file length {}", handle.metadata().unwrap().len());
                 handle.flush().unwrap();
+                assert_eq!(30000, handle.metadata().unwrap().len());
             }
             store.upload("label", input_file.path().to_owned()).await.unwrap();
             assert_eq!(store.size("label").await.unwrap().unwrap(), 3 * 100 * 100);
@@ -775,6 +1004,96 @@ mod test {
             store.download("label", output_file.path().to_owned()).await.unwrap();
 
             assert_eq!(std::fs::read(input_file.path()).unwrap(), std::fs::read(output_file.path()).unwrap())
+        }
+
+        assert!(store.upload("Not a file", std::path::PathBuf::from("/not-a-file")).await.is_err());
+        let output_file = tempfile::NamedTempFile::new().unwrap();
+        assert!(store.download("Not a file", output_file.path().to_owned()).await.is_err());
+    }
+
+    async fn s3_connect() -> S3BlobStore {
+        S3BlobStore::new(super::S3Config {
+            access_key_id: Some("al_storage_key".to_owned()),
+            secret_access_key: Some("Ch@ngeTh!sPa33w0rd".to_owned()),
+            endpoint_url: Some("http://localhost:9000".to_owned()),
+            region_name: "west".to_owned(),
+            bucket: "test".to_owned(),
+            no_tls_verify: true
+        }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn s3_get_put_size() {
+        let store = s3_connect().await;
+
+        let body = b"a body".repeat(10);
+        assert!(store.size("not-a-blob").await.unwrap().is_none());
+        store.put("get-put-size-test", body.clone()).await.unwrap();
+        assert_eq!(store.size("get-put-size-test").await.unwrap().unwrap(), 60);
+        assert_eq!(store.get("get-put-size-test").await.unwrap(), body);
+
+    }
+
+    #[tokio::test]
+    async fn s3_delete_file() {
+        let store = s3_connect().await;
+        let body = b"a body".repeat(10);
+
+        store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
+        store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
+        store.put("delete-file-test", body.clone()).await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_some());
+        store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
+        store.delete("delete-file-test").await.unwrap();
+        assert!(store.size("delete-file-test").await.unwrap().is_none());
+    }
+
+
+    #[tokio::test]
+    async fn s3_azure_stream() {
+        let store = s3_connect().await;
+
+        let body = b"a body".repeat(10);
+        store.put("stream-test", body.clone()).await.unwrap();
+
+        let mut data_stream = store.stream("stream-test").await.unwrap();
+        let mut buff = vec![];
+        while let Some(data) = data_stream.recv().await {
+            buff.extend(data.unwrap());
+        }
+        assert_eq!(buff, body);
+
+        assert!(store.stream("Not a file").await.is_err());
+    }
+
+
+    #[tokio::test]
+    async fn s3_upload_download() {
+        let store = s3_connect().await;
+
+        for _ in 0 .. 3 {
+            let input_file = tempfile::NamedTempFile::new().unwrap();
+            {
+                let mut handle = input_file.as_file();
+                for _ in 0..100 {
+                    assert_eq!(handle.write(&(b"123".repeat(100))).unwrap(), 300);
+                }
+                handle.flush().unwrap();
+                assert_eq!(30000, handle.metadata().unwrap().len());
+            }
+            store.upload("upload-download-label", input_file.path().to_owned()).await.unwrap();
+            assert_eq!(store.size("upload-download-label").await.unwrap().unwrap(), 3 * 100 * 100);
+
+            let output_file = tempfile::NamedTempFile::new().unwrap();
+            store.download("upload-download-label", output_file.path().to_owned()).await.unwrap();
+
+            let expected = std::fs::read(input_file.path()).unwrap();
+            let output = std::fs::read(output_file.path()).unwrap();
+            assert_eq!(expected.len(), output.len());
+            assert_eq!(expected, output)
         }
 
         assert!(store.upload("Not a file", std::path::PathBuf::from("/not-a-file")).await.is_err());

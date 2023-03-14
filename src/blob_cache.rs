@@ -556,6 +556,7 @@ mod test {
         // Add some data
         let id = uuid::Uuid::new_v4().to_string();
         storage.put(id.as_str(), data.clone()).await.unwrap();
+        assert_eq!(storage.get(id.as_str()).await.unwrap(), data);
 
         {
             let handle = cache.open(id.clone()).await.unwrap();
