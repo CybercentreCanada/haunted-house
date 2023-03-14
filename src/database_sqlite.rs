@@ -204,6 +204,7 @@ impl SQLiteInterface {
 
         sqlx::query(&format!("create table if not exists {filter_table} (
             id INTEGER PRIMARY KEY,
+            leaves BOOLEAN,
             group INTEGER,
             filter BLOB NOT NULL,
             kind TEXT NOT NULL,
@@ -287,29 +288,64 @@ impl SQLiteInterface {
         return Ok(false)
     }
 
-    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<i64> {
+    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<()> {
         // Setup tables to insert to
         self.setup_filter_table(index_group).await?;
         let mut conn = self.db.acquire().await?;
         let file_table = file_table_name(index_group);
 
         // Insert to the file table
-        sqlx::query(&format!("INSERT INTO {file_table}(hash, access, group, filter, kind) VALUES(?, ?, NULL, ?, ?)"))
-            .bind(hash)
-            .bind(&postcard::to_allocvec(&access)?)
-            .bind(filter.as_bytes())
-            .bind(filter.kind())
-            .execute(&mut conn).await?;
+        // sqlx::query(&format!("INSERT INTO {file_table}(hash, access, group, filter, kind) VALUES(?, ?, NULL, ?, ?)"))
+        //     .bind(hash)
+        //     .bind(&postcard::to_allocvec(&access)?)
+        //     .bind(filter.as_bytes())
+        //     .bind(filter.kind())
+        //     .execute(&mut conn).await?;
 
         // Check if its time to add a group
-        let (count, ): (i64, ) = query_as(&format!("
-            SELECT COUNT(*) FROM {file_table}
-            WHERE kind = ? AND group IS NULL"))
-            .bind(filter.kind())
-            .fetch_one(&mut conn).await?;
+        // let (count, ): (i64, ) = query_as(&format!("
+        //     SELECT COUNT(*) FROM {file_table}
+        //     WHERE kind = ? AND group IS NULL"))
+        //     .bind(filter.kind())
+        //     .fetch_one(&mut conn).await?;
 
         return Ok(count)
     }
+
+    async fn _find_root(&self, index_group: &IndexGroup, kind: &str) -> Result<(i64, bool, SimpleFilter)> {
+        let filter_table = filter_table_name(index_group);
+        let mut trans = self.db.begin().await?;
+
+        // Load the root group
+        let row: Option<(i64, bool, Vec<u8>)> = query_as(&format!("
+            SELECT id, leaves, filter FROM {filter_table}
+            WHERE kind = ? AND group IS NULL"))
+            .bind(kind)
+            .fetch_optional(&mut trans).await?;
+
+        // Try to atomically create it
+        match row {
+            Some((id, leaves, data)) => {
+                Ok((id, leaves, SimpleFilter::load(kind, data)))
+            },
+            None => {
+
+            },
+        }
+    }
+
+    async fn _find_insert_group(&self, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<Vec<(i64, bool, SimpleFilter)>> {
+        todo!()
+    }
+
+    async fn _expand_filters(&self, index_group: &IndexGroup, filter: &SimpleFilter, stack: Vec<(i64, SimpleFilter)>) -> Result<bool> {
+        todo!()
+    }
+
+    async fn _split_group(&self, group: i64) -> Result<bool> {
+        todo!()
+    }
+
 
 
 //     pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, u64)>> {
