@@ -1,17 +1,17 @@
-use std::collections::{BTreeSet, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashSet, HashMap};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
-use futures::{TryStreamExt};
-use log::{debug, info};
+use log::{debug, info, error, warn};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, query_as, Decode, Acquire, Row, Transaction, Sqlite};
+use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite};
 use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
 use crate::bloom::SimpleFilter;
-use crate::core::{SearchCache, CoreConfig};
-use crate::database::{IndexGroup, SearchStage};
+use crate::core::{CoreConfig};
+use crate::database::{IndexGroup, SearchStage, IndexStatus};
 use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, YaraTask, WorkError};
 use crate::query::Query;
 
@@ -60,6 +60,7 @@ pub struct SQLiteInterface {
     config: CoreConfig,
     work_notification: tokio::sync::Notify,
     _temp_dir: Option<tempfile::TempDir>,
+    cant_split: std::sync::Mutex<std::cell::RefCell<HashSet<i64>>>,
 }
 
 // #[derive(Serialize, Deserialize, Clone)]
@@ -108,8 +109,11 @@ struct SearchRecord {
     suspect_files: u64,
     hit_files: BTreeSet<Vec<u8>>,
     truncated: bool,
+    start: IndexGroup,
+    end: IndexGroup,
 }
 
+const GROUP_SIZE: usize = 128;
 
 impl SQLiteInterface {
     pub async fn new(config: CoreConfig, url: &str) -> Result<Self> {
@@ -144,6 +148,7 @@ impl SQLiteInterface {
             config,
             work_notification: Default::default(),
             _temp_dir: None,
+            cant_split: std::sync::Mutex::new(RefCell::new(Default::default()))
         })
     }
 
@@ -205,26 +210,26 @@ impl SQLiteInterface {
         sqlx::query(&format!("create table if not exists {filter_table} (
             id INTEGER PRIMARY KEY,
             leaves BOOLEAN,
-            group INTEGER,
+            block INTEGER,
             filter BLOB NOT NULL,
             kind TEXT NOT NULL,
-            FOREIGN KEY(group) REFERENCES {filter_table}(id)
-        )")).execute(&mut trans).await?;
+            FOREIGN KEY(block) REFERENCES {filter_table}(id)
+        )")).execute(&mut trans).await.context("Create filter table")?;
 
         sqlx::query(&format!("create table if not exists {file_table} (
             hash BLOB PRIMARY KEY,
             access BLOB NOT NULL,
-            group INTEGER,
+            block INTEGER NOT NULL,
             filter BLOB NOT NULL,
             kind TEXT NOT NULL,
-            FOREIGN KEY(group) REFERENCES {filter_table}(id)
-        )")).execute(&mut trans).await?;
+            FOREIGN KEY(block) REFERENCES {filter_table}(id)
+        )")).execute(&mut trans).await.context("Create file table")?;
 
         trans.commit().await?;
         return Ok(())
     }
 
-    async fn get_indices(&self) -> Result<Vec<IndexGroup>> {
+    async fn list_indices(&self) -> Result<Vec<IndexGroup>> {
         // Get tables
         let tables: Vec<(String, )> = sqlx::query_as("SELECT name FROM sqlite_schema WHERE type='table'")
             .fetch_all(&self.db).await?;
@@ -246,27 +251,58 @@ impl SQLiteInterface {
         return Ok(groups)
     }
 
+    pub async fn status(&self) -> Result<IndexStatus> {
+        let tables = self.list_indices().await?;
+        let mut conn = self.db.acquire().await?;
+
+        let mut sizes: HashMap<String, u64> = Default::default();
+        let mut kinds: HashMap<String, u64> = Default::default();
+
+        for group in tables {
+            let file_table = file_table_name(&group);
+            // let (count, ): (i64, ) = sqlx::query_as(&format!(
+            //     "SELECT COUNT(1) FROM {file_table}"))
+            //     .fetch_one(&mut conn).await?;
+            // sizes.insert(group.to_string(), count as u64);
+
+            let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+                "SELECT kind, COUNT(1) FROM {file_table} GROUP BY kind"))
+                .fetch_all(&mut conn).await?;
+
+            for (kind, size) in rows {
+                sizes.insert(group.to_string(), *sizes.get(&group.to_string()).unwrap_or(&0) + size as u64);
+                kinds.insert(kind.to_string(), *kinds.get(&kind.to_string()).unwrap_or(&0) + size as u64);
+            }
+        }
+
+        Ok(IndexStatus{
+            group_files: sizes,
+            filter_sizes: kinds
+        })
+    }
+
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, new_index_group: &IndexGroup) -> Result<bool> {
         let mut conn = self.db.acquire().await?;
 
         // Get all the groups that expire later than this one
-        let indices = self.get_indices().await?;
-        let indices: Vec<IndexGroup> = indices.into_iter()
+        let indices = self.list_indices().await?;
+        let mut indices: Vec<IndexGroup> = indices.into_iter()
             .filter(|index| index >= new_index_group)
             .collect();
+        indices.sort_unstable();
 
-        for group in indices {
+        while let Some(group) = indices.pop() {
             let file_table = file_table_name(&group);
 
             loop {
                 // Fetch current data
-                let item: Option<(Vec<u8>, )> = sqlx::query_as(&format!(
+                let item: Option<(String, )> = sqlx::query_as(&format!(
                     "SELECT access FROM {file_table} WHERE hash = ? LIMIT 1"))
                     .bind(hash).fetch_optional(&mut conn).await?;
 
                 // Update entry
-                let (old_access, old_buffer): (AccessControl, Vec<u8>) = match item {
-                    Some(item) => (postcard::from_bytes(&item.0)?, item.0),
+                let (old_access, old_buffer): (AccessControl, String) = match item {
+                    Some(item) => (item.0.parse()?, item.0),
                     None => break,
                 };
                 let new_access = old_access.or(access).simplify();
@@ -277,7 +313,7 @@ impl SQLiteInterface {
                 // Apply update
                 let res = sqlx::query(&format!(
                     "UPDATE {file_table} SET access = ? WHERE hash = ? AND access = ?"))
-                    .bind(&postcard::to_allocvec(&new_access)?).bind(hash).bind(old_buffer)
+                    .bind(new_access.to_string()).bind(hash).bind(old_buffer)
                     .execute(&mut conn).await?;
                 if res.rows_affected() > 0 {
                     return Ok(true)
@@ -290,63 +326,444 @@ impl SQLiteInterface {
 
     pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<()> {
         // Setup tables to insert to
-        self.setup_filter_table(index_group).await?;
+        self.setup_filter_table(index_group).await.context("setup_filter_table")?;
         let mut conn = self.db.acquire().await?;
         let file_table = file_table_name(index_group);
 
-        // Insert to the file table
-        // sqlx::query(&format!("INSERT INTO {file_table}(hash, access, group, filter, kind) VALUES(?, ?, NULL, ?, ?)"))
-        //     .bind(hash)
-        //     .bind(&postcard::to_allocvec(&access)?)
-        //     .bind(filter.as_bytes())
-        //     .bind(filter.kind())
-        //     .execute(&mut conn).await?;
+        let mut stack = loop {
+            // Get the stack down to the group we want to insert into
+            let stack = self._find_insert_group(&mut conn, index_group, filter).await.context("_find_insert_group")?;
 
-        // Check if its time to add a group
-        // let (count, ): (i64, ) = query_as(&format!("
-        //     SELECT COUNT(*) FROM {file_table}
-        //     WHERE kind = ? AND group IS NULL"))
-        //     .bind(filter.kind())
-        //     .fetch_one(&mut conn).await?;
+            // Expand the items in the stack down to the insertion point
+            if !self._expand_filters(&mut conn, index_group, filter, &stack).await.context("expand_filters")? {
+                continue
+            }
 
-        return Ok(count)
+            // Insert file entry
+            let result = sqlx::query(&format!("INSERT INTO {file_table}(hash, access, block, filter, kind) VALUES(?, ?, ?, ?, ?)"))
+                .bind(hash)
+                .bind(access.to_string())
+                .bind(stack.last().unwrap().0)
+                .bind(filter.to_buffer()?)
+                .bind(filter.kind())
+                .execute(&mut conn).await;
+            match result {
+                Ok(_) => break stack,
+                Err(err) => {
+                    error!("Could not insert file: {err}");
+                },
+            };
+        };
+
+        // Check each group (bottom up) to see if it needs to be split
+        while let Some((group_id, leaf, mask)) = stack.pop() {
+            if leaf {
+                let count = self._count_files_in_group(&mut conn, index_group, group_id).await?;
+                if count > GROUP_SIZE {
+                    self._split_leaf_group(&mut conn, index_group, group_id).await?;
+                }
+            } else {
+                let count = self._count_groups_in_group(&mut conn, index_group, group_id).await?;
+                if count > GROUP_SIZE {
+                    self._split_inner_group(&mut conn, index_group, group_id).await?;
+                }
+            }
+        }
+        return Ok(())
     }
 
-    async fn _find_root(&self, index_group: &IndexGroup, kind: &str) -> Result<(i64, bool, SimpleFilter)> {
+    async fn _find_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<Vec<(i64, bool, SimpleFilter)>> {
         let filter_table = filter_table_name(index_group);
-        let mut trans = self.db.begin().await?;
 
         // Load the root group
-        let row: Option<(i64, bool, Vec<u8>)> = query_as(&format!("
-            SELECT id, leaves, filter FROM {filter_table}
-            WHERE kind = ? AND group IS NULL"))
-            .bind(kind)
-            .fetch_optional(&mut trans).await?;
+        let mut rows: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
+            SELECT id, leaves, kind, filter FROM {filter_table}
+            WHERE kind = ? AND block IS NULL"))
+            .bind(filter.kind())
+            .fetch_all(&mut *conn).await?;
 
         // Try to atomically create it
-        match row {
-            Some((id, leaves, data)) => {
-                Ok((id, leaves, SimpleFilter::load(kind, data)))
-            },
-            None => {
+        if rows.is_empty() {
+            sqlx::query(&format!("INSERT INTO {filter_table}(leaves, block, filter, kind) VALUES(TRUE, NULL, ?, ?)"))
+                .bind(filter.to_buffer()?)
+                .bind(filter.kind())
+                .execute(&mut *conn).await?;
 
-            },
+            rows = query_as(&format!("
+            SELECT id, leaves, kind, filter FROM {filter_table}
+            WHERE kind = ? AND block IS NULL"))
+            .bind(filter.kind())
+            .fetch_all(&mut *conn).await?;
+        }
+
+        let mut output = vec![];
+        for (id, leaves, kind, filter) in rows {
+            let filter = match SimpleFilter::load(&kind, &filter) {
+                Ok(filter) => filter,
+                Err(err) => {
+                    error!("Couldn't load filter {id}: {err}");
+                    continue
+                },
+            };
+            output.push((id, leaves, filter))
+        }
+        Ok(output)
+    }
+
+    fn _pick_best(target: &SimpleFilter, options: &Vec<&SimpleFilter>) -> Result<usize> {
+        let mut best = 0;
+        let mut best_score = 0;
+        for (index, other) in options.iter().enumerate() {
+            let score = target.overlap(other)?.data.count_zeros();
+            if score > best_score {
+                best = index;
+                best_score = score;
+            }
+        }
+        Ok(best)
+    }
+
+    async fn _find_insert_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<Vec<(i64, bool, SimpleFilter)>> {
+        let mut group_stack: Vec<(i64, bool, SimpleFilter)> = vec![{
+            // Get the root groups
+            let mut roots = self._find_roots(&mut *conn, index_group, filter).await?;
+            assert!(!roots.is_empty());
+
+            // Select the best of the root groups
+            let index = Self::_pick_best(filter, &roots.iter().map(|r|&r.2).collect())?;
+            roots.swap_remove(index)
+        }];
+
+        while !group_stack.last().unwrap().1 {
+            // Get the subgroups of this group
+            let mut subgroups = self._load_groups_in_group(&mut *conn, index_group, group_stack.last().unwrap().0).await?;
+            assert!(!subgroups.is_empty());
+
+            // select the best of the subgroups
+            let index = Self::_pick_best(filter, &subgroups.iter().map(|r|&r.2).collect())?;
+            group_stack.push(subgroups.swap_remove(index));
+        }
+        return Ok(group_stack)
+    }
+
+    async fn _expand_filters(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &SimpleFilter, stack: &Vec<(i64, bool, SimpleFilter)>) -> Result<bool> {
+        let filter_table = filter_table_name(index_group);
+        for (group_id, _, old_filter) in stack {
+            // calculate the new filter for this group
+            let new = filter.overlap(old_filter)?;
+
+            // Try to swap it in
+            let result = sqlx::query(&format!("
+                UPDATE {filter_table} SET filter = ?
+                WHERE id = ? AND filter = ?"))
+            .bind(new.to_buffer()?)
+            .bind(group_id)
+            .bind(old_filter.to_buffer()?)
+            .execute(&mut *conn).await?;
+
+            // if we could insert it, continue to the next
+            // if we failed abort and restart the insertion process
+            if result.rows_affected() == 0 {
+                return Ok(false)
+            }
+        }
+        return Ok(true)
+    }
+
+    async fn _count_files_in_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<usize> {
+        let file_table = file_table_name(&index_group);
+        let (count, ) : (i64, ) = query_as(&format!("
+            SELECT count(*) FROM {file_table}
+            WHERE block = ?"))
+            .bind(group)
+            .fetch_one(&mut *conn).await?;
+        return Ok(count as usize)
+    }
+
+    async fn _count_groups_in_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<usize> {
+        let filter_table = filter_table_name(&index_group);
+        let (count, ) : (i64, ) = query_as(&format!("
+            SELECT count(*) FROM {filter_table}
+            WHERE block = ?"))
+            .bind(group)
+            .fetch_one(&mut *conn).await?;
+        return Ok(count as usize)
+    }
+
+    async fn _split_leaf_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<bool> {
+        if let Ok(mut table) = self.cant_split.lock() {
+            let table = table.get_mut();
+            if table.contains(&group) {
+                return Ok(false)
+            }
+        }
+
+        loop {
+            let mut trans = conn.begin().await?;
+            let filter_table = filter_table_name(&index_group);
+            let file_table = file_table_name(&index_group);
+
+            // Get the group info
+            let query = query_as(&format!("
+                SELECT block, kind FROM {filter_table}
+                WHERE id = ?"))
+                .bind(group)
+                .fetch_optional(&mut trans).await?;
+            let (parent, kind): (Option<i64>, String) = match query {
+                Some(row) => row,
+                None => return Ok(false),
+            };
+
+            // Load all the files in the group
+            let items = self._load_files_in_group(&mut trans, index_group, group).await?;
+            if items.len() < GROUP_SIZE {
+                return Ok(false)
+            }
+
+            // Find the best partition
+            let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect())? {
+                Some(index) => index,
+                None => {
+                    if !parent.is_none() {
+                        warn!("A filter group could not be split. {parent:?} {kind}");
+                    }
+                    if let Ok(mut table) = self.cant_split.lock() {
+                        let table = table.get_mut();
+                        table.insert(group);
+                    }
+                    return Ok(false)
+                },
+            };
+
+            // Split the items that will move
+            let (a_items, b_items): (Vec<(Vec<u8>, AccessControl, SimpleFilter)>, Vec<(Vec<u8>, AccessControl, SimpleFilter)>) = items.into_iter()
+                .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
+
+            // build the new covering filters
+            let size = SimpleFilter::parse_kind(&kind)?;
+            let a_cover = a_items.iter()
+                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+            let b_cover = b_items.iter()
+                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+
+            // Check for root
+            let parent = match parent {
+                Some(parent) => parent,
+                None => {
+                    let peak = a_cover.overlap(&b_cover)?;
+                    self._new_group(&mut trans, index_group, false, None, &peak).await?
+                },
+            };
+
+            // Add new groups
+            let group_a = self._new_group(&mut trans, index_group, true, Some(parent), &a_cover).await?;
+            let group_b = self._new_group(&mut trans, index_group, true, Some(parent), &b_cover).await?;
+
+            // Move the ones that should be moved
+            for (hash, _, _) in a_items {
+                sqlx::query(&format!("UPDATE {file_table} SET block = ? WHERE hash = ?"))
+                    .bind(group_a).bind(hash)
+                    .execute(&mut trans).await?;
+            }
+            for (hash, _, _) in b_items {
+                sqlx::query(&format!("UPDATE {file_table} SET block = ? WHERE hash = ?"))
+                    .bind(group_b).bind(hash)
+                    .execute(&mut trans).await?;
+            }
+
+            // try to remove the old group
+            sqlx::query(&format!("DELETE FROM {filter_table} WHERE id = ?"))
+                .bind(group)
+                .execute(&mut trans).await?;
+
+            // Commit
+            match trans.commit().await {
+                Ok(_) => return Ok(true),
+                Err(err) => {
+                    warn!("Split failure: {err}")
+                },
+            };
         }
     }
 
-    async fn _find_insert_group(&self, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<Vec<(i64, bool, SimpleFilter)>> {
-        todo!()
+    async fn _split_inner_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<bool> {
+        if let Ok(mut table) = self.cant_split.lock() {
+            let table = table.get_mut();
+            if table.contains(&group) {
+                return Ok(false)
+            }
+        }
+
+        loop {
+            let mut trans = conn.begin().await?;
+            let filter_table = filter_table_name(&index_group);
+
+            // Get the group info
+            let query = query_as(&format!("
+                SELECT block, kind FROM {filter_table}
+                WHERE id = ?"))
+                .bind(group)
+                .fetch_optional(&mut trans).await?;
+            let (parent, kind): (Option<i64>, String) = match query {
+                Some(row) => row,
+                None => return Ok(false),
+            };
+
+            // Load all the files in the group
+            let items = self._load_groups_in_group(&mut trans, index_group, group).await?;
+            if items.len() < GROUP_SIZE {
+                return Ok(false)
+            }
+
+            // Find the best partition
+            let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect())? {
+                Some(index) => index,
+                None => {
+                    if let Ok(mut table) = self.cant_split.lock() {
+                        let table = table.get_mut();
+                        table.insert(group);
+                    }
+                    warn!("A filter group could not be split.");
+                    return Ok(false)
+                },
+            };
+
+            // Split the items that will move
+            let (a_items, b_items): (Vec<(i64, bool, SimpleFilter)>, Vec<(i64, bool, SimpleFilter)>) = items.into_iter()
+                .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
+
+            // build the new covering filters
+            let size = SimpleFilter::parse_kind(&kind)?;
+            let a_cover = a_items.iter()
+                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+            let b_cover = b_items.iter()
+                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+
+            // Check for root
+            let parent = match parent {
+                Some(parent) => parent,
+                None => {
+                    let peak = a_cover.overlap(&b_cover)?;
+                    self._new_group(&mut trans, index_group, false, None, &peak).await?
+                },
+            };
+
+            // Add new groups
+            let group_a = self._new_group(&mut trans, index_group, false, Some(parent), &a_cover).await?;
+            let group_b = self._new_group(&mut trans, index_group, false, Some(parent), &b_cover).await?;
+
+            // Move the ones that should be moved
+            for (id, _, _) in a_items {
+                sqlx::query(&format!("UPDATE {filter_table} SET block = ? WHERE id = ?"))
+                    .bind(group_a).bind(id)
+                    .execute(&mut trans).await?;
+            }
+            for (id, _, _) in b_items {
+                sqlx::query(&format!("UPDATE {filter_table} SET block = ? WHERE id = ?"))
+                    .bind(group_b).bind(id)
+                    .execute(&mut trans).await?;
+            }
+
+            // try to remove the old group
+            sqlx::query(&format!("DELETE FROM {filter_table} WHERE id = ?"))
+                .bind(group)
+                .execute(&mut trans).await?;
+
+            // Commit
+            match trans.commit().await {
+                Ok(_) => return Ok(true),
+                Err(err) => {
+                    warn!("Split failure: {err}")
+                },
+            };
+        }
     }
 
-    async fn _expand_filters(&self, index_group: &IndexGroup, filter: &SimpleFilter, stack: Vec<(i64, SimpleFilter)>) -> Result<bool> {
-        todo!()
+    fn _find_partition(items: &Vec<&SimpleFilter>) -> Result<Option<usize>> {
+        let mut counts: HashMap<usize, i64> = Default::default();
+        for filter in items.iter() {
+            for bit in filter.data.iter_ones() {
+                counts.insert(bit, *counts.get(&bit).unwrap_or(&0));
+            }
+        }
+        let mut best_index: Option<usize> = None;
+        let even_split = (items.len() as i64)/2;
+        let mut best_distance = even_split;
+        for (index, hits) in counts {
+            let distance = (hits - even_split).abs();
+            if distance < best_distance {
+                best_distance = distance;
+                best_index = Some(index)
+            }
+        }
+        Ok(best_index)
     }
 
-    async fn _split_group(&self, group: i64) -> Result<bool> {
-        todo!()
+    async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &SimpleFilter) -> Result<i64>
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        let filter_table = filter_table_name(index_group);
+        Ok(sqlx::query(&format!("INSERT INTO {filter_table}(leaves, block, filter, kind) VALUES(?, ?, ?, ?)"))
+            .bind(leaves)
+            .bind(parent)
+            .bind(filter.to_buffer()?)
+            .bind(filter.kind())
+            .execute(conn).await?.last_insert_rowid())
     }
 
 
+    async fn _load_files_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(Vec<u8>, AccessControl, SimpleFilter)>>
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        let file_table = file_table_name(&index_group);
+        let rows: Vec<(Vec<u8>, String, String, Vec<u8>)> = query_as(&format!("
+            SELECT hash, access, kind, filter, kind FROM {file_table}
+            WHERE block = ?"))
+            .bind(group)
+            .fetch_all(conn).await?;
+        let mut out = vec![];
+        for (hash, access, kind, filter) in rows {
+            let filter = match SimpleFilter::load(&kind, &filter) {
+                Ok(filter) => filter,
+                Err(err) => {
+                    error!("Corrupt filter entry: {err}");
+                    continue
+                },
+            };
+            let access: AccessControl = match access.parse() {
+                Ok(access) => access,
+                Err(err) => {
+                    error!("Corrupt access entry: {err}");
+                    continue
+                }
+            };
+            out.push((hash, access, filter))
+        }
+        return Ok(out)
+    }
+
+    async fn _load_groups_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(i64, bool, SimpleFilter)>>
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        let filter_table = filter_table_name(&index_group);
+        let rows: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
+            SELECT id, leaves, kind, filter, kind FROM {filter_table}
+            WHERE block = ?"))
+            .bind(group)
+            .fetch_all(conn).await?;
+        let mut out = vec![];
+        for (id, leave, kind, filter) in rows {
+            let filter = match SimpleFilter::load(&kind, &filter) {
+                Ok(filter) => filter,
+                Err(err) => {
+                    error!("Corrupt filter entry: {err}");
+                    continue
+                },
+            };
+            out.push((id, leave, filter))
+        }
+        return Ok(out)
+    }
 
 //     pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, u64)>> {
 //         let mut conn = self.db.acquire().await?;
@@ -354,7 +771,7 @@ impl SQLiteInterface {
 //         // Get all the groups that expire later than this one
 //         let list: Vec<(IndexID, Vec<u8>)> = query_as("
 //             SELECT label, data FROM index_index
-//             WHERE expiry_group = ?")
+//             WHERE block = ?")
 //             .bind(index_group.as_str())
 //             .fetch_all(&mut conn).await?;
 
@@ -533,42 +950,30 @@ impl SQLiteInterface {
 //         return Ok(())
 //     }
 
-//     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
-//         // Search for groups older than that id
-//         let rows: Vec<(Vec<u8>, )> = sqlx::query_as(
-//             "SELECT data FROM index_index WHERE expiry_group <= ?")
-//             .bind(id.as_str())
-//             .fetch_all(&self.db).await?;
+    pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
+        for group in self.list_indices().await? {
+            if group <= id {
+                self._release_group(group).await?;
+            }
+        }
+        return Ok(())
+    }
 
-//         for data in rows {
-//             let entry = postcard::from_bytes(&data.0)?;
-//             self._release_group(entry).await?;
-//         }
+    async fn _release_group(&self, entry: IndexGroup) -> Result<()> {
+        info!("Garbage collecting index for {}", entry);
 
-//         return Ok(())
-//     }
+        // In a transaction
+        let mut trans = self.db.begin().await?;
 
-//     async fn _release_group(&self, entry: IndexEntry) -> Result<()> {
-//         info!("Garbage collecting index for {}", entry.group);
+        // Delete group table
+        let filter_table = filter_table_name(&entry);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {filter_table}")).execute(&mut trans).await?;
+        let file_table = file_table_name(&entry);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {file_table}")).execute(&mut trans).await?;
 
-//         // In a transaction
-//         let mut trans = self.db.begin().await?;
-
-//         // Delete from index_index
-//         sqlx::query("DELETE FROM index_index WHERE label = ?")
-//             .bind(entry.label.as_str())
-//             .execute(&mut trans).await?;
-
-//         // Add blob to GC
-//         self._schedule_blob_gc(&mut trans, &entry.current_blob, chrono::Utc::now()).await?;
-
-//         // Delete group table
-//         let table_name = filter_table_name(&entry.label);
-//         sqlx::query(&format!("DROP TABLE IF EXISTS {table_name}")).execute(&mut trans).await?;
-
-//         // Commit
-//         Ok(trans.commit().await?)
-//     }
+        // Commit
+        Ok(trans.commit().await?)
+    }
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         // Turn the expiry dates into a group range
@@ -594,6 +999,8 @@ impl SQLiteInterface {
                 view: req.view,
                 group: req.group.clone(),
                 query: req.query.clone(),
+                start: start,
+                end: end,
                 suspect_files: 0,
                 hit_files: Default::default(),
                 truncated: false,

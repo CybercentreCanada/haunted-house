@@ -1,17 +1,24 @@
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
 use crate::bloom::SimpleFilter;
-use crate::core::{SearchCache, CoreConfig};
+use crate::core::{CoreConfig};
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
 
+#[derive(Serialize, Deserialize)]
+pub struct IndexStatus {
+    pub group_files: HashMap<String, u64>,
+    pub filter_sizes: HashMap<String, u64>
+}
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord, Debug)]
 pub struct IndexGroup(String);
 
 impl IndexGroup {
@@ -172,7 +179,7 @@ impl Database {
         }
     }
 
-    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<i64> {
+    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<()> {
         match self {
             Database::SQLite(local) => local.insert_file(hash, access, index_group, filter).await,
         }
@@ -215,11 +222,11 @@ impl Database {
 //         }
 //     }
 
-//     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
-//         match self {
-//             Database::SQLite(local) => local.release_groups(id).await,
-//         }
-//     }
+    pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.release_groups(id).await,
+        }
+    }
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         match self {
@@ -227,12 +234,17 @@ impl Database {
         }
     }
 
-//     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
-//         match self {
-//             Database::SQLite(local) => local.search_status(code).await
-//         }
-//     }
+    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
+        match self {
+            Database::SQLite(local) => local.search_status(code).await
+        }
+    }
 
+    pub async fn status(&self) -> Result<IndexStatus> {
+        match self {
+            Database::SQLite(local) => local.status().await
+        }
+    }
 //     pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
 //         match self {
 //             Database::SQLite(local) => local.get_work(req).await
@@ -281,11 +293,12 @@ impl Database {
 //         }
 //     }
 
-//     pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
-//         match self {
-//             Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
-//         }
-//     }
+    pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+        todo!();
+        // match self {
+        //     Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
+        // }
+    }
 
 //     pub async fn work_error(&self, err: WorkError) -> Result<()> {
 //         match self {

@@ -84,9 +84,9 @@ pub struct Config {
     pub authentication: Authentication,
     pub database: Database,
     pub core: crate::core::CoreConfig,
-    pub cache: CacheConfig,
+    // pub cache: CacheConfig,
     pub files: crate::storage::BlobStorageConfig,
-    pub blobs: crate::storage::BlobStorageConfig,
+    // pub blobs: crate::storage::BlobStorageConfig,
 
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
@@ -98,9 +98,9 @@ impl Default for Config {
             authentication: Default::default(),
             database: Default::default(),
             core: Default::default(),
-            cache: Default::default(),
+            // cache: Default::default(),
             files: Default::default(),
-            blobs: Default::default(),
+            // blobs: Default::default(),
             bind_address: Some("localhost:4443".to_owned()),
             tls: None
         }
@@ -113,10 +113,10 @@ pub struct WorkerConfig {
     // pub authentication: Authentication,
     // pub database: Database,
     // pub core: crate::core::CoreConfig,
-    pub file_cache: CacheConfig,
-    pub blob_cache: CacheConfig,
+    pub cache: CacheConfig,
+    // pub blob_cache: CacheConfig,
     pub files: crate::storage::BlobStorageConfig,
-    pub blobs: crate::storage::BlobStorageConfig,
+    // pub blobs: crate::storage::BlobStorageConfig,
 
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
@@ -129,10 +129,8 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             api_token: "<API token with worker role>".to_owned(),
-            file_cache: Default::default(),
-            blob_cache: Default::default(),
+            cache: Default::default(),
             files: Default::default(),
-            blobs: Default::default(),
             bind_address: Some("localhost:4444".to_owned()),
             tls: None,
             server_address: "localhost:4443".to_owned(),

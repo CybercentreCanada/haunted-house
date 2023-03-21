@@ -16,102 +16,12 @@ use tokio::time::sleep;
 
 use crate::blob_cache::{BlobCache, BlobHandle};
 use crate::config::WorkerTLSConfig;
-use crate::database::BlobID;
 use crate::filter::TrigramFilter;
-use crate::interface::{WorkPackage, FilterTask, YaraTask, WorkRequest, WorkResult, WorkResultValue, WorkError};
+use crate::interface::{WorkPackage, YaraTask, WorkRequest, WorkResult, WorkError};
 
 use super::StatusReport;
 
 
-// #[pyclass]
-// #[derive(Default)]
-// pub struct WorkerBuilder {
-//     index_storage: Option<BlobStorageConfig>,
-//     file_storage: Option<BlobStorageConfig>,
-//     api_token: Option<String>,
-//     server_address: Option<String>,
-//     cache_space: Option<(PathBuf, u64, u64)>,
-// }
-
-// #[pymethods]
-// impl WorkerBuilder {
-//     #[new]
-//     fn new() -> Self {
-//         Default::default()
-//     }
-
-//     fn index_storage(&mut self, config: BlobStorageConfig) -> PyResult<()> {
-//         self.index_storage = Some(config);
-//         Ok(())
-//     }
-
-//     fn file_storage(&mut self, config: BlobStorageConfig) -> PyResult<()> {
-//         self.file_storage = Some(config);
-//         Ok(())
-//     }
-
-//     fn cache_directory(&mut self, path: PathBuf, index_capacity: u64, file_capacity: u64) -> PyResult<()> {
-//         self.cache_space = Some((path, index_capacity, file_capacity));
-//         Ok(())
-//     }
-
-//     fn api_token(&mut self, token: String) -> PyResult<()> {
-//         self.api_token = Some(token);
-//         Ok(())
-//     }
-
-//     fn server_address(&mut self, token: String) -> PyResult<()> {
-//         self.server_address = Some(token);
-//         Ok(())
-//     }
-
-//     fn start(&mut self, py: Python) -> PyResult<PyObject> {
-//         // Initialize blob stores
-//         let index_storage_config = match self.index_storage.take() {
-//             Some(index) => index,
-//             None => return Err(PyValueError::new_err("index storage must be configured"))
-//         };
-//         let file_storage_config = match self.file_storage.take() {
-//             Some(index) => index,
-//             None => return Err(PyValueError::new_err("file storage must be configured"))
-//         };
-
-//         // Initialize authenticator
-//         let token = self.api_token.take().ok_or(anyhow::format_err!("An api token must be configured."))?;
-
-//         // Get cache
-//         let (cache_dir, index_cache_size, file_cache_size) = self.cache_space.take().ok_or(anyhow::format_err!("A cache directory must be configured."))?;
-
-//         let address = match &self.server_address {
-//             Some(address) => address.clone(),
-//             None => "http://localhost:8080".to_owned()
-//         };
-
-//         Ok(pyo3_asyncio::tokio::future_into_py(py, async move {
-//             // Define cache directory
-//             let index_storage = crate::storage::connect(index_storage_config).await?;
-//             let file_storage = crate::storage::connect(file_storage_config).await?;
-//             let index_cache = BlobCache::new(index_storage, index_cache_size, cache_dir.clone());
-//             let file_cache = BlobCache::new(file_storage, file_cache_size, cache_dir);
-
-
-//             let (sender, recv) = mpsc::unbounded_channel();
-//             let weak = sender.downgrade();
-//             let data = Arc::new(WorkerData::new(weak, file_cache, index_cache, address, token)?);
-
-//             tokio::spawn(async {
-//                 if let Err(err) = worker_manager(data, recv).await {
-//                     error!("{err}");
-//                 }
-//             });
-
-//             // return internal interface to core
-//             Ok(WorkerHandle{
-//                 connection: sender
-//             })
-//         })?.into())
-//     }
-// }
 
 pub enum WorkerMessage {
     Stop,
@@ -121,23 +31,11 @@ pub enum WorkerMessage {
     Status(oneshot::Sender<StatusReport>)
 }
 
-// #[pyclass]
-// struct WorkerHandle {
-//     connection: mpsc::UnboundedSender<WorkerMessage>,
-// }
-
-// #[pymethods]
-// impl WorkerHandle {
-//     pub fn stop(&self) {
-//         _ = self.connection.send(WorkerMessage::Stop);
-//     }
-// }
-
 pub struct WorkerData {
     connection: mpsc::UnboundedSender<WorkerMessage>,
     hostname: String,
     file_cache: BlobCache,
-    index_cache: BlobCache,
+    // index_cache: BlobCache,
     server_address: String,
     client: reqwest::Client,
 }
@@ -159,7 +57,7 @@ impl Display for TaskId {
 
 impl WorkerData {
 
-    pub fn new(connection: mpsc::UnboundedSender<WorkerMessage>, file_cache: BlobCache, index_cache: BlobCache, server_address: String, tls: WorkerTLSConfig, token: String, port: u16) -> Result<Self> {
+    pub fn new(connection: mpsc::UnboundedSender<WorkerMessage>, file_cache: BlobCache, server_address: String, tls: WorkerTLSConfig, token: String, port: u16) -> Result<Self> {
         // Build our default header list
         let mut headers = reqwest::header::HeaderMap::new();
         let mut auth_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
@@ -187,7 +85,6 @@ impl WorkerData {
             connection,
             hostname,
             file_cache,
-            index_cache,
             server_address,
             client,
         })
@@ -200,7 +97,7 @@ impl WorkerData {
     async fn get_work_package(&self) -> Result<WorkPackage> {
         let work_request = WorkRequest {
             worker: self.hostname.clone(),
-            cached_filters: self.index_cache.current_open().await?.into_iter().map(BlobID::from).collect(),
+            // cached_filters: self.index_cache.current_open().await?.into_iter().map(BlobID::from).collect(),
         };
 
         // Try to get a work package
@@ -296,8 +193,8 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
                     }
                 };
 
-                if !work.filter.is_empty() || !work.yara.is_empty() {
-                    info!("Got {} filter and {} yara tasks", work.filter.len(), work.yara.len());
+                if !work.yara.is_empty() {
+                    info!("Got {} yara tasks", work.yara.len());
                 }
 
                 _ = data.connection.send(WorkerMessage::Work(work));
@@ -372,10 +269,6 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
                     },
                     WorkerMessage::Work(work) => {
                         // dispatch all the tasks in the package
-                        for filter_task in work.filter {
-                            active_tasks.insert(TaskId::Filter(filter_task.id), tokio::spawn(do_filter_task(data.clone(), filter_task)));
-                        }
-
                         for yara_task in work.yara {
                             active_tasks.insert(TaskId::Yara(yara_task.id), tokio::spawn(do_yara_task(data.clone(), yara_task)));
                         }
@@ -390,28 +283,28 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
 }
 
 
-async fn do_filter_task(data: Arc<WorkerData>, filter_task: FilterTask) -> Result<()> {
-    // Download filter file
-    let index_blob = data.index_cache.open(filter_task.filter_blob.to_string()).await.context("Error downloading filter.")?;
-    let index_file = index_blob.open().context("Error opening filter.")?;
+// async fn do_filter_task(data: Arc<WorkerData>, filter_task: FilterTask) -> Result<()> {
+//     // Download filter file
+//     let index_blob = data.index_cache.open(filter_task.filter_blob.to_string()).await.context("Error downloading filter.")?;
+//     let index_file = index_blob.open().context("Error opening filter.")?;
 
-    // Run query
-    let file_ids = tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {
-        let index = TrigramFilter::open(index_file)?;
-        Ok(index.run_query(&filter_task.query)?.into_iter().collect())
-    }).await??;
+//     // Run query
+//     let file_ids = tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {
+//         let index = TrigramFilter::open(index_file)?;
+//         Ok(index.run_query(&filter_task.query)?.into_iter().collect())
+//     }).await??;
 
-    // Report finding
-    info!("filter task {} finished ({} hits)", filter_task.id, file_ids.len());
-    let result = WorkResult {
-        id: filter_task.id,
-        search: filter_task.search,
-        value: WorkResultValue::Filter(filter_task.filter_id, filter_task.filter_blob, file_ids),
-    };
+//     // Report finding
+//     info!("filter task {} finished ({} hits)", filter_task.id, file_ids.len());
+//     let result = WorkResult {
+//         id: filter_task.id,
+//         search: filter_task.search,
+//         value: WorkResultValue::Filter(filter_task.filter_id, filter_task.filter_blob, file_ids),
+//     };
 
-    data.report_result(result).await;
-    return Ok(())
-}
+//     data.report_result(result).await;
+//     return Ok(())
+// }
 
 async fn do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()> {
     debug!("yara task {} starting", yara_task.id);
@@ -462,7 +355,7 @@ async fn do_yara_task(data: Arc<WorkerData>, yara_task: YaraTask) -> Result<()> 
     data.report_result(WorkResult {
         id: yara_task.id,
         search: yara_task.search,
-        value: WorkResultValue::Yara(filtered),
+        yara_hits: filtered
     }).await;
     return Ok(())
 }

@@ -25,7 +25,7 @@ use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::config::TLSConfig;
 use crate::core::{HouseCore, IngestStatus, SearchStatus};
-use crate::database::{IndexGroup, SearchStage};
+use crate::database::{IndexGroup, SearchStage, IndexStatus};
 use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -132,24 +132,24 @@ impl StatusInterface {
 
     pub async fn get_status(&self) -> Result<StatusReport> {
         let ingest = self.core.ingest_status().await?;
-        let mut indices = self.core.database.list_indices().await?;
-        indices.sort();
+        // let mut indices = self.core.database.list_indices().await?;
+        // indices.sort();
 
-        let mut file_count: HashMap<IndexGroup, u64> = Default::default();
+        // let mut file_count: HashMap<IndexGroup, u64> = Default::default();
 
-        for (group, index) in indices.iter() {
-            let mut count = *file_count.get(group).unwrap_or(&0);
-            count += self.core.database.count_files(index).await?;
-            file_count.insert(group.clone(), count);
-        }
+        // for (group, index) in indices.iter() {
+        //     let mut count = *file_count.get(group).unwrap_or(&0);
+        //     count += self.core.database.count_files(index).await?;
+        //     file_count.insert(group.clone(), count);
+        // }
 
-        let mut file_counts: Vec<_> = file_count.into_iter().collect();
-        file_counts.sort();
+        // let mut file_counts: Vec<_> = file_count.into_iter().collect();
+        // file_counts.sort();
 
         Ok(StatusReport {
             ingest,
-            active_filters: indices,
-            file_counts
+            search: SearchStatus {  },
+            index: self.core.database.status().await?
         })
     }
 }
@@ -167,19 +167,20 @@ impl WorkerInterface {
     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
         let start = std::time::Instant::now();
         loop {
-            let work = self.core.get_work(&req).await?;
-            if !work.is_empty() {
-                return Ok(work);
-            }
+            todo!()
+            // let work = self.core.get_work(&req).await?;
+            // if !work.is_empty() {
+            //     return Ok(work);
+            // }
 
-            let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
-                Some(wait) => wait,
-                None => return Ok(Default::default()),
-            };
+            // let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
+            //     Some(wait) => wait,
+            //     None => return Ok(Default::default()),
+            // };
 
-            if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
-                return Ok(Default::default())
-            }
+            // if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
+            //     return Ok(Default::default())
+            // }
         }
     }
 
@@ -188,7 +189,8 @@ impl WorkerInterface {
     }
 
     pub async fn work_error(&self, req: WorkError) -> Result<()> {
-        self.core.work_error(req).await
+        todo!()
+        // self.core.work_error(req).await
     }
 }
 
@@ -208,10 +210,6 @@ impl SearcherInterface {
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         self.core.search_status(code).await
     }
-
-    // pub async fn tag_prompt(&self, req: PromptQuery) -> Result<PromptResult> {
-    //     self.core.database.tag_prompt(req).await
-    // }
 }
 
 #[derive(Clone)]
@@ -308,20 +306,6 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
 
     return (StatusCode::OK, Json(status.resp).into_response())
 }
-
-// pub struct ListRequest {
-
-// }
-
-// pub struct ListResponse {
-
-// }
-
-// #[handler]
-// async fn list_searches(Data(interface): Data<&SearcherInterface>, query: Option<poem::web::Query<ListRequest>>, body: Option<Json<ListRequest>>) -> (StatusCode, Response) {
-//     todo!()
-// }
-
 
 #[derive(Serialize, Deserialize)]
 pub struct YaraTask {
@@ -480,6 +464,7 @@ async fn ingest_stream(Data(interface): Data<&IngestInterface>, ws: poem::web::w
                         };
 
                         let (hash, token, result) = item;
+                        debug!("Ingest result: {hash} {result:?}");
                         let response = match result {
                             Ok(()) => IngestResponse{
                                 token,
@@ -490,7 +475,7 @@ async fn ingest_stream(Data(interface): Data<&IngestInterface>, ws: poem::web::w
                             Err(err) => IngestResponse {
                                 token,
                                 hash,
-                                error: format!("{}", err),
+                                error: format!("{err:?}"),
                                 success: false
                             },
                         };
@@ -522,6 +507,7 @@ async fn get_status() -> Result<()> {
 struct StatusReport {
     ingest: IngestStatus,
     search: SearchStatus,
+    index: IndexStatus,
 }
 
 #[handler]

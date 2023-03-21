@@ -136,21 +136,21 @@ async fn main() -> Result<()> {
             let auth = Authenticator::from_config(config.authentication)?;
 
             // Setup the storage
-            info!("Connect to index storage");
-            let index_storage = crate::storage::connect(config.blobs).await?;
+            // info!("Connect to index storage");
+            // let index_storage = crate::storage::connect(config.blobs).await?;
             info!("Connect to file storage");
             let file_storage = crate::storage::connect(config.files).await?;
 
-            info!("Setup cache");
-            let (cache, _temp) = match config.cache {
-                config::CacheConfig::TempDir { size } => {
-                    let temp_dir = tempfile::tempdir()?;
-                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
-                }
-                config::CacheConfig::Directory { path, size } => {
-                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
-                }
-            };
+            // info!("Setup cache");
+            // let (cache, _temp) = match config.cache {
+            //     config::CacheConfig::TempDir { size } => {
+            //         let temp_dir = tempfile::tempdir()?;
+            //         (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
+            //     }
+            //     config::CacheConfig::Directory { path, size } => {
+            //         (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
+            //     }
+            // };
 
             // Initialize database
             info!("Connecting to database.");
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
 
             // Start server core
             info!("Starting server core.");
-            let core = HouseCore::new(index_storage, file_storage, database, cache, auth, config.core)
+            let core = HouseCore::new(file_storage, database, auth, config.core)
                 .context("Error launching core.")?;
 
             // Start http interface
@@ -181,8 +181,8 @@ async fn main() -> Result<()> {
             let config = load_worker_config(config)?;
 
             // Setup the storage
-            info!("Connect to blob storage");
-            let index_storage = crate::storage::connect(config.blobs).await?;
+            // info!("Connect to blob storage");
+            // let index_storage = crate::storage::connect(config.blobs).await?;
             info!("Connect to file storage");
             let file_storage = crate::storage::connect(config.files).await?;
 
@@ -191,7 +191,7 @@ async fn main() -> Result<()> {
 
             // Get cache
             info!("Setup caches");
-            let (file_cache, _file_temp) = match config.file_cache {
+            let (file_cache, _file_temp) = match config.cache {
                 config::CacheConfig::TempDir { size } => {
                     let temp_dir = tempfile::tempdir()?;
                     (BlobCache::new(file_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
@@ -200,15 +200,15 @@ async fn main() -> Result<()> {
                     (BlobCache::new(file_storage.clone(), size, PathBuf::from(path))?, None)
                 }
             };
-            let (index_cache, _index_temp) = match config.blob_cache {
-                config::CacheConfig::TempDir { size } => {
-                    let temp_dir = tempfile::tempdir()?;
-                    (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
-                }
-                config::CacheConfig::Directory { path, size } => {
-                    (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
-                }
-            };
+            // let (index_cache, _index_temp) = match config.blob_cache {
+            //     config::CacheConfig::TempDir { size } => {
+            //         let temp_dir = tempfile::tempdir()?;
+            //         (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
+            //     }
+            //     config::CacheConfig::Directory { path, size } => {
+            //         (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
+            //     }
+            // };
 
             // Figure out where the worker status interface will be hosted
             info!("Determine bind address");
@@ -226,7 +226,7 @@ async fn main() -> Result<()> {
             let address = config.server_address;
             let verify = config.server_tls;
             let (sender, recv) = mpsc::unbounded_channel();
-            let data = Arc::new(WorkerData::new(sender.clone(), file_cache, index_cache, address, verify, token, bind_address.port())?);
+            let data = Arc::new(WorkerData::new(sender.clone(), file_cache, address, verify, token, bind_address.port())?);
 
             // Watch for exit signal
             tokio::spawn({
