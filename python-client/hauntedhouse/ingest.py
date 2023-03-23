@@ -46,7 +46,7 @@ class Config(pydantic.BaseModel):
 
 async def socket_main(config: Config, verify: bool) -> None:
     logger.info("Connect to assemblyline for classification configuration")
-    al_client = get_client(config.assemblyline_url, apikey=(config.assemblyline_user, config.assemblyline_api_key))
+    al_client = get_client(config.assemblyline_url, apikey=(config.assemblyline_user, config.assemblyline_api_key), verify=verify)
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
 
     try:
