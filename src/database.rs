@@ -12,6 +12,7 @@ use crate::core::{CoreConfig};
 use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
 
+
 #[derive(Serialize, Deserialize)]
 pub struct IndexStatus {
     pub group_files: HashMap<String, u64>,
@@ -155,15 +156,10 @@ impl std::fmt::Display for SearchStage {
 }
 
 pub enum Database {
-    // Rocks(RocksInterface),
     SQLite(SQLiteInterface),
 }
 
 impl Database {
-
-//     // pub async fn new_rocks(index_soft_max: usize) -> Result<Self> {
-//     //     Ok(Database::Rocks(RocksInterface::new(index_soft_max)?))
-//     // }
 
     pub async fn new_sqlite(config: CoreConfig, path: &str) -> Result<Self> {
         Ok(Database::SQLite(SQLiteInterface::new(config, path).await?))
@@ -171,6 +167,12 @@ impl Database {
 
     pub async fn new_sqlite_temp(config: CoreConfig) -> Result<Self> {
         Ok(Database::SQLite(SQLiteInterface::new_temp(config).await?))
+    }
+
+    pub async fn partition_test(&self) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.partition_test().await,
+        }
     }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {
@@ -185,42 +187,11 @@ impl Database {
         }
     }
 
-//     pub async fn update_index_data(&self, index_group: &IndexGroup, index_id: IndexID, old_blob_id: BlobID, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, index_offset: u64, new_size: u64) -> Result<()> {
-//         match self {
-//             // Database::Rocks(local) => local.update_index_data(index_group, index_id, old_blob_id, blob_id, meta, index_offset, new_size).await,
-//             Database::SQLite(local) => local.update_index_data(index_group, index_id, &old_blob_id, &blob_id, meta, index_offset, new_size).await,
-//         }
-//     }
-
-//     pub async fn list_indices(&self) -> Result<Vec<(IndexGroup, IndexID)>> {
-//         match self {
-//             Database::SQLite(local) => local.list_indices().await,
-//         }
-//     }
-
-//     pub async fn count_files(&self, id: &IndexID) -> Result<u64> {
-//         match self {
-//             Database::SQLite(local) => local.count_files(id).await,
-//         }
-//     }
-
-//     pub async fn lease_blob(&self) -> Result<BlobID> {
-//         match self {
-//             Database::SQLite(local) => local.lease_blob().await,
-//         }
-//     }
-
-//     pub async fn list_garbage_blobs(&self) -> Result<Vec<BlobID>> {
-//         match self {
-//             Database::SQLite(local) => local.list_garbage_blobs().await,
-//         }
-//     }
-
-//     pub async fn release_blob(&self, id: BlobID) -> Result<()> {
-//         match self {
-//             Database::SQLite(local) => local.release_blob(id).await,
-//         }
-//     }
+    // pub async fn list_indices(&self) -> Result<Vec<IndexGroup>> {
+    //     match self {
+    //         Database::SQLite(local) => local.list_indices().await,
+    //     }
+    // }
 
     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
         match self {
@@ -240,76 +211,76 @@ impl Database {
         }
     }
 
+    pub async fn get_queued_or_filtering_searches(&self) -> Result<(Vec<String>, Vec<String>)> {
+        match self {
+            Database::SQLite(local) => local.get_queued_or_filtering_searches().await
+        }
+    }
+
+    pub async fn set_search_stage(&self, code: &str, stage: SearchStage) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.set_search_stage(code, stage).await
+        }
+    }
+
+    pub async fn filter_search(&self, code: &str) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.filter_search(code).await
+        }
+    }
+
     pub async fn status(&self) -> Result<IndexStatus> {
         match self {
             Database::SQLite(local) => local.status().await
         }
     }
-//     pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
-//         match self {
-//             Database::SQLite(local) => local.get_work(req).await
-//         }
-//     }
 
-//     pub async fn release_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
-//         match self {
-//             Database::SQLite(local) => local.release_tasks_assigned_before(time).await
-//         }
-//     }
-
-//     pub async fn release_filter_task(&self, id: i64) -> Result<bool> {
-//         match self {
-//             Database::SQLite(local) => local.release_filter_task(id).await
-//         }
-//     }
-
-//     pub async fn release_yara_task(&self, id: i64) -> Result<bool> {
-//         match self {
-//             Database::SQLite(local) => local.release_yara_task(id).await
-//         }
-//     }
-
-//     pub async fn get_filter_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
-//         match self {
-//             Database::SQLite(local) => local.get_filter_assignments_before(time).await
-//         }
-//     }
-
-//     pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
-//         match self {
-//             Database::SQLite(local) => local.get_yara_assignments_before(time).await
-//         }
-//     }
-
-//     pub async fn get_work_notification(&self) -> Result<()> {
-//         match self {
-//             Database::SQLite(local) => local.get_work_notification().await
-//         }
-//     }
-
-//     pub async fn finish_filter_work(&self, id: i64, search: &String, cache: &mut SearchCache, index: IndexID, file_ids: Vec<u64>) -> Result<()> {
-//         match self {
-//             Database::SQLite(local) => local.finish_filter_work(id, search, cache, index, file_ids).await
-//         }
-//     }
-
-    pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
-        todo!();
-        // match self {
-        //     Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
-        // }
+    pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
+        match self {
+            Database::SQLite(local) => local.get_work(req).await
+        }
     }
 
-//     pub async fn work_error(&self, err: WorkError) -> Result<()> {
-//         match self {
-//             Database::SQLite(local) => local.work_error(err).await
-//         }
-//     }
+    pub async fn release_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        match self {
+            Database::SQLite(local) => local.release_tasks_assigned_before(time).await
+        }
+    }
 
-//     // pub async fn tag_prompt(&self, req: PromptQuery) -> Result<PromptResult> {
-//     //     match self {
-//     //         Database::SQLite(local) => local.tag_prompt(req).await
-//     //     }
-//     // }
+    pub async fn release_yara_task(&self, id: i64) -> Result<bool> {
+        match self {
+            Database::SQLite(local) => local.release_yara_task(id).await
+        }
+    }
+
+    pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
+        match self {
+            Database::SQLite(local) => local.get_yara_assignments_before(time).await
+        }
+    }
+
+    pub async fn get_work_notification(&self) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.get_work_notification().await
+        }
+    }
+
+    pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
+        }
+    }
+
+    pub async fn add_work_error(&self, err: WorkError) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.add_work_error(err).await
+        }
+    }
+
+    pub async fn add_search_error(&self, code: &str, error: &str) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.add_search_error(code, error).await
+        }
+    }
 }
 

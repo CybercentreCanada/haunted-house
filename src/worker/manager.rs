@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
@@ -16,7 +15,6 @@ use tokio::time::sleep;
 
 use crate::blob_cache::{BlobCache, BlobHandle};
 use crate::config::WorkerTLSConfig;
-use crate::filter::TrigramFilter;
 use crate::interface::{WorkPackage, YaraTask, WorkRequest, WorkResult, WorkError};
 
 use super::StatusReport;
@@ -40,20 +38,6 @@ pub struct WorkerData {
     client: reqwest::Client,
 }
 
-#[derive(PartialEq, Eq, Hash, Copy, Clone)]
-enum TaskId {
-    Yara(i64),
-    Filter(i64)
-}
-
-impl Display for TaskId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TaskId::Yara(id) => f.write_fmt(format_args!("yara({id})")),
-            TaskId::Filter(id) => f.write_fmt(format_args!("filter({id})")),
-        }
-    }
-}
 
 impl WorkerData {
 
@@ -147,11 +131,11 @@ impl WorkerData {
         }
     }
 
-    async fn report_error(&self, id: TaskId, error: String) {
+    async fn report_error(&self, id: i64, error: String) {
         error!("{error}");
-        let error = match id {
-            TaskId::Filter(id) => WorkError::Filter(id, error),
-            TaskId::Yara(id) => WorkError::Yara(id, error),
+        let error = WorkError {
+            job_id: id,
+            error
         };
 
         self._post(format!("{}/work/error/", self.server_address), error).await;
@@ -167,7 +151,7 @@ impl WorkerData {
 pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::UnboundedReceiver<WorkerMessage>) -> Result<()> {
 
     let mut still_running = true;
-    let mut active_tasks: HashMap<TaskId, JoinHandle<Result<()>>> = Default::default();
+    let mut active_tasks: HashMap<i64, JoinHandle<Result<()>>> = Default::default();
     let mut fetch_work: Option<JoinHandle<()>> = None;
 
     while still_running || active_tasks.len() > 0 {
@@ -203,7 +187,7 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
 
         // Clear out any finished tasks
         {
-            let ids: Vec<TaskId> = active_tasks.keys().cloned().collect_vec();
+            let ids: Vec<i64> = active_tasks.keys().cloned().collect_vec();
             for id in ids {
                 if let Some(job) = active_tasks.get(&id) {
                     if !job.is_finished() {
@@ -252,25 +236,14 @@ pub async fn worker_manager(data: Arc<WorkerData>, mut messages: mpsc::Unbounded
                     WorkerMessage::NoWork => continue,
                     WorkerMessage::WorkDone => continue,
                     WorkerMessage::Status(response) => {
-                        let mut active_filter = vec![];
-                        let mut active_yara = vec![];
-
-                        for id in active_tasks.keys() {
-                            match id {
-                                TaskId::Yara(id) => active_yara.push(*id),
-                                TaskId::Filter(id) => active_filter.push(*id),
-                            }
-                        }
-
                         _ = response.send(StatusReport {
-                            active_filter,
-                            active_yara
+                            active_yara: active_tasks.keys().cloned().collect_vec()
                         });
                     },
                     WorkerMessage::Work(work) => {
                         // dispatch all the tasks in the package
                         for yara_task in work.yara {
-                            active_tasks.insert(TaskId::Yara(yara_task.id), tokio::spawn(do_yara_task(data.clone(), yara_task)));
+                            active_tasks.insert(yara_task.id, tokio::spawn(do_yara_task(data.clone(), yara_task)));
                         }
                     },
                 }

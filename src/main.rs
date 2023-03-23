@@ -7,11 +7,8 @@ mod database;
 mod database_sqlite;
 mod query;
 mod error;
-mod filter;
 mod access;
 mod interface;
-mod ursadb;
-mod varint;
 mod blob_cache;
 mod worker;
 mod bloom;
@@ -78,6 +75,10 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(short, long)]
         default: bool,
+    },
+    PartitionTest {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     }
 }
 
@@ -200,15 +201,6 @@ async fn main() -> Result<()> {
                     (BlobCache::new(file_storage.clone(), size, PathBuf::from(path))?, None)
                 }
             };
-            // let (index_cache, _index_temp) = match config.blob_cache {
-            //     config::CacheConfig::TempDir { size } => {
-            //         let temp_dir = tempfile::tempdir()?;
-            //         (BlobCache::new(index_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
-            //     }
-            //     config::CacheConfig::Directory { path, size } => {
-            //         (BlobCache::new(index_storage.clone(), size, PathBuf::from(path))?, None)
-            //     }
-            // };
 
             // Figure out where the worker status interface will be hosted
             info!("Determine bind address");
@@ -259,6 +251,20 @@ async fn main() -> Result<()> {
                 Err(err) => error!("Server crashed: {err}"),
                 _ => {}
             };
+        },
+        Commands::PartitionTest { config } => {
+            // Load the config file
+            info!("Loading config from: {config:?}");
+            let config = load_config(config)?;
+
+            // Initialize database
+            info!("Connecting to database.");
+            let database = match config.database {
+                config::Database::SQLite{path} => Database::new_sqlite(config.core.clone(), &path).await?,
+                config::Database::SQLiteTemp{..} => Database::new_sqlite_temp(config.core.clone()).await?,
+            };
+
+            database.partition_test().await?;
         }
     }
 

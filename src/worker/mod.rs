@@ -7,6 +7,5 @@ use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct StatusReport {
-    pub active_filter: Vec<i64>,
     pub active_yara: Vec<i64>,
 }

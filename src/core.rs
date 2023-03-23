@@ -1,23 +1,20 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
-use crate::blob_cache::BlobCache;
 use crate::bloom::{self, SimpleFilter};
-use crate::database::{Database, IndexGroup};
-use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage, WorkError};
+use crate::database::{Database, IndexGroup, SearchStage};
+use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage};
 use crate::storage::BlobStorage;
 use crate::access::AccessControl;
-use crate::filter::TrigramFilter;
 use crate::worker_watcher::worker_watcher;
 use bitvec::vec::BitVec;
-use futures::future::select_all;
 use log::{error, debug, info};
 use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot};
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc, Duration};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinSet};
 use weak_self::WeakSelf;
 
 
@@ -95,8 +92,9 @@ pub struct HouseCore {
     pub config: CoreConfig,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     insert_queue: mpsc::UnboundedSender<InsertMessage>,
-    search_watchers: mpsc::UnboundedSender<WorkResult>,
+    result_queue: mpsc::UnboundedSender<WorkResult>,
     garbage_collection_notification: tokio::sync::Notify,
+    search_start_notification: tokio::sync::Notify,
 }
 
 impl HouseCore {
@@ -120,16 +118,17 @@ impl HouseCore {
             ingest_queue: send_ingest,
             insert_queue: send_insert,
             config,
-            search_watchers: send_search,
-            garbage_collection_notification: tokio::sync::Notify::new()
+            result_queue: send_search,
+            garbage_collection_notification: tokio::sync::Notify::new(),
+            search_start_notification: tokio::sync::Notify::new(),
         });
         core.weak_self.init(&core);
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
         tokio::spawn(insert_worker(core.clone(), receive_insert));
-        tokio::spawn(search_watcher(core.clone(), receive_search));
-        tokio::spawn(worker_watcher(core.clone()));
         tokio::spawn(search_workers(core.clone()));
+        tokio::spawn(worker_watcher(core.clone()));
+        tokio::spawn(result_processor(core.clone(), receive_search));
         tokio::spawn(garbage_collector(core.clone()));
 
         return Ok(core)
@@ -139,7 +138,7 @@ impl HouseCore {
         let (send, ingest_recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::Status(send))?;
         let (send, insert_recv) = oneshot::channel();
-        if let Err(err) = self.insert_queue.send(InsertMessage::Status(send)){
+        if let Err(_) = self.insert_queue.send(InsertMessage::Status(send)){
             return Err(anyhow::anyhow!("Couldn't fetch insert status"));
         }
         let mut value = ingest_recv.await?;
@@ -149,6 +148,7 @@ impl HouseCore {
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         let res = self.database.initialize_search(req).await?;
+        self.search_start_notification.notify_one();
         return Ok(res)
     }
 
@@ -156,24 +156,20 @@ impl HouseCore {
         self.database.search_status(code).await
     }
 
-    // pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
-    //     self.database.get_work(req).await
-    // }
+    pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
+        self.database.get_work(req).await
+    }
 
-    // pub async fn get_work_notification(&self) -> Result<()> {
-    //     self.database.get_work_notification().await
-    // }
+    pub async fn get_work_notification(&self) -> Result<()> {
+        self.database.get_work_notification().await
+    }
 
     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
-        match self.search_watchers.send(req){
+        match self.result_queue.send(req){
             Ok(()) => Ok(()),
             Err(err) => Err(anyhow::anyhow!("result processor error: {err}")),
         }
     }
-
-    // pub async fn work_error(&self, err: WorkError) -> Result<()> {
-    //     self.database.work_error(err).await
-    // }
 }
 
 async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<IngestMessage>) {
@@ -478,33 +474,91 @@ async fn run_insert(core: Arc<HouseCore>, task: IngestTask, filter: SimpleFilter
 }
 
 async fn search_workers(core: Arc<HouseCore>){
-    todo!("search not implemented");
-    let mut workers = tokio::task::JoinSet::new();
-
     loop {
-        while workers.len() < core.config.search_workers as usize {
-            workers.spawn(_search_worker(core.clone()));
+        match tokio::spawn(_search_workers(core.clone())).await {
+            Err(err) => error!("Task error in search workers: {err}"),
+            Ok(Err(err)) => error!("Error in search workers: {err}"),
+            Ok(Ok(())) => info!("Search manager stopped."),
+        }
+    }
+}
+
+async fn _search_workers(core: Arc<HouseCore>) -> Result<()> {
+    let mut workers: JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    let mut active: HashMap<String, tokio::task::AbortHandle> = Default::default();
+    info!("Search manager started");
+    let worker_target = core.config.search_workers as usize;
+    loop {
+        active.retain(|_code, handle|!handle.is_finished());
+
+        // If there are free worker slots check if there is room for
+        if workers.len() < worker_target {
+            debug!("Search worker looking for work {}/{}", workers.len(), core.config.search_workers);
+            let (mut queued, mut filtering) = core.database.get_queued_or_filtering_searches().await?;
+            if !queued.is_empty() || !filtering.is_empty() {
+                debug!("work options {queued:?} | {filtering:?}");
+            } else {
+                debug!("No searches");
+            }
+
+            // Try to resume any active searches that don't have a worker
+            let mut to_start = vec![];
+            while !filtering.is_empty() && to_start.len() + workers.len() < worker_target {
+                if let Some(filtering) = filtering.pop() {
+                    if active.contains_key(&filtering) {
+                        continue
+                    }
+                    to_start.push(filtering);
+                }
+            }
+
+            // Add in new searches to reach limit
+            while !queued.is_empty() && to_start.len() + workers.len() < worker_target {
+                if let Some(queued) = queued.pop() {
+                    core.database.set_search_stage(&queued, SearchStage::Filtering).await?;
+                    to_start.push(queued);
+                }
+            }
+
+            // Launch the search workers
+            for search in to_start {
+                let code = search.clone();
+                active.insert(code, workers.spawn(_search_worker(core.clone(), search)));
+            }
+        } else {
+            debug!("Search worker busy {}/{}", workers.len(), worker_target)
         }
 
-        if let Some(res) = workers.join_next().await {
-            match res {
-                Ok(res) => if let Err(err) = res {
-                    error!("Error in search worker: {err}")
-                },
-                Err(err) => {
-                    error!("Error in search worker: {err}")
-                },
+        tokio::select! {
+            // Wait for a search worker to finish, log any errors
+            result = workers.join_next(), if !workers.is_empty() => {
+                debug!("Search job finished");
+                if let Some(result) = result {
+                    match result {
+                        Err(err) => error!("Search task error: {err}"),
+                        Ok(Err(err)) => error!("Search error: {err}"),
+                        Ok(Ok(())) => continue
+                    };
+                }
+            }
+
+            // If we have free worker slots wake up when a search request is created
+            _ = core.search_start_notification.notified(), if workers.len() < worker_target => {
+                debug!("New search notification triggered");
             }
         }
     }
 }
 
-async fn _search_worker(core: Arc<HouseCore>) -> Result<()> {
-    todo!()
+async fn _search_worker(core: Arc<HouseCore>, code: String) -> Result<()> {
+    if let Err(err) = core.database.filter_search(&code).await {
+        _ = core.database.add_search_error(&code, &format!("{err:?}")).await;
+        return Err(err)
+    }
+    return Ok(())
 }
 
-
-async fn search_watcher(core: Arc<HouseCore>, mut results: mpsc::UnboundedReceiver<WorkResult>){
+async fn result_processor(core: Arc<HouseCore>, mut results: mpsc::UnboundedReceiver<WorkResult>){
     loop {
         let message = match results.recv().await {
             Some(result) => result,

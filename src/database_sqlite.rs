@@ -3,9 +3,9 @@ use std::collections::{BTreeSet, HashSet, HashMap};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
-use log::{debug, info, error, warn};
+use log::{info, error, warn};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite};
+use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite, Encode};
 use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
@@ -41,6 +41,12 @@ use crate::query::Query;
 //     }
 // }
 
+impl<'r> Encode<'r, sqlx::Sqlite> for SearchStage {
+    fn encode_by_ref(&self, buf: &mut Vec<sqlx::sqlite::SqliteArgumentValue<'r>>) -> sqlx::encode::IsNull {
+        self.to_string().encode_by_ref(buf)
+    }
+}
+
 impl<'r> Decode<'r, sqlx::Sqlite> for SearchStage {
     fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
         let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
@@ -53,6 +59,26 @@ impl sqlx::Type<sqlx::Sqlite> for SearchStage {
         <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
     }
 }
+
+
+
+#[derive(Serialize, Deserialize)]
+struct SearchRecord {
+    code: String,
+    group: String,
+    yara_signature: String,
+    query: Query,
+    view: AccessControl,
+    access: HashSet<String>,
+    errors: Vec<String>,
+    filtered_files: u64,
+    suspect_files: u64,
+    hit_files: BTreeSet<Vec<u8>>,
+    truncated: bool,
+    start: IndexGroup,
+    end: IndexGroup,
+}
+
 
 
 pub struct SQLiteInterface {
@@ -96,22 +122,6 @@ fn filter_table_name(name: &IndexGroup) -> String {
     format!("filter_{name}")
 }
 
-
-#[derive(Serialize, Deserialize)]
-struct SearchRecord {
-    code: String,
-    group: String,
-    yara_signature: String,
-    query: Query,
-    view: AccessControl,
-    access: HashSet<String>,
-    errors: Vec<String>,
-    suspect_files: u64,
-    hit_files: BTreeSet<Vec<u8>>,
-    truncated: bool,
-    start: IndexGroup,
-    end: IndexGroup,
-}
 
 const GROUP_SIZE: usize = 128;
 
@@ -229,7 +239,7 @@ impl SQLiteInterface {
         return Ok(())
     }
 
-    async fn list_indices(&self) -> Result<Vec<IndexGroup>> {
+    pub async fn list_indices(&self) -> Result<Vec<IndexGroup>> {
         // Get tables
         let tables: Vec<(String, )> = sqlx::query_as("SELECT name FROM sqlite_schema WHERE type='table'")
             .fetch_all(&self.db).await?;
@@ -356,7 +366,7 @@ impl SQLiteInterface {
         };
 
         // Check each group (bottom up) to see if it needs to be split
-        while let Some((group_id, leaf, mask)) = stack.pop() {
+        while let Some((group_id, leaf, _mask)) = stack.pop() {
             if leaf {
                 let count = self._count_files_in_group(&mut conn, index_group, group_id).await?;
                 if count > GROUP_SIZE {
@@ -395,6 +405,29 @@ impl SQLiteInterface {
             .bind(filter.kind())
             .fetch_all(&mut *conn).await?;
         }
+
+        let mut output = vec![];
+        for (id, leaves, kind, filter) in rows {
+            let filter = match SimpleFilter::load(&kind, &filter) {
+                Ok(filter) => filter,
+                Err(err) => {
+                    error!("Couldn't load filter {id}: {err}");
+                    continue
+                },
+            };
+            output.push((id, leaves, filter))
+        }
+        Ok(output)
+    }
+
+    async fn _find_all_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup) -> Result<Vec<(i64, bool, SimpleFilter)>> {
+        let filter_table = filter_table_name(index_group);
+
+        // Load the root group
+        let rows: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
+            SELECT id, leaves, kind, filter FROM {filter_table}
+            WHERE block IS NULL"))
+            .fetch_all(&mut *conn).await?;
 
         let mut output = vec![];
         for (id, leaves, kind, filter) in rows {
@@ -520,8 +553,8 @@ impl SQLiteInterface {
                 return Ok(false)
             }
 
-            // Find the best partition
-            let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect())? {
+            // Partition the data
+            let (a_items, b_items) = match Self::_partition(items) {
                 Some(index) => index,
                 None => {
                     if !parent.is_none() {
@@ -534,10 +567,6 @@ impl SQLiteInterface {
                     return Ok(false)
                 },
             };
-
-            // Split the items that will move
-            let (a_items, b_items): (Vec<(Vec<u8>, AccessControl, SimpleFilter)>, Vec<(Vec<u8>, AccessControl, SimpleFilter)>) = items.into_iter()
-                .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
 
             // build the new covering filters
             let size = SimpleFilter::parse_kind(&kind)?;
@@ -615,22 +644,20 @@ impl SQLiteInterface {
                 return Ok(false)
             }
 
-            // Find the best partition
-            let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect())? {
+            // Partition the data
+            let (a_items, b_items) = match Self::_partition(items) {
                 Some(index) => index,
                 None => {
+                    if !parent.is_none() {
+                        warn!("A filter group could not be split. {parent:?} {kind}");
+                    }
                     if let Ok(mut table) = self.cant_split.lock() {
                         let table = table.get_mut();
                         table.insert(group);
                     }
-                    warn!("A filter group could not be split.");
                     return Ok(false)
                 },
             };
-
-            // Split the items that will move
-            let (a_items, b_items): (Vec<(i64, bool, SimpleFilter)>, Vec<(i64, bool, SimpleFilter)>) = items.into_iter()
-                .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
 
             // build the new covering filters
             let size = SimpleFilter::parse_kind(&kind)?;
@@ -679,7 +706,23 @@ impl SQLiteInterface {
         }
     }
 
-    fn _find_partition(items: &Vec<&SimpleFilter>) -> Result<Option<usize>> {
+    fn _partition<A, B>(items: Vec<(A, B, SimpleFilter)>) -> Option<(Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>)> {
+        // Find the best partition
+        let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect()) {
+            Some(index) => index,
+            None => {
+                return None
+            },
+        };
+
+        // Split the items that will move
+        let (a_items, b_items): (Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>) = items.into_iter()
+            .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
+        Some((a_items, b_items))
+    }
+
+
+    fn _find_partition(items: &Vec<&SimpleFilter>) -> Option<usize> {
         let mut counts: HashMap<usize, i64> = Default::default();
         for filter in items.iter() {
             for bit in filter.data.iter_ones() {
@@ -696,7 +739,7 @@ impl SQLiteInterface {
                 best_index = Some(index)
             }
         }
-        Ok(best_index)
+        best_index
     }
 
     async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &SimpleFilter) -> Result<i64>
@@ -717,7 +760,7 @@ impl SQLiteInterface {
     {
         let file_table = file_table_name(&index_group);
         let rows: Vec<(Vec<u8>, String, String, Vec<u8>)> = query_as(&format!("
-            SELECT hash, access, kind, filter, kind FROM {file_table}
+            SELECT hash, access, kind, filter FROM {file_table}
             WHERE block = ?"))
             .bind(group)
             .fetch_all(conn).await?;
@@ -747,7 +790,7 @@ impl SQLiteInterface {
     {
         let filter_table = filter_table_name(&index_group);
         let rows: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
-            SELECT id, leaves, kind, filter, kind FROM {filter_table}
+            SELECT id, leaves, kind, filter FROM {filter_table}
             WHERE block = ?"))
             .bind(group)
             .fetch_all(conn).await?;
@@ -990,7 +1033,7 @@ impl SQLiteInterface {
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
         sqlx::query("INSERT INTO searches(code, stage, data, search_group, start_time) VALUES(?, ?, ?, ?, ?)")
             .bind(&code)
-            .bind(SearchStage::Queued.to_string())
+            .bind(SearchStage::Queued)
             .bind(&postcard::to_allocvec(&SearchRecord{
                 code: code.clone(),
                 yara_signature: req.yara_signature,
@@ -999,19 +1042,20 @@ impl SQLiteInterface {
                 view: req.view,
                 group: req.group.clone(),
                 query: req.query.clone(),
-                start: start,
-                end: end,
+                start,
+                end,
                 suspect_files: 0,
+                filtered_files: 0,
                 hit_files: Default::default(),
                 truncated: false,
             })?)
             .bind(req.group)
             .bind(chrono::Utc::now().to_rfc3339())
-            .execute(&self.db).await?;
+            .execute(&self.db).await.context("inserting search")?;
 
 
         self.work_notification.notify_waiters();
-        match self.search_status(code).await? {
+        match self.search_status(code).await.context("first search status")? {
             Some(result) => Ok(result),
             None => Err(anyhow::anyhow!("Result status could not be read.")),
         }
@@ -1019,7 +1063,7 @@ impl SQLiteInterface {
 
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         let mut conn = self.db.acquire().await?;
-        let data = self._get_search(&mut conn, &code).await?;
+        let data = self._get_search(&mut conn, &code).await.context("_get_search")?;
 
         let (stage, search) = match data {
             Some(row) => row,
@@ -1045,6 +1089,7 @@ impl SQLiteInterface {
                     stage,
                     errors: search.errors,
                     suspect_files: search.suspect_files,
+                    filtered_files: search.filtered_files,
                     pending_files: pending_files as u64,
                     hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
                     truncated: search.truncated,
@@ -1053,93 +1098,57 @@ impl SQLiteInterface {
         ))
     }
 
-//     async fn claim_filter_task(&self, id: i64, worker: &String) -> Result<bool> {
-//         let mut conn = self.db.acquire().await?;
-//         let req = sqlx::query(
-//             "UPDATE filter_tasks SET assigned_worker = ?, assigned_time = ?
-//             WHERE id = ?")
-//             .bind(worker.as_str())
-//             .bind(chrono::Utc::now().to_rfc3339())
-//             .bind(id)
-//             .execute(&mut conn).await?;
-//         return Ok(req.rows_affected() > 0)
-//     }
+    pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
+        let mut conn = self.db.acquire().await?;
+        let req: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT assigned_worker, id FROM yara_tasks WHERE assigned_time < ?")
+            .bind(time.to_rfc3339())
+            .fetch_all(&mut conn).await?;
+        return Ok(req)
+    }
 
-//     pub async fn get_filter_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
-//         let mut conn = self.db.acquire().await?;
-//         let req: Vec<(String, i64)> = sqlx::query_as(
-//             "SELECT assigned_worker, id FROM filter_tasks WHERE assigned_time < ?")
-//             .bind(time.to_rfc3339())
-//             .fetch_all(&mut conn).await?;
-//         return Ok(req)
-//     }
+    pub async fn release_tasks_assigned_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        let mut conn = self.db.acquire().await?;
+        let yara_req = sqlx::query(
+            "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
+            WHERE assigned_time < ?")
+            .bind(time.to_rfc3339())
+            .execute(&mut conn).await?;
+        return Ok(yara_req.rows_affected())
+    }
 
-//     pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
-//         let mut conn = self.db.acquire().await?;
-//         let req: Vec<(String, i64)> = sqlx::query_as(
-//             "SELECT assigned_worker, id FROM yara_tasks WHERE assigned_time < ?")
-//             .bind(time.to_rfc3339())
-//             .fetch_all(&mut conn).await?;
-//         return Ok(req)
-//     }
+    async fn claim_yara_task(&self, id: i64, worker: &String) -> Result<bool> {
+        let mut conn = self.db.acquire().await?;
+        let req = sqlx::query(
+            "UPDATE yara_tasks SET assigned_worker = ?, assigned_time = ?
+            WHERE id = ?")
+            .bind(worker.as_str())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&mut conn).await?;
+        return Ok(req.rows_affected() > 0)
+    }
 
-//     pub async fn release_tasks_assigned_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
-//         let mut conn = self.db.acquire().await?;
-//         let filter_req = sqlx::query(
-//             "UPDATE filter_tasks SET assigned_worker = NULL, assigned_time = NULL
-//             WHERE assigned_time < ?")
-//             .bind(time.to_rfc3339())
-//             .execute(&mut conn).await?;
-//         let yara_req = sqlx::query(
-//             "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
-//             WHERE assigned_time < ?")
-//             .bind(time.to_rfc3339())
-//             .execute(&mut conn).await?;
-//         return Ok(filter_req.rows_affected() + yara_req.rows_affected())
-//     }
+    pub async fn release_yara_task(&self, id: i64) -> Result<bool>{
+        self._release_yara_task(&self.db, id).await
+    }
 
-//     pub async fn release_filter_task(&self, id: i64) -> Result<bool> {
-//         let mut conn = self.db.acquire().await?;
-//         let req = sqlx::query(
-//             "UPDATE filter_tasks SET assigned_worker = NULL, assigned_time = NULL
-//             WHERE id = ?")
-//             .bind(id)
-//             .execute(&mut conn).await?;
-//         return Ok(req.rows_affected() > 0)
-//     }
+    async fn _release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>
+    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    {
+        let req = sqlx::query(
+            "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
+            WHERE id = ?")
+            .bind(id)
+            .execute(conn).await?;
+        return Ok(req.rows_affected() > 0)
+    }
 
-//     async fn claim_yara_task(&self, id: i64, worker: &String) -> Result<bool> {
-//         let mut conn = self.db.acquire().await?;
-//         let req = sqlx::query(
-//             "UPDATE yara_tasks SET assigned_worker = ?, assigned_time = ?
-//             WHERE id = ?")
-//             .bind(worker.as_str())
-//             .bind(chrono::Utc::now().to_rfc3339())
-//             .bind(id)
-//             .execute(&mut conn).await?;
-//         return Ok(req.rows_affected() > 0)
-//     }
-
-//     pub async fn release_yara_task(&self, id: i64) -> Result<bool>{
-//         self._release_yara_task(&self.db, id).await
-//     }
-
-//     async fn _release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>
-//     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
-//     {
-//         let req = sqlx::query(
-//             "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
-//             WHERE id = ?")
-//             .bind(id)
-//             .execute(conn).await?;
-//         return Ok(req.rows_affected() > 0)
-//     }
-
-    async fn _get_search<'e, E>(&self, conn: E, code: &String) -> Result<Option<(SearchStage, SearchRecord)>>
+    async fn _get_search<'e, E>(&self, conn: E, code: &str) -> Result<Option<(SearchStage, SearchRecord)>>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let search: Option<(SearchStage, Vec<u8>)> = sqlx::query_as(
-            "SELECT (stage, data) FROM searches WHERE code = ? LIMIT 1")
+            "SELECT stage, data FROM searches WHERE code = ? LIMIT 1")
             .bind(&code)
             .fetch_optional(conn).await?;
 
@@ -1149,294 +1158,324 @@ impl SQLiteInterface {
         })
     }
 
-//     async fn get_yara_task(&self, conn: &mut PoolConnection<sqlx::Sqlite>, worker: &String) -> Result<Vec<YaraTask>> {
-//         let search: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
-//             "SELECT id, search, hashes FROM yara_tasks WHERE assigned_worker IS NULL LIMIT 1")
-//             .fetch_optional(&mut *conn).await?;
+    pub async fn get_queued_or_filtering_searches(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let searches: Vec<(String, SearchStage)> = sqlx::query_as(
+            "SELECT code, stage FROM searches WHERE stage = ? OR stage = ?")
+            .bind(SearchStage::Queued)
+            .bind(SearchStage::Filtering)
+            .fetch_all(&self.db).await?;
 
-//         let (id, search, hashes) = match search {
-//             Some(row) => row,
-//             None => return Ok(vec![]),
-//         };
+        let mut queued = vec![];
+        let mut filtering = vec![];
 
-//         let record = match self._get_search(conn, &search).await? {
-//             Some(record) => record,
-//             None => return Ok(vec![])
-//         };
+        for (code, stage) in searches {
+            match stage {
+                SearchStage::Queued => queued.push(code),
+                SearchStage::Filtering => filtering.push(code),
+                _ => {}
+            }
+        }
 
-//         let hashes: Vec<Vec<u8>> = postcard::from_bytes(&hashes)?;
-//         if self.claim_yara_task(id, &worker).await? {
-//             Ok(vec![YaraTask {
-//                 id,
-//                 search,
-//                 yara_rule: record.yara_signature,
-//                 hashes
-//             }])
-//         } else {
-//             Ok(vec![])
-//         }
-//     }
+        return Ok((queued, filtering))
+    }
 
 
-//     pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
-//         let mut conn = self.db.acquire().await?;
-//         // Look for related filter jobs
-//         let mut filter_tasks = {
-//             // : dyn Stream<>
-//             let mut raw = sqlx::query(
-//                 "SELECT id, query, search, filter_id, filter_blob FROM filter_tasks WHERE assigned_worker IS NULL")
-//                 .fetch(&mut conn);
+    pub async fn set_search_stage(&self, code: &str, stage: SearchStage) -> Result<()> {
+        sqlx::query(
+            "UPDATE searches SET stage = ? WHERE code = ?")
+            .bind(stage)
+            .bind(code)
+            .execute(&self.db).await?;
+        return Ok(())
+    }
 
-//             let mut filters = vec![];
-//             while let Some(row) = raw.try_next().await.context("Error listing assignable tasks.")? {
-//                 let id: i64 = row.get(0);
-//                 let query: Vec<u8> = row.get(1);
-//                 let search: String = row.get(2);
-//                 let filter_id: IndexID = row.get(3);
-//                 let filter_blob: BlobID = row.get(4);
-//                 let query: Query = postcard::from_bytes(&query)?;
+    pub async fn filter_search(&self, code: &str) -> Result<()> {
+        // Get the search in question
+        let mut conn = self.db.acquire().await?;
+        let record = match self._get_search(&mut conn, code).await? {
+            None => return Ok(()),
+            Some((stage, record)) => {
+                if stage == SearchStage::Filtering {
+                    record
+                } else {
+                    return Ok(())
+                }
+            }
+        };
 
-//                 if !req.cached_filters.contains(&filter_blob) {
-//                     continue;
-//                 }
+        // Load the set of indices in the range for this job
+        let indices = self.list_indices().await?;
+        let indices: Vec<IndexGroup> = indices.into_iter()
+            .filter(|index| &record.start <= index && index <= &record.end).collect();
 
-//                 if self.claim_filter_task(id, &req.worker).await? {
-//                     filters.push(FilterTask {
-//                         id,
-//                         search,
-//                         filter_id,
-//                         filter_blob,
-//                         query
-//                     });
-//                 }
-//             }
-//             filters
-//         };
+        let mut files: HashSet<Vec<u8>> = Default::default();
+        let mut rejected_files: HashSet<Vec<u8>> = Default::default();
+        for index_group in indices {
+            // Load the base filters for this index
+            let mut outstanding_groups = self._find_all_roots(&mut conn, &index_group).await?;
 
-//         // Add a job from a new filter
-//         while filter_tasks.len() < 2 {
-//             let filter: Option<(BlobID, IndexID)> = sqlx::query_as(
-//                 "SELECT filter_blob, filter_id FROM filter_tasks WHERE assigned_worker IS NULL LIMIT 1")
-//                 .fetch_optional(&mut conn).await?;
+            // Apply filters recursively until we only have file entries left
+            while let Some((group_id, leaves, filter)) = outstanding_groups.pop() {
+                if !filter.query(&record.query) {
+                    continue
+                }
 
-//             let (filter_blob, filter_id) = match filter {
-//                 Some(filter) => filter,
-//                 None => break,
-//             };
+                if leaves {
+                    for (hash, access, filter) in self._load_files_in_group(&mut conn, &index_group, group_id).await? {
+                        if rejected_files.contains(&hash) { continue }
+                        if !access.can_access(&record.access) || !filter.query(&record.query) {
+                            rejected_files.insert(hash);
+                            continue
+                        }
+                        files.insert(hash);
+                    }
+                } else {
+                    outstanding_groups.extend(self._load_groups_in_group(&mut conn, &index_group, group_id).await?);
+                }
+            }
+        }
 
-//             let raw: Vec<(i64, Vec<u8>, String)> = sqlx::query_as(
-//                 "SELECT id, query, search FROM filter_tasks WHERE assigned_worker IS NULL AND filter_blob = ?")
-//                 .bind(filter_blob.as_str())
-//                 .fetch_all(&mut conn).await?;
+        let mut trans = conn.begin().await?;
 
-//             for (id, query, search) in raw {
-//                 let query: Query = postcard::from_bytes(&query)?;
+        // Create yara jobs for these files
+        let files: Vec<Vec<u8>> = files.into_iter().collect();
+        for hash_block in files.chunks(self.config.yara_job_size as usize) {
+            let hashes_data = postcard::to_allocvec(&hash_block)?;
+            sqlx::query(
+                "INSERT INTO yara_tasks(search, hashes, hash_count) VALUES(?,?,?)")
+                .bind(&code)
+                .bind(hashes_data)
+                .bind(hash_block.len() as i64)
+                .execute(&mut trans).await?;
+        }
 
-//                 if self.claim_filter_task(id, &req.worker).await? {
-//                     filter_tasks.push(FilterTask {
-//                         id,
-//                         search,
-//                         filter_id: filter_id.clone(),
-//                         filter_blob: filter_blob.clone(),
-//                         query
-//                     });
-//                 }
-//             }
-//         }
+        let stage = if files.is_empty() {
+            SearchStage::Finished
+        } else {
+            SearchStage::Yara
+        };
 
-//         // Grab some yara jobs
-//         let yara_tasks = self.get_yara_task(&mut conn, &req.worker).await?;
+        // Update job status
+        let mut record = record;
+        record.suspect_files = files.len() as u64;
+        record.filtered_files = rejected_files.len() as u64;
+        sqlx::query(
+            "UPDATE searches SET data = ?, stage = ? WHERE code = ?")
+            .bind(&postcard::to_allocvec(&record)?)
+            .bind(stage)
+            .bind(&code)
+            .execute(&mut trans).await?;
 
-//         if !filter_tasks.is_empty() || !yara_tasks.is_empty() {
-//             debug!("Returning work bundle with {} filters {} yara batches", filter_tasks.len(), yara_tasks.len());
-//         }
-//         return Ok(WorkPackage{
-//             filter: filter_tasks,
-//             yara: yara_tasks,
-//         })
-//     }
+        // Apply search result
+        Ok(trans.commit().await?)
+    }
 
-//     pub async fn get_work_notification(&self) -> Result<()> {
-//         Ok(self.work_notification.notified().await)
-//     }
+    async fn get_yara_task(&self, conn: &mut PoolConnection<sqlx::Sqlite>, worker: &String) -> Result<Vec<YaraTask>> {
+        let search: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, search, hashes FROM yara_tasks WHERE assigned_worker IS NULL LIMIT 1")
+            .fetch_optional(&mut *conn).await?;
 
-//     pub async fn finish_filter_work(&self, id: i64, code: &String, search_cache: &mut SearchCache, index: IndexID, file_ids: Vec<u64>) -> Result<()> {
-//         let mut conn = self.db.acquire().await?;
-//         let table_name = filter_table_name(&index);
+        let (id, search, hashes) = match search {
+            Some(row) => row,
+            None => return Ok(vec![]),
+        };
 
-//         let search_access = match &search_cache.access {
-//             Some(access) => access,
-//             None => {
-//                 let search_entry = self._get_search(&mut conn, code).await?;
-//                 match search_entry {
-//                     Some(search_entry) => {
-//                         search_cache.access = Some(search_entry.access.clone());
-//                         search_cache.access.as_ref().unwrap()
-//                     }
-//                     None => {
-//                         return Err(anyhow::anyhow!("Terminated search"));
-//                     }
-//                 }
-//             },
-//         };
+        let record = match self._get_search(conn, &search).await? {
+            Some((_stage, record)) => record,
+            None => return Ok(vec![])
+        };
 
-//         // Get the information about the filter entry
-//         let mut found_hashes = vec![];
-//         for index in file_ids {
-//             // Load the hash and access
-//             let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!(
-//                 "SELECT hash, access FROM {table_name} WHERE number = ?"))
-//                 .bind(index as i64)
-//                 .fetch_optional(&mut conn).await?;
+        let hashes: Vec<Vec<u8>> = postcard::from_bytes(&hashes)?;
+        if self.claim_yara_task(id, &worker).await? {
+            Ok(vec![YaraTask {
+                id,
+                search,
+                yara_rule: record.yara_signature,
+                hashes
+            }])
+        } else {
+            Ok(vec![])
+        }
+    }
 
-//             let (hash, access) = match row {
-//                 Some((hash, access)) => {
-//                     if !search_cache.seen.insert(hash.clone()) {
-//                         continue;
-//                     }
 
-//                     (hash, match postcard::from_bytes::<AccessControl>(&access) {
-//                         Ok(access) => access,
-//                         Err(_) => continue,
-//                     })
-//                 },
-//                 None => continue,
-//             };
+    pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
+        let mut conn = self.db.acquire().await?;
 
-//             // Filter on access
-//             if access.can_access(search_access) {
-//                 found_hashes.push(hash);
-//             }
-//         }
+        // Grab some yara jobs
+        let yara_tasks = self.get_yara_task(&mut conn, &req.worker).await?;
 
-//         // Create yara job
-//         for hash_block in found_hashes.chunks(self.config.yara_job_size as usize) {
-//             let hashes_data = postcard::to_allocvec(&hash_block)?;
-//             sqlx::query(
-//                 "INSERT INTO yara_tasks(search, hashes, hash_count) VALUES(?,?,?)")
-//                 .bind(&code)
-//                 .bind(hashes_data)
-//                 .bind(hash_block.len() as i64)
-//                 .execute(&mut conn).await?;
-//         }
+        return Ok(WorkPackage{
+            yara: yara_tasks,
+        })
+    }
 
-//         // Drop finished filter job
-//         sqlx::query(
-//             "DELETE FROM filter_tasks WHERE id = ?")
-//             .bind(id)
-//             .execute(&mut conn).await?;
+    pub async fn get_work_notification(&self) -> Result<()> {
+        Ok(self.work_notification.notified().await)
+    }
 
-//         self.work_notification.notify_waiters();
-//         return Ok(())
-//     }
+    pub async fn finish_yara_work(&self, id: i64, code: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
 
-//     pub async fn finish_yara_work(&self, id: i64, code: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
-//         let mut conn = self.db.acquire().await?;
+        // Store confirmed hashes into search object
+        loop {
+            // Get the old record value
+            let buffer: Option<(Vec<u8>, )> = sqlx::query_as(
+                "SELECT data FROM searches WHERE code = ? LIMIT 1")
+                .bind(&code)
+                .fetch_optional(&mut conn).await?;
+            let buffer = match buffer {
+                Some(buffer) => buffer.0,
+                None => return Err(anyhow::anyhow!("results on missing search.")),
+            };
+            let mut search: SearchRecord = postcard::from_bytes(&buffer)?;
 
-//         // Store confirmed hashes into search object
-//         loop {
-//             // Get the old record value
-//             let buffer: Option<(Vec<u8>, )> = sqlx::query_as(
-//                 "SELECT data FROM searches WHERE code = ? LIMIT 1")
-//                 .bind(&code)
-//                 .fetch_optional(&mut conn).await?;
-//             let buffer = match buffer {
-//                 Some(buffer) => buffer.0,
-//                 None => return Err(anyhow::anyhow!("results on missing search.")),
-//             };
-//             let mut search: SearchRecord = postcard::from_bytes(&buffer)?;
+            // Update the record
+            let before_count = search.hit_files.len();
+            let before_truncated = search.truncated;
+            for hash in hashes.iter() {
+                if search.hit_files.contains(hash) { continue }
+                if search.hit_files.len() >= self.config.max_result_set_size as usize {
+                    search.truncated = true;
+                    break
+                }
+                search.hit_files.insert(hash.clone());
+            }
 
-//             // Update the record
-//             let before_count = search.hit_files.len();
-//             let before_truncated = search.truncated;
-//             for hash in hashes.iter() {
-//                 if search.hit_files.contains(hash) { continue }
-//                 if search.hit_files.len() >= self.config.max_result_set_size as usize {
-//                     search.truncated = true;
-//                     break
-//                 }
-//                 search.hit_files.insert(hash.clone());
-//             }
+            if before_count == search.hit_files.len() && before_truncated == search.truncated {
+                break;
+            }
 
-//             if before_count == search.hit_files.len() && before_truncated == search.truncated {
-//                 break;
-//             }
+            // Apply the update
+            let res = sqlx::query(
+                "UPDATE searches SET data = ? WHERE code = ? AND data = ?")
+                .bind(&postcard::to_allocvec(&search)?)
+                .bind(&code)
+                .bind(&buffer)
+                .execute(&mut conn).await?;
+            if res.rows_affected() > 0 {
+                break;
+            }
+        }
 
-//             // Apply the update
-//             let res = sqlx::query(
-//                 "UPDATE searches SET data = ? WHERE code = ? AND data = ?")
-//                 .bind(&postcard::to_allocvec(&search)?)
-//                 .bind(&code)
-//                 .bind(&buffer)
-//                 .execute(&mut conn).await?;
-//             if res.rows_affected() > 0 {
-//                 break;
-//             }
-//         }
+        // remove finished yara jobs
+        sqlx::query(
+            "DELETE FROM yara_tasks WHERE id = ?")
+            .bind(id)
+            .execute(&mut conn).await?;
 
-//         // remove finished yara jobs
-//         sqlx::query(
-//             "DELETE FROM yara_tasks WHERE id = ?")
-//             .bind(id)
-//             .execute(&mut conn).await?;
-//         return Ok(())
-//     }
+        // Check if the yara phase is done
+        let (count, ): (i64, ) = sqlx::query_as("SELECT count(1) FROM yara_tasks WHERE search = ? LIMIT 1").bind(code).fetch_one(&mut conn).await?;
+        if count == 0 {
+            self.set_search_stage(code, SearchStage::Finished).await?;
+        }
+        return Ok(());
+    }
 
-//     pub async fn work_error(&self, err: WorkError) -> Result<()> {
-//         let mut conn = self.db.acquire().await?;
 
-//         let (code, error_message) = match &err {
-//             WorkError::Yara(id, err) => {
-//                 let (search, ): (String, ) = sqlx::query_as(
-//                     "SELECT search FROM yara_tasks WHERE id = ? LIMIT 1").bind(id)
-//                     .fetch_one(&mut conn).await?;
-//                 (search, err)
-//             },
-//             WorkError::Filter(id, err) => {
-//                 let (search, ): (String, ) = sqlx::query_as(
-//                     "SELECT search FROM filter_tasks WHERE id = ? LIMIT 1").bind(id)
-//                     .fetch_one(&mut conn).await?;
-//                 (search, err)
-//             },
-//         };
+    pub async fn add_work_error(&self, err: WorkError) -> Result<()> {
+        let (search, ): (String, ) = sqlx::query_as(
+            "SELECT search FROM yara_tasks WHERE id = ? LIMIT 1")
+            .bind(err.job_id).fetch_one(&self.db).await?;
+        self.add_search_error(&search, &err.error).await?;
+        sqlx::query("DELETE FROM yara_tasks WHERE id = ?").bind(err.job_id).execute(&self.db).await?;
+        return Ok(())
+    }
 
-//         loop {
-//             // Get the old record value
-//             let buffer: Option<(Vec<u8>, )> = sqlx::query_as(
-//                 "SELECT data FROM searches WHERE code = ? LIMIT 1")
-//                 .bind(&code)
-//                 .fetch_optional(&mut conn).await?;
-//             let buffer = match buffer {
-//                 Some(buffer) => buffer.0,
-//                 None => return Err(anyhow::anyhow!("results on missing search.")),
-//             };
-//             let mut search: SearchRecord = postcard::from_bytes(&buffer)?;
+    pub async fn add_search_error(&self, code: &str, error_message: &str) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
 
-//             // Update the record
-//             search.errors.push(error_message.clone());
+        loop {
+            // Get the old record value
+            let buffer: Option<(Vec<u8>, )> = sqlx::query_as(
+                "SELECT data FROM searches WHERE code = ? LIMIT 1")
+                .bind(&code)
+                .fetch_optional(&mut conn).await?;
+            let buffer = match buffer {
+                Some(buffer) => buffer.0,
+                None => return Err(anyhow::anyhow!("results on missing search.")),
+            };
+            let mut search: SearchRecord = postcard::from_bytes(&buffer)?;
 
-//             // Apply the update
-//             let res = sqlx::query(
-//                 "UPDATE searches SET data = ? WHERE code = ? AND data = ?")
-//                 .bind(&postcard::to_allocvec(&search)?)
-//                 .bind(&code)
-//                 .bind(&buffer)
-//                 .execute(&mut conn).await?;
-//             if res.rows_affected() > 0 {
-//                 break;
-//             }
-//         }
+            // Update the record
+            search.errors.push(error_message.to_owned());
 
-//         match &err {
-//             WorkError::Yara(id, _) => {
-//                 sqlx::query("DELETE FROM yara_tasks WHERE id = ?").bind(id).execute(&mut conn).await?;
-//             },
-//             WorkError::Filter(id, _) => {
-//                 sqlx::query("DELETE FROM filter_tasks WHERE id = ?").bind(id).execute(&mut conn).await?;
-//             },
-//         };
+            // Apply the update
+            let res = sqlx::query(
+                "UPDATE searches SET data = ? WHERE code = ? AND data = ?")
+                .bind(&postcard::to_allocvec(&search)?)
+                .bind(&code)
+                .bind(&buffer)
+                .execute(&mut conn).await?;
+            if res.rows_affected() > 0 {
+                break;
+            }
+        }
 
-//         return Ok(())
-//     }
+        return Ok(())
+
+    }
+
+    fn _new_partition<A, B>(items: Vec<(A, B, SimpleFilter)>) -> Option<(Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>)> {
+        // Find the best partition
+        let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect()) {
+            Some(index) => index,
+            None => {
+                return None
+            },
+        };
+
+        // Split the items that will move
+        let (a_items, b_items): (Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>) = items.into_iter()
+            .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
+        Some((a_items, b_items))
+    }
+
+    pub async fn partition_test(&self) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
+
+        for index in self.list_indices().await? {
+            let filter_table = filter_table_name(&index);
+            let groups: Vec<(i64, bool)> = query_as(&format!("
+            SELECT id, leaves FROM {filter_table}"))
+            .fetch_all(&mut conn).await?;
+
+            for (group_id, leaves) in groups {
+                let items: Vec<((), (), SimpleFilter)> = if leaves {
+                    self._load_files_in_group(&mut conn, &index, group_id).await?
+                        .into_iter()
+                        .map(|(_, _, filter)|((), (), filter)).collect()
+                } else {
+                    self._load_groups_in_group(&mut conn, &index, group_id).await?
+                        .into_iter()
+                        .map(|(_, _, filter)|((), (), filter)).collect()
+                };
+
+                println!("{group_id}");
+
+                if let Some((a_items, b_items)) = Self::_partition(items.clone()) {
+                    let kind = a_items[0].2.kind();
+                    let size = SimpleFilter::parse_kind(&kind)?;
+                    let a_cover = a_items.iter()
+                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                    let b_cover = b_items.iter()
+                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                    println!("Split ")
+                }
+
+
+                if let Some((a_items, b_items)) = Self::_new_partition(items.clone()) {
+                    let kind = a_items[0].2.kind();
+                    let size = SimpleFilter::parse_kind(&kind)?;
+                    let a_cover = a_items.iter()
+                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                    let b_cover = b_items.iter()
+                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                }
+
+            }
+        }
+        return Ok(())
+    }
 }
 

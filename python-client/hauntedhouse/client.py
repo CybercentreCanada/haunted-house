@@ -27,11 +27,11 @@ class DuplicateToken(KeyError):
 class SearchStatus(pydantic.BaseModel):
     code: str
     group: str
-    finished: bool
+    stage: str
     errors: list[str]
-    total_indices: int
-    pending_indices: int
-    pending_candidates: int
+    suspect_files: int
+    pending_files: int
+    filtered_files: int
     hits: list[str]
     truncated: bool
 

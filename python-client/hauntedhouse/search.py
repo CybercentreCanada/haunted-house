@@ -1,6 +1,7 @@
 import asyncio
 import os
 import argparse
+from pprint import pprint
 
 from assemblyline_client import get_client
 
@@ -30,10 +31,12 @@ async def main(yara_file, access, verify):
                       classification=classification_definition, verify=verify) as client:
 
         search_status = await client.start_search(body, access, archive_only=False)
+        pprint(search_status)
 
-        while not search_status.finished:
+        while not search_status.stage.lower() == 'finished':
             await asyncio.sleep(10)
             search_status = await client.search_status(search_status.code, access)
+            pprint(search_status)
 
         if search_status.errors:
             print(search_status.errors)

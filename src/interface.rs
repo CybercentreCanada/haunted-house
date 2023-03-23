@@ -1,6 +1,6 @@
 
 
-use std::collections::{HashSet, HashMap};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use anyhow::{Result, Context};
@@ -25,7 +25,7 @@ use crate::access::AccessControl;
 use crate::auth::Role;
 use crate::config::TLSConfig;
 use crate::core::{HouseCore, IngestStatus, SearchStatus};
-use crate::database::{IndexGroup, SearchStage, IndexStatus};
+use crate::database::{SearchStage, IndexStatus};
 use crate::query::Query;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -167,20 +167,19 @@ impl WorkerInterface {
     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
         let start = std::time::Instant::now();
         loop {
-            todo!()
-            // let work = self.core.get_work(&req).await?;
-            // if !work.is_empty() {
-            //     return Ok(work);
-            // }
+            let work = self.core.get_work(&req).await?;
+            if !work.is_empty() {
+                return Ok(work);
+            }
 
-            // let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
-            //     Some(wait) => wait,
-            //     None => return Ok(Default::default()),
-            // };
+            let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
+                Some(wait) => wait,
+                None => return Ok(Default::default()),
+            };
 
-            // if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
-            //     return Ok(Default::default())
-            // }
+            if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
+                return Ok(Default::default())
+            }
         }
     }
 
@@ -189,8 +188,7 @@ impl WorkerInterface {
     }
 
     pub async fn work_error(&self, req: WorkError) -> Result<()> {
-        todo!()
-        // self.core.work_error(req).await
+        self.core.database.add_work_error(req).await
     }
 }
 
@@ -261,6 +259,7 @@ pub struct SearchRequestResponse {
     pub errors: Vec<String>,
     pub suspect_files: u64,
     pub pending_files: u64,
+    pub filtered_files: u64,
     pub hits: Vec<String>,
     pub truncated: bool,
 }
@@ -344,9 +343,9 @@ pub struct WorkResult {
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum WorkError {
-    Yara(i64, String),
-    Filter(i64, String),
+pub struct WorkError {
+    pub job_id: i64,
+    pub error: String,
 }
 
 #[handler]

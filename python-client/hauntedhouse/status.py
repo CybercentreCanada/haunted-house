@@ -1,4 +1,4 @@
-from pprint import pprint
+from pprint import PrettyPrinter
 import asyncio
 import os
 import argparse
@@ -12,10 +12,12 @@ HAUNTED_HOUSE_API_KEY = os.environ['HAUNTEDHOUSE_API_KEY']
 
 async def main(verify):
 
+    printer = PrettyPrinter(width=200, compact=True, underscore_numbers=True)
+
     async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + HAUNTED_HOUSE_API_KEY}) as session:
         async with session.get(HAUNTED_HOUSE_URL + "/status/detailed", verify_ssl=verify) as resp:
             resp.raise_for_status()
-            pprint(await resp.json())
+            printer.pprint(await resp.json())
 
 
 if __name__ == '__main__':
