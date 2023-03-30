@@ -8,9 +8,6 @@ default-run = "haunted-house"
 name = "operator"
 required-features = ["operator"]
 
-[profile.release]
-lto = true
-
 [dependencies]
 serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0"
@@ -42,6 +39,7 @@ gethostname = "0.4"
 yara = { version = "0.16", features= ["vendored"] }
 # yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
 clap = { version = "4", features = ["derive"] }
+seahash = { version = "4" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
