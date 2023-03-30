@@ -23,7 +23,8 @@ impl SimpleFilter {
     pub fn build(size: u64, trigrams: &BitVec) -> Self {
         let mut buffer = Self::empty(size);
         for index in trigrams.iter_ones() {
-            buffer.data.set(index % size as usize, true);
+            let index = (seahash::hash(&index.to_le_bytes()) % size) as usize;
+            buffer.data.set(index, true);
         }
         buffer
     }
@@ -45,8 +46,21 @@ impl SimpleFilter {
         self.data.len() as u64
     }
 
+    pub fn cost(&self) -> f64 {
+        let density = self.density();
+        density / (1.0 - density)
+    }
+
+    pub fn full(&self) -> bool {
+        self.data.count_zeros() == 0
+    }
+
     pub fn count_ones(&self) -> usize {
         self.data.count_ones()
+    }
+
+    pub fn count_zeros(&self) -> usize {
+        self.data.count_zeros()
     }
 
     pub fn density(&self) -> f64 {
@@ -94,9 +108,11 @@ impl SimpleFilter {
                 return false
             },
             Query::Literal(term) => {
+                let size = self.data.len() as u64;
                 for trigram in term.windows(3) {
                     let index = (trigram[0] as u32) << 16 | (trigram[1] as u32) << 8 | (trigram[2] as u32);
-                    if !self.data.get(index as usize % self.data.len()).unwrap() {
+                    let index = (seahash::hash(&index.to_le_bytes()) % size) as usize;
+                    if !self.data.get(index).unwrap() {
                         return false
                     }
                 }
