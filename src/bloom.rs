@@ -15,19 +15,39 @@ pub struct SimpleFilter {
     pub data: BitVec
 }
 
+pub struct PreparedTrigrams(Vec<u64>);
+
 impl SimpleFilter {
     pub fn empty(size: u64) -> Self {
         Self { data: bitvec::bitvec![0; size as usize] }
     }
 
-    pub fn build(size: u64, trigrams: &BitVec) -> Self {
-        let mut buffer = Self::empty(size);
+    pub fn prepare(trigrams: &BitVec) -> PreparedTrigrams {
+        let mut buffer = vec![];
         for index in trigrams.iter_ones() {
-            let index = (seahash::hash(&index.to_le_bytes()) % size) as usize;
-            buffer.data.set(index, true);
+            buffer.push(seahash::hash(&index.to_le_bytes()));
+        }
+        buffer.sort_unstable();
+        buffer.dedup();
+        PreparedTrigrams(buffer)
+    }
+
+    pub fn build(size: u64, indices: &PreparedTrigrams) -> Self {
+        let mut buffer = Self::empty(size);
+        for index in &indices.0 {
+            buffer.data.set((index % size) as usize, true);
         }
         buffer
     }
+
+    // pub fn build_from(size: u64, trigrams: &BitVec) -> Self {
+    //     let mut buffer = Self::empty(size);
+    //     for index in trigrams.iter_ones() {
+    //         let index = (seahash::hash(&index.to_le_bytes()) % size) as usize;
+    //         buffer.data.set(index, true);
+    //     }
+    //     buffer
+    // }
 
     pub fn load(kind: &str, data: &Vec<u8>) -> Result<Self> {
         let size = Self::parse_kind(kind)?;
@@ -110,7 +130,7 @@ impl SimpleFilter {
             Query::Literal(term) => {
                 let size = self.data.len() as u64;
                 for trigram in term.windows(3) {
-                    let index = (trigram[0] as u32) << 16 | (trigram[1] as u32) << 8 | (trigram[2] as u32);
+                    let index = (trigram[0] as u64) << 16 | (trigram[1] as u64) << 8 | (trigram[2] as u64);
                     let index = (seahash::hash(&index.to_le_bytes()) % size) as usize;
                     if !self.data.get(index).unwrap() {
                         return false
@@ -140,8 +160,10 @@ mod test {
             trigrams.push(prng.gen());
         }
 
+        let prepared = SimpleFilter::prepare(&trigrams);
+
         for power in START_POWER..=END_POWER {
-            let filter = SimpleFilter::build(1 << power, &trigrams);
+            let filter = SimpleFilter::build(1 << power, &prepared);
             let kind = filter.kind();
             let data = filter.to_buffer().unwrap();
             let unpacked = SimpleFilter::load(&kind, &data).unwrap();
@@ -164,7 +186,7 @@ mod test {
             trigrams.set(trigram as usize, true);
         }
 
-        let filter = SimpleFilter::build(1 << 10, &trigrams);
+        let filter = SimpleFilter::build(1 << 10, &SimpleFilter::prepare(&trigrams));
 
         for _ in 0..1000 {
             let index = prng.gen_range(0..(data.len() - 8));
