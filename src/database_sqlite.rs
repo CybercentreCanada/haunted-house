@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet, HashMap};
 use std::path::{Path};
@@ -177,6 +178,7 @@ impl SQLiteInterface {
 
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
+        sqlx::query("PRAGMA busy_timeout=120000").execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
@@ -445,12 +447,12 @@ impl SQLiteInterface {
 
     fn _pick_best(target: &SimpleFilter, options: &Vec<&SimpleFilter>) -> Result<usize> {
         let mut best = 0;
-        let mut best_score = 0;
+        let mut best_cost = f64::INFINITY;
         for (index, other) in options.iter().enumerate() {
-            let score = target.overlap(other)?.data.count_zeros();
-            if score > best_score {
+            let cost = other.cost() - target.overlap(other)?.cost();
+            if cost < best_cost {
                 best = index;
-                best_score = score;
+                best_cost = cost;
             }
         }
         Ok(best)
@@ -492,7 +494,20 @@ impl SQLiteInterface {
             .bind(new.to_buffer()?)
             .bind(group_id)
             .bind(old_filter.to_buffer()?)
-            .execute(&mut *conn).await?;
+            .execute(&mut *conn).await;
+
+            let result = match result {
+                Ok(ok) => ok,
+                Err(err) => if let Some(dberr) = err.as_database_error() {
+                    if dberr.code() == Some(Cow::Borrowed("5")) {
+                        return Ok(false)
+                    } else {
+                        return Err(err.into())
+                    }
+                } else {
+                    return Err(err.into())
+                },
+            };
 
             // if we could insert it, continue to the next
             // if we failed abort and restart the insertion process
@@ -532,7 +547,6 @@ impl SQLiteInterface {
         }
 
         loop {
-            let mut trans = conn.begin().await?;
             let filter_table = filter_table_name(&index_group);
             let file_table = file_table_name(&index_group);
 
@@ -541,14 +555,14 @@ impl SQLiteInterface {
                 SELECT block, kind FROM {filter_table}
                 WHERE id = ?"))
                 .bind(group)
-                .fetch_optional(&mut trans).await?;
+                .fetch_optional(&mut *conn).await?;
             let (parent, kind): (Option<i64>, String) = match query {
                 Some(row) => row,
                 None => return Ok(false),
             };
 
             // Load all the files in the group
-            let items = self._load_files_in_group(&mut trans, index_group, group).await?;
+            let items = self._load_files_in_group(&mut *conn, index_group, group).await?;
             if items.len() < GROUP_SIZE {
                 return Ok(false)
             }
@@ -575,6 +589,7 @@ impl SQLiteInterface {
             let b_cover = b_items.iter()
                 .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
 
+            let mut trans = conn.begin().await?;
             // Check for root
             let parent = match parent {
                 Some(parent) => parent,
@@ -624,7 +639,6 @@ impl SQLiteInterface {
         }
 
         loop {
-            let mut trans = conn.begin().await?;
             let filter_table = filter_table_name(&index_group);
 
             // Get the group info
@@ -632,14 +646,14 @@ impl SQLiteInterface {
                 SELECT block, kind FROM {filter_table}
                 WHERE id = ?"))
                 .bind(group)
-                .fetch_optional(&mut trans).await?;
+                .fetch_optional(&mut *conn).await?;
             let (parent, kind): (Option<i64>, String) = match query {
                 Some(row) => row,
                 None => return Ok(false),
             };
 
             // Load all the files in the group
-            let items = self._load_groups_in_group(&mut trans, index_group, group).await?;
+            let items = self._load_groups_in_group(&mut *conn, index_group, group).await?;
             if items.len() < GROUP_SIZE {
                 return Ok(false)
             }
@@ -666,6 +680,7 @@ impl SQLiteInterface {
             let b_cover = b_items.iter()
                 .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
 
+            let mut trans = conn.begin().await?;
             // Check for root
             let parent = match parent {
                 Some(parent) => parent,
@@ -706,40 +721,52 @@ impl SQLiteInterface {
         }
     }
 
-    fn _partition<A, B>(items: Vec<(A, B, SimpleFilter)>) -> Option<(Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>)> {
-        // Find the best partition
-        let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect()) {
-            Some(index) => index,
-            None => {
+    fn _partition<A, B>(mut items: Vec<(A, B, SimpleFilter)>) -> Option<(Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>)> {
+        // Pick a starting item
+        let mut group = vec![{
+            let (_, index) = items.iter().enumerate()
+                .map(|row|(row.1.2.data.count_ones(), row.0))
+                .min()?;
+            let item = items.swap_remove(index);
+            if item.2.data.count_zeros() == 0 {
                 return None
-            },
-        };
+            }
+            item
+        }];
 
-        // Split the items that will move
-        let (a_items, b_items): (Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>) = items.into_iter()
-            .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
-        Some((a_items, b_items))
+        // Expand until we take half or  might lose more than half our zeros
+        let mut group_cover = group[0].2.clone();
+        let initial_zeros = group_cover.data.count_zeros();
+        if initial_zeros <= 2 {
+            return None
+        }
+
+        while group.len() + 1 < items.len() {
+            let (new_cover, index) = items.iter().enumerate()
+                .map(|row|(row.1.2.overlap(&group_cover).unwrap(), row.0))
+                .min_by_key(|row|row.0.data.count_zeros())?;
+
+            if group.len() > items.len()/3 {
+                if new_cover.data.count_zeros() < initial_zeros/2 {
+                    break
+                };
+            }
+
+            group_cover = new_cover;
+            group.push(items.swap_remove(index));
+        }
+
+        if group_cover.full() {
+            return None
+        }
+
+        // Return remains
+        return Some((group, items))
     }
 
-
-    fn _find_partition(items: &Vec<&SimpleFilter>) -> Option<usize> {
-        let mut counts: HashMap<usize, i64> = Default::default();
-        for filter in items.iter() {
-            for bit in filter.data.iter_ones() {
-                counts.insert(bit, *counts.get(&bit).unwrap_or(&0));
-            }
-        }
-        let mut best_index: Option<usize> = None;
-        let even_split = (items.len() as i64)/2;
-        let mut best_distance = even_split;
-        for (index, hits) in counts {
-            let distance = (hits - even_split).abs();
-            if distance < best_distance {
-                best_distance = distance;
-                best_index = Some(index)
-            }
-        }
-        best_index
+    fn _cover_on<A, B>(items: &Vec<(A, B, SimpleFilter)>) -> SimpleFilter {
+        let size = items[0].2.size();
+        items.iter().fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap())
     }
 
     async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &SimpleFilter) -> Result<i64>
@@ -1009,10 +1036,10 @@ impl SQLiteInterface {
         let mut trans = self.db.begin().await?;
 
         // Delete group table
-        let filter_table = filter_table_name(&entry);
-        sqlx::query(&format!("DROP TABLE IF EXISTS {filter_table}")).execute(&mut trans).await?;
         let file_table = file_table_name(&entry);
         sqlx::query(&format!("DROP TABLE IF EXISTS {file_table}")).execute(&mut trans).await?;
+        let filter_table = filter_table_name(&entry);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {filter_table}")).execute(&mut trans).await?;
 
         // Commit
         Ok(trans.commit().await?)
@@ -1416,31 +1443,19 @@ impl SQLiteInterface {
 
     }
 
-    fn _new_partition<A, B>(items: Vec<(A, B, SimpleFilter)>) -> Option<(Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>)> {
-        // Find the best partition
-        let split_index = match Self::_find_partition(&items.iter().map(|r|&r.2).collect()) {
-            Some(index) => index,
-            None => {
-                return None
-            },
-        };
-
-        // Split the items that will move
-        let (a_items, b_items): (Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>) = items.into_iter()
-            .partition(|row| row.2.data.get(split_index).as_deref() == Some(&true));
-        Some((a_items, b_items))
-    }
 
     pub async fn partition_test(&self) -> Result<()> {
         let mut conn = self.db.acquire().await?;
 
         for index in self.list_indices().await? {
             let filter_table = filter_table_name(&index);
-            let groups: Vec<(i64, bool)> = query_as(&format!("
-            SELECT id, leaves FROM {filter_table}"))
+            let groups: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
+            SELECT id, leaves, kind, filter FROM {filter_table}"))
             .fetch_all(&mut conn).await?;
 
-            for (group_id, leaves) in groups {
+            for (group_id, leaves, kind, filter) in groups {
+                let filter = SimpleFilter::load(&kind, &filter)?;
+
                 let items: Vec<((), (), SimpleFilter)> = if leaves {
                     self._load_files_in_group(&mut conn, &index, group_id).await?
                         .into_iter()
@@ -1451,7 +1466,11 @@ impl SQLiteInterface {
                         .map(|(_, _, filter)|((), (), filter)).collect()
                 };
 
-                println!("{group_id}");
+                if items.len() == 1 {
+                    continue
+                }
+
+                println!("{group_id}  {}  {}", items.len(), filter.density());
 
                 if let Some((a_items, b_items)) = Self::_partition(items.clone()) {
                     let kind = a_items[0].2.kind();
@@ -1460,18 +1479,24 @@ impl SQLiteInterface {
                         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
                     let b_cover = b_items.iter()
                         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-                    println!("Split ")
+                    println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
+                } else {
+                    println!("Old couldn't split.")
                 }
 
 
-                if let Some((a_items, b_items)) = Self::_new_partition(items.clone()) {
-                    let kind = a_items[0].2.kind();
-                    let size = SimpleFilter::parse_kind(&kind)?;
-                    let a_cover = a_items.iter()
-                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-                    let b_cover = b_items.iter()
-                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-                }
+                // if let Some((a_items, b_items)) = Self::_new_partition(items.clone()) {
+                //     let kind = a_items[0].2.kind();
+                //     let size = SimpleFilter::parse_kind(&kind)?;
+                //     let a_cover = a_items.iter()
+                //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                //     let b_cover = b_items.iter()
+                //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                //     println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
+                // } else {
+                //     println!("New couldn't split.")
+                // }
+
 
             }
         }
