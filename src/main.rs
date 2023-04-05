@@ -13,16 +13,21 @@ mod blob_cache;
 mod worker;
 mod bloom;
 mod worker_watcher;
+mod counters;
 
+use std::ops::BitXor;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use auth::Authenticator;
+use bitvec::macros::internal::funty::Numeric;
+use bloom::Filter;
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use log::{info, error};
+use rand::{thread_rng, Rng};
 use tokio::sync::mpsc;
 use worker::{worker_manager, WorkerData};
 
@@ -76,7 +81,7 @@ enum Commands {
         #[arg(short, long)]
         default: bool,
     },
-    PartitionTest {
+    Test {
         #[arg(short, long)]
         config: Option<PathBuf>,
     }
@@ -252,7 +257,7 @@ async fn main() -> Result<()> {
                 _ => {}
             };
         },
-        Commands::PartitionTest { config } => {
+        Commands::Test { config } => {
             // Load the config file
             info!("Loading config from: {config:?}");
             let config = load_config(config)?;
@@ -264,9 +269,321 @@ async fn main() -> Result<()> {
                 config::Database::SQLiteTemp{..} => Database::new_sqlite_temp(config.core.clone()).await?,
             };
 
-            database.partition_test().await?;
+            // database.partition_test().await?;
+
+            let data = database.list_filters("simple:4096", 1000).await?;
+
+            let mut tree = TestTree::new(4096);
+
+            for filter in data {
+                if tree.insert(filter) {
+                    let mask = tree.mask().clone();
+                    let other = tree.split();
+                    tree = TestTree::Internal(mask, vec![other, tree]);
+                }
+            }
+
+            tree.describe("".to_owned());
+
+            // for item in data {
+            //     let original = {
+            //         let buffer = item.to_buffer()?;
+            //         buffer.len()
+            //     };
+
+            //     let raw = {
+            //         let mut buffer = vec![];
+            //         let mut data = item.data.clone();
+            //         data.force_align();
+            //         for num in data.into_vec() {
+            //             for byte in num.to_le_bytes() {
+            //                 buffer.push(byte);
+            //             }
+            //         }
+            //         while let Some(&last) = buffer.last() {
+            //             if last == 0 {
+            //                 buffer.pop();
+            //             } else {
+            //                 break
+            //             }
+            //         }
+
+            //         buffer.len()
+            //     };
+
+            //     let sparse = {
+            //         let buffer = encode_sparse(&item.data);
+            //         buffer.len()
+            //     };
+
+            //     println!("{original}\t{raw}\t{sparse}");
+            // }
         }
     }
 
     return Ok(())
 }
+
+
+
+enum TestTree {
+    Internal(Filter, Vec<TestTree>),
+    Leaves(Filter, Vec<Filter>)
+}
+
+const SIZE: usize = 64;
+
+impl TestTree {
+
+    fn add_score(a: &Filter, b: &Filter) -> i64 {
+        // (a.data.clone().bitxor(&b.data).count_ones() as i64)
+        a.overlap(&b).unwrap().count_zeros() as i64
+    }
+
+    pub fn new(size: u64) -> Self {
+        TestTree::Leaves(Filter::empty(size, 1, 1), vec![])
+    }
+
+    pub fn mask(&self) -> &Filter {
+        match self {
+            TestTree::Internal(mask, _) => mask,
+            TestTree::Leaves(mask, _) => mask,
+        }
+    }
+
+    pub fn insert(&mut self, filter: Filter) -> bool {
+        match self {
+            TestTree::Internal(mask, children) => {
+                *mask = mask.overlap(&filter).unwrap();
+
+                let mut best_score = i64::MIN;
+                let mut best: Option<&mut TestTree> = None;
+                for child in children.iter_mut() {
+                    let score = Self::add_score(child.mask(), &filter);
+                    if score > best_score {
+                        best_score = score;
+                        best = Some(child);
+                    }
+                }
+
+                if let Some(best) = best {
+                    if best.insert(filter) {
+                        let new = best.split();
+                        children.push(new);
+                    }
+                } else {
+                    todo!();
+                }
+
+                children.len() >= SIZE
+            },
+            TestTree::Leaves(mask, children) => {
+                *mask = mask.overlap(&filter).unwrap();
+                children.push(filter);
+                children.len() >= SIZE
+            },
+        }
+    }
+
+    pub fn split(&mut self) -> TestTree {
+        let children = self.children_masks();
+        let (a_seed, b_seed) = choose_opposed(&children);
+
+        let mut a = vec![a_seed];
+        let mut b = vec![b_seed];
+        let mut a_cover = children[a_seed].clone();
+        let mut b_cover = children[b_seed].clone();
+
+        for (index, filter) in children.iter().enumerate() {
+            if index == a_seed || index == b_seed {
+                continue
+            }
+
+            if Self::add_score(&a_cover, filter) > Self::add_score(&b_cover, filter) {
+                a.push(index);
+                a_cover = a_cover.overlap(filter).unwrap();
+            } else {
+                b.push(index);
+                b_cover = b_cover.overlap(filter).unwrap();
+            }
+        }
+
+        println!("Split {} {} {}", self.mask().count_zeros(), a_cover.count_zeros(), b_cover.count_zeros());
+
+        b.sort();
+        match self {
+            TestTree::Internal(mask, children) => {
+                *mask = a_cover;
+
+                let mut b_children = vec![];
+                while let Some(index) = b.pop() {
+                    b_children.push(children.swap_remove(index));
+                }
+
+                TestTree::Internal(b_cover, b_children)
+            },
+            TestTree::Leaves(mask, children) => {
+                *mask = a_cover;
+
+                let mut b_children = vec![];
+                while let Some(index) = b.pop() {
+                    b_children.push(children.swap_remove(index));
+                }
+
+                TestTree::Leaves(b_cover, b_children)
+            }
+        }
+    }
+
+    fn children_masks(&self) -> Vec<&Filter> {
+        let mut out = vec![];
+        match self {
+            TestTree::Internal(_, children) => {
+                for child in children {
+                    out.push(child.mask());
+                }
+            },
+            TestTree::Leaves(_, children) => {
+                for child in children {
+                    out.push(child);
+                }
+            },
+        }
+        return out;
+    }
+
+    pub fn describe(&self, pad: String) {
+        println!("{pad}{}", self.mask().count_zeros());
+        match self {
+            TestTree::Internal(_, children) => {
+                for child in children {
+                    child.describe(format!("{pad}  "))
+                }
+            },
+            TestTree::Leaves(mask, children) => {
+                let mut slack = 0;
+                for item in children {
+                    slack += item.data.clone().bitxor(&mask.data).count_ones();
+                }
+                println!("{pad}  {}", slack/children.len());
+            },
+        }
+    }
+}
+
+
+fn choose_opposed_once(values: &Vec<&Filter>) -> (usize, usize, usize) {
+    let a = thread_rng().gen_range(0..values.len());
+    let mut b = 0;
+    let mut best_score = values[a].data.clone().bitxor(&values[b].data).count_ones();
+    // let mut best_score = values[a].overlap(&values[b]).unwrap().count_zeros();
+
+    for index in 1..values.len() {
+        if index == a {
+            continue;
+        }
+
+        let score = values[a].data.clone().bitxor(&values[index].data).count_ones();
+        // let score = values[a].overlap(&values[index]).unwrap().count_zeros();
+        if score < best_score {
+            b = index;
+            best_score = score;
+        }
+    }
+
+    (a, b, best_score)
+}
+
+
+fn choose_opposed(values: &Vec<&Filter>) -> (usize, usize) {
+    let (a, b, mut best_score) = choose_opposed_once(values);
+
+    let mut best_pair: (usize, usize) = (a, b);
+
+    for _ in 0..10 {
+        let (a, b, score) = choose_opposed_once(values);
+        if score > best_score {
+            best_pair = (a, b);
+            best_score = score;
+        }
+    }
+
+    return best_pair
+}
+
+// fn encode_zeros(encoded: &mut bitvec::vec::BitVec, zeros: usize) {
+//     if zeros == 0 {
+//         encoded.push(false);
+//     } else if zeros <= 1 << 4 {
+//         let zeros = zeros - 1; // counting from 1 because zero isn't an option
+//         encoded.push(true);
+//         encoded.push(false);
+//         encoded.push(zeros & 0b0001 > 0);
+//         encoded.push(zeros & 0b0010 > 0);
+//         encoded.push(zeros & 0b0100 > 0);
+//         encoded.push(zeros & 0b1000 > 0);
+//     } else {
+//         let zeros = zeros - 1; // counting from 1 because zero isn't an option
+//         encoded.push(true);
+//         encoded.push(true);
+//         encoded.push(zeros & 0b0001 > 0);
+//         encoded.push(zeros & 0b0010 > 0);
+//         encoded.push(zeros & 0b0100 > 0);
+//         encoded.push(zeros & 0b1000 > 0);
+//         let zeros = zeros >> 4;
+
+//         loop {
+//             let bits = [
+//                 zeros & 0b0001 > 0,
+//                 zeros & 0b0010 > 0,
+//                 zeros & 0b0100 > 0,
+//                 zeros & 0b1000 > 0
+//             ];
+//             let zeros = zeros >> 4;
+
+//             if zeros > 0 {
+//                 encoded.push(true);
+//                 encoded.extend(bits);
+//             } else {
+//                 encoded.push(false);
+//                 encoded.extend(bits);
+//                 break;
+//             }
+//         }
+//     }
+// }
+
+// fn encode_sparse(data: &bitvec::vec::BitVec) -> Vec<u8> {
+//     let mut encoded: bitvec::vec::BitVec = bitvec::vec::BitVec::new();
+//     let mut last: usize = 0;
+
+//     for (current, next) in data.iter_ones().tuple_windows() {
+//         last = next;
+//         let zeros = next - current - 1;
+
+//         // One step
+//         encode_zeros(&mut encoded, zeros);
+//     }
+//     encode_zeros(&mut encoded, data.len() - last);
+
+//     let mut buffer = vec![];
+//     encoded.force_align();
+//     for num in encoded.into_vec() {
+//         for byte in num.to_le_bytes() {
+//             buffer.push(byte);
+//         }
+//     }
+//     while let Some(&last) = buffer.last() {
+//         if last == 0 {
+//             buffer.pop();
+//         } else {
+//             break
+//         }
+//     }
+
+//     return buffer;
+// }
+
+// 0 one followed by a one
+// 10xxxx one followed by zeros encoded by x
+// 11xxxx(1xxxx)*0xxxx one followed

@@ -10,7 +10,7 @@ use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite, Encode};
 use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
-use crate::bloom::SimpleFilter;
+use crate::bloom::Filter;
 use crate::core::{CoreConfig};
 use crate::database::{IndexGroup, SearchStage, IndexStatus};
 use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, YaraTask, WorkError};
@@ -88,32 +88,8 @@ pub struct SQLiteInterface {
     work_notification: tokio::sync::Notify,
     _temp_dir: Option<tempfile::TempDir>,
     cant_split: std::sync::Mutex<std::cell::RefCell<HashSet<i64>>>,
+    status: tokio::sync::Mutex<std::cell::RefCell<IndexStatus>>
 }
-
-// #[derive(Serialize, Deserialize, Clone)]
-// struct IndexEntry {
-//     group: IndexGroup,
-//     label: IndexID,
-//     current_blob: BlobID,
-//     size_bytes: u64,
-//     size_entries: u64
-// }
-
-// // impl IndexEntry {
-// //     fn prepare_key(group: &IndexGroup, label: &IndexID) -> String {
-// //         format!("{}:{}", group.as_str(), label.as_str())
-// //     }
-
-// //     fn key(&self) -> String {
-// //         IndexEntry::prepare_key(&self.group, &self.label)
-// //     }
-// // }
-
-// #[derive(Serialize, Deserialize)]
-// struct FileEntry {
-//     access: AccessControl,
-//     hash: Vec<u8>
-// }
 
 fn file_table_name(name: &IndexGroup) -> String {
     format!("file_{name}")
@@ -154,13 +130,20 @@ impl SQLiteInterface {
 
         Self::initialize(&pool).await?;
 
-        Ok(Self {
+        let db = Self {
             db: pool,
             config,
             work_notification: Default::default(),
             _temp_dir: None,
-            cant_split: std::sync::Mutex::new(RefCell::new(Default::default()))
-        })
+            cant_split: std::sync::Mutex::new(RefCell::new(Default::default())),
+            status: tokio::sync::Mutex::new(RefCell::new(Default::default()))
+        };
+        {
+            let mut status = db.status.lock().await;
+            *status.get_mut() = db._init_status().await?;
+        }
+
+        return Ok(db)
     }
 
     pub async fn new_temp(config: CoreConfig) -> Result<Self> {
@@ -263,7 +246,31 @@ impl SQLiteInterface {
         return Ok(groups)
     }
 
-    pub async fn status(&self) -> Result<IndexStatus> {
+    pub async fn list_filters(&self, kind: &str, goal: usize) -> Result<Vec<Filter>> {
+        let mut filters = vec![];
+        let indices = self.list_indices().await?;
+
+        for index in indices {
+            if filters.len() >= goal {
+                break
+            }
+
+            let file_table = file_table_name(&index);
+
+            let rows: Vec<(Vec<u8>, )> = sqlx::query_as(&format!("
+                SELECT filter FROM {file_table} WHERE kind = ? LIMIT {goal}"))
+                .bind(kind)
+                .fetch_all(&self.db).await?;
+
+            for (data, ) in rows {
+                filters.push(Filter::load(kind, &data)?)
+            }
+        }
+
+        return Ok(filters)
+    }
+
+    pub async fn _init_status(&self) -> Result<IndexStatus> {
         let tables = self.list_indices().await?;
         let mut conn = self.db.acquire().await?;
 
@@ -272,10 +279,6 @@ impl SQLiteInterface {
 
         for group in tables {
             let file_table = file_table_name(&group);
-            // let (count, ): (i64, ) = sqlx::query_as(&format!(
-            //     "SELECT COUNT(1) FROM {file_table}"))
-            //     .fetch_one(&mut conn).await?;
-            // sizes.insert(group.to_string(), count as u64);
 
             let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
                 "SELECT kind, COUNT(1) FROM {file_table} GROUP BY kind"))
@@ -291,6 +294,11 @@ impl SQLiteInterface {
             group_files: sizes,
             filter_sizes: kinds
         })
+    }
+
+    pub async fn status(&self) -> Result<IndexStatus> {
+        let mut data = self.status.lock().await;
+        return Ok(data.get_mut().clone());
     }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, new_index_group: &IndexGroup) -> Result<bool> {
@@ -336,7 +344,7 @@ impl SQLiteInterface {
         return Ok(false)
     }
 
-    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<()> {
+    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &Filter) -> Result<()> {
         // Setup tables to insert to
         self.setup_filter_table(index_group).await.context("setup_filter_table")?;
         let mut conn = self.db.acquire().await?;
@@ -367,6 +375,17 @@ impl SQLiteInterface {
             };
         };
 
+        {
+            let mut count = self.status.lock().await;
+            let count = count.get_mut();
+            let group = index_group.to_string();
+            let kind = filter.kind();
+            let kind_count = *count.filter_sizes.get(&kind).unwrap_or(&0);
+            count.filter_sizes.insert(kind, kind_count + 1);
+            let group_count = *count.group_files.get(&group).unwrap_or(&0);
+            count.group_files.insert(group, group_count + 1);
+        }
+
         // Check each group (bottom up) to see if it needs to be split
         while let Some((group_id, leaf, _mask)) = stack.pop() {
             if leaf {
@@ -384,7 +403,7 @@ impl SQLiteInterface {
         return Ok(())
     }
 
-    async fn _find_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<Vec<(i64, bool, SimpleFilter)>> {
+    async fn _find_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
         let filter_table = filter_table_name(index_group);
 
         // Load the root group
@@ -410,7 +429,7 @@ impl SQLiteInterface {
 
         let mut output = vec![];
         for (id, leaves, kind, filter) in rows {
-            let filter = match SimpleFilter::load(&kind, &filter) {
+            let filter = match Filter::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Couldn't load filter {id}: {err}");
@@ -422,7 +441,7 @@ impl SQLiteInterface {
         Ok(output)
     }
 
-    async fn _find_all_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup) -> Result<Vec<(i64, bool, SimpleFilter)>> {
+    async fn _find_all_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup) -> Result<Vec<(i64, bool, Filter)>> {
         let filter_table = filter_table_name(index_group);
 
         // Load the root group
@@ -433,7 +452,7 @@ impl SQLiteInterface {
 
         let mut output = vec![];
         for (id, leaves, kind, filter) in rows {
-            let filter = match SimpleFilter::load(&kind, &filter) {
+            let filter = match Filter::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Couldn't load filter {id}: {err}");
@@ -445,7 +464,7 @@ impl SQLiteInterface {
         Ok(output)
     }
 
-    fn _pick_best(target: &SimpleFilter, options: &Vec<&SimpleFilter>) -> Result<usize> {
+    fn _pick_best(target: &Filter, options: &Vec<&Filter>) -> Result<usize> {
         let mut best = 0;
         let mut best_cost = f64::INFINITY;
         for (index, other) in options.iter().enumerate() {
@@ -458,8 +477,8 @@ impl SQLiteInterface {
         Ok(best)
     }
 
-    async fn _find_insert_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<Vec<(i64, bool, SimpleFilter)>> {
-        let mut group_stack: Vec<(i64, bool, SimpleFilter)> = vec![{
+    async fn _find_insert_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
+        let mut group_stack: Vec<(i64, bool, Filter)> = vec![{
             // Get the root groups
             let mut roots = self._find_roots(&mut *conn, index_group, filter).await?;
             assert!(!roots.is_empty());
@@ -481,7 +500,7 @@ impl SQLiteInterface {
         return Ok(group_stack)
     }
 
-    async fn _expand_filters(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &SimpleFilter, stack: &Vec<(i64, bool, SimpleFilter)>) -> Result<bool> {
+    async fn _expand_filters(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &Filter, stack: &Vec<(i64, bool, Filter)>) -> Result<bool> {
         let filter_table = filter_table_name(index_group);
         for (group_id, _, old_filter) in stack {
             // calculate the new filter for this group
@@ -583,11 +602,11 @@ impl SQLiteInterface {
             };
 
             // build the new covering filters
-            let size = SimpleFilter::parse_kind(&kind)?;
+            let size = Filter::parse_kind(&kind)?;
             let a_cover = a_items.iter()
-                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
             let b_cover = b_items.iter()
-                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
 
             let mut trans = conn.begin().await?;
             // Check for root
@@ -674,11 +693,11 @@ impl SQLiteInterface {
             };
 
             // build the new covering filters
-            let size = SimpleFilter::parse_kind(&kind)?;
+            let size = Filter::parse_kind(&kind)?;
             let a_cover = a_items.iter()
-                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
             let b_cover = b_items.iter()
-                .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
 
             let mut trans = conn.begin().await?;
             // Check for root
@@ -721,14 +740,14 @@ impl SQLiteInterface {
         }
     }
 
-    fn _partition<A, B>(mut items: Vec<(A, B, SimpleFilter)>) -> Option<(Vec<(A, B, SimpleFilter)>, Vec<(A, B, SimpleFilter)>)> {
+    fn _partition<A, B>(mut items: Vec<(A, B, Filter)>) -> Option<(Vec<(A, B, Filter)>, Vec<(A, B, Filter)>)> {
         // Pick a starting item
         let mut group = vec![{
             let (_, index) = items.iter().enumerate()
-                .map(|row|(row.1.2.data.count_ones(), row.0))
+                .map(|row|(row.1.2.count_ones(), row.0))
                 .min()?;
             let item = items.swap_remove(index);
-            if item.2.data.count_zeros() == 0 {
+            if item.2.count_zeros() == 0 {
                 return None
             }
             item
@@ -736,7 +755,7 @@ impl SQLiteInterface {
 
         // Expand until we take half or  might lose more than half our zeros
         let mut group_cover = group[0].2.clone();
-        let initial_zeros = group_cover.data.count_zeros();
+        let initial_zeros = group_cover.count_zeros();
         if initial_zeros <= 2 {
             return None
         }
@@ -744,10 +763,10 @@ impl SQLiteInterface {
         while group.len() + 1 < items.len() {
             let (new_cover, index) = items.iter().enumerate()
                 .map(|row|(row.1.2.overlap(&group_cover).unwrap(), row.0))
-                .min_by_key(|row|row.0.data.count_zeros())?;
+                .min_by_key(|row|row.0.count_zeros())?;
 
             if group.len() > items.len()/3 {
-                if new_cover.data.count_zeros() < initial_zeros/2 {
+                if new_cover.count_zeros() < initial_zeros/2 {
                     break
                 };
             }
@@ -764,12 +783,12 @@ impl SQLiteInterface {
         return Some((group, items))
     }
 
-    fn _cover_on<A, B>(items: &Vec<(A, B, SimpleFilter)>) -> SimpleFilter {
-        let size = items[0].2.size();
-        items.iter().fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap())
+    fn _cover_on<A, B>(items: &Vec<(A, B, Filter)>) -> Filter {
+        let size = items[0].2.params();
+        items.iter().fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap())
     }
 
-    async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &SimpleFilter) -> Result<i64>
+    async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &Filter) -> Result<i64>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let filter_table = filter_table_name(index_group);
@@ -782,7 +801,7 @@ impl SQLiteInterface {
     }
 
 
-    async fn _load_files_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(Vec<u8>, AccessControl, SimpleFilter)>>
+    async fn _load_files_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(Vec<u8>, AccessControl, Filter)>>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let file_table = file_table_name(&index_group);
@@ -793,7 +812,7 @@ impl SQLiteInterface {
             .fetch_all(conn).await?;
         let mut out = vec![];
         for (hash, access, kind, filter) in rows {
-            let filter = match SimpleFilter::load(&kind, &filter) {
+            let filter = match Filter::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Corrupt filter entry: {err}");
@@ -812,7 +831,7 @@ impl SQLiteInterface {
         return Ok(out)
     }
 
-    async fn _load_groups_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(i64, bool, SimpleFilter)>>
+    async fn _load_groups_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(i64, bool, Filter)>>
     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
     {
         let filter_table = filter_table_name(&index_group);
@@ -823,7 +842,7 @@ impl SQLiteInterface {
             .fetch_all(conn).await?;
         let mut out = vec![];
         for (id, leave, kind, filter) in rows {
-            let filter = match SimpleFilter::load(&kind, &filter) {
+            let filter = match Filter::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Corrupt filter entry: {err}");
@@ -1021,11 +1040,20 @@ impl SQLiteInterface {
 //     }
 
     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
+        let mut changed = false;
         for group in self.list_indices().await? {
             if group <= id {
                 self._release_group(group).await?;
+                changed = true;
             }
         }
+
+        // adjust cache
+        if changed {
+            let mut count = self.status.lock().await;
+            *count.get_mut() = self._init_status().await?;
+        }
+
         return Ok(())
     }
 
@@ -1454,9 +1482,9 @@ impl SQLiteInterface {
             .fetch_all(&mut conn).await?;
 
             for (group_id, leaves, kind, filter) in groups {
-                let filter = SimpleFilter::load(&kind, &filter)?;
+                let filter = Filter::load(&kind, &filter)?;
 
-                let items: Vec<((), (), SimpleFilter)> = if leaves {
+                let items: Vec<((), (), Filter)> = if leaves {
                     self._load_files_in_group(&mut conn, &index, group_id).await?
                         .into_iter()
                         .map(|(_, _, filter)|((), (), filter)).collect()
@@ -1474,11 +1502,11 @@ impl SQLiteInterface {
 
                 if let Some((a_items, b_items)) = Self::_partition(items.clone()) {
                     let kind = a_items[0].2.kind();
-                    let size = SimpleFilter::parse_kind(&kind)?;
+                    let size = Filter::parse_kind(&kind)?;
                     let a_cover = a_items.iter()
-                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                        .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
                     let b_cover = b_items.iter()
-                        .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+                        .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
                     println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
                 } else {
                     println!("Old couldn't split.")

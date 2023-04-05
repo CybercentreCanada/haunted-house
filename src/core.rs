@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
-use crate::bloom::{self, SimpleFilter};
+use crate::bloom::{self, Filter};
 use crate::database::{Database, IndexGroup, SearchStage};
 use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage};
 use crate::storage::BlobStorage;
@@ -23,6 +23,8 @@ pub struct IngestStatus {
     pub active_workers: u64,
     pub max_workers: u64,
     pub build_queue_size: u64,
+    pub ingest_last_minute: u64,
+    pub insert_last_minute: u64,
     pub insert_queues: HashMap<String, u64>,
 }
 
@@ -44,6 +46,10 @@ pub struct CoreConfig {
     pub search_workers: u64,
     #[serde(default="default_target_density")]
     pub target_density: f64,
+    #[serde(default="default_filter_hits")]
+    pub filter_hits: u32,
+    #[serde(default="default_filter_hashes")]
+    pub filter_hashes: u32,
     #[serde(default="default_garbage_collection_interval")]
     pub garbage_collection_interval: std::time::Duration,
     #[serde(default="default_index_soft_entries_max")]
@@ -63,6 +69,8 @@ pub struct CoreConfig {
 }
 
 fn default_target_density() -> f64 { 0.5 }
+fn default_filter_hits() -> u32 { 3 }
+fn default_filter_hashes() -> u32 { 3 }
 fn default_index_workers() -> u64 { 8 }
 fn default_search_workers() -> u64 { 8 }
 fn default_garbage_collection_interval() -> std::time::Duration { std::time::Duration::from_secs(60) }
@@ -142,7 +150,9 @@ impl HouseCore {
             return Err(anyhow::anyhow!("Couldn't fetch insert status"));
         }
         let mut value = ingest_recv.await?;
-        value.insert_queues = insert_recv.await?.0;
+        let (insert_queues, insert_counter) = insert_recv.await?;
+        value.insert_queues = insert_queues;
+        value.insert_last_minute = insert_counter as u64;
         Ok(value)
     }
 
@@ -201,6 +211,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
     let mut buffer: VecDeque<IngestTask> = Default::default();
     let mut active: JoinSet<()> = JoinSet::new();
+    let mut timer = crate::counters::RateCounter::new(60);
 
     loop {
         // Wait for more ingest messages
@@ -248,7 +259,9 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                             active_workers: active.len() as u64,
                             max_workers: core.config.index_workers,
                             build_queue_size: buffer.len() as u64,
-                            insert_queues: Default::default()
+                            ingest_last_minute: timer.average() as u64,
+                            insert_queues: Default::default(),
+                            insert_last_minute: 0,
                         });
                     }
                 }
@@ -259,9 +272,12 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 debug!("Ingest task done");
 
                 // Check if there was an error
+                if result.is_some() {
+                    timer.tick();
+                }
                 if let Some(Err(err)) = result {
                     error!("Crash in ingest: {err}")
-                }
+                };
 
                 // Check if there is something new to add
                 if active.len() < core.config.index_workers as usize {
@@ -291,7 +307,7 @@ async fn run_ingest_build_filter(core: Arc<HouseCore>, task: IngestTask) {
     };
 }
 
-async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Result<Option<SimpleFilter>> {
+async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Result<Option<Filter>> {
 
     let index_group: IndexGroup = task.index;
     let hash: Vec<u8> = task.hash;
@@ -346,11 +362,12 @@ async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Res
         }
     }
 
+    let prepared_indices = Filter::prepare(core.config.filter_hashes, &trigrams);
     // Try filter configurations until we find one that matches
     for power in bloom::START_POWER..=bloom::END_POWER {
         let size = 1 << power;
         debug!("Attempting {size} {}", hex::encode(&hash));
-        let filter = SimpleFilter::build(size, &trigrams);
+        let filter = Filter::build(size, 1, 1, &prepared_indices);
         if power == bloom::END_POWER || filter.density() < core.config.target_density {
             return Ok(Some(filter));
         }
@@ -361,9 +378,9 @@ async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Res
 enum InsertMessage {
     Insert {
         task: IngestTask,
-        filter: SimpleFilter,
+        filter: Filter,
     },
-    Status(oneshot::Sender<(HashMap<String, u64>, )>),
+    Status(oneshot::Sender<(HashMap<String, u64>, usize)>),
 }
 
 async fn insert_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<InsertMessage>) {
@@ -380,9 +397,10 @@ async fn insert_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 
 async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<InsertMessage>) -> Result<()> {
 
-    let mut buffer: HashMap<(IndexGroup, String), VecDeque<(IngestTask, SimpleFilter)>> = Default::default();
+    let mut buffer: HashMap<(IndexGroup, String), VecDeque<(IngestTask, Filter)>> = Default::default();
     let mut active: JoinSet<()> = JoinSet::new();
     let mut busy: HashMap<(IndexGroup, String), tokio::task::AbortHandle> = Default::default();
+    let mut timer = crate::counters::RateCounter::new(60);
 
     loop {
         // Wait for more ingest messages
@@ -418,13 +436,17 @@ async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                             (k.0.to_string() + ":" + &k.1, v.len() as u64)
                         }).collect();
 
-                        _ = response.send((counts, ));
+                        _ = response.send((counts, timer.average()));
                     }
                 }
             }
 
             // If the current batch finishes, or another batch should be checked
-            _ = active.join_next(), if !active.is_empty() => {
+            result = active.join_next(), if !active.is_empty() => {
+                if result.is_some() {
+                    timer.tick();
+                }
+
                 // Clear out finished jobs
                 busy.retain(|_, v| !v.is_finished());
 
@@ -445,7 +467,7 @@ async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     return Ok(())
 }
 
-async fn run_insert(core: Arc<HouseCore>, task: IngestTask, filter: SimpleFilter) {
+async fn run_insert(core: Arc<HouseCore>, task: IngestTask, filter: Filter) {
     // Make sure the expiry isn't already due
     let today_group = IndexGroup::create(&Some(Utc::now()));
     if task.data.index <= today_group {

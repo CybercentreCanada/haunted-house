@@ -131,25 +131,15 @@ impl StatusInterface {
     }
 
     pub async fn get_status(&self) -> Result<StatusReport> {
+        let start = std::time::Instant::now();
         let ingest = self.core.ingest_status().await?;
-        // let mut indices = self.core.database.list_indices().await?;
-        // indices.sort();
-
-        // let mut file_count: HashMap<IndexGroup, u64> = Default::default();
-
-        // for (group, index) in indices.iter() {
-        //     let mut count = *file_count.get(group).unwrap_or(&0);
-        //     count += self.core.database.count_files(index).await?;
-        //     file_count.insert(group.clone(), count);
-        // }
-
-        // let mut file_counts: Vec<_> = file_count.into_iter().collect();
-        // file_counts.sort();
+        let index = self.core.database.status().await?;
 
         Ok(StatusReport {
             ingest,
             search: SearchStatus {  },
-            index: self.core.database.status().await?
+            index,
+            generate_msec: start.elapsed().as_millis() as u32,
         })
     }
 }
@@ -507,6 +497,7 @@ struct StatusReport {
     ingest: IngestStatus,
     search: SearchStatus,
     index: IndexStatus,
+    generate_msec: u32,
 }
 
 #[handler]

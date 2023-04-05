@@ -6,14 +6,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::bloom::SimpleFilter;
+use crate::bloom::Filter;
 use crate::core::{CoreConfig};
 // use crate::database_rocksdb::RocksInterface;
 use crate::database_sqlite::SQLiteInterface;
 use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct IndexStatus {
     pub group_files: HashMap<String, u64>,
     pub filter_sizes: HashMap<String, u64>
@@ -181,7 +181,7 @@ impl Database {
         }
     }
 
-    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &SimpleFilter) -> Result<()> {
+    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &Filter) -> Result<()> {
         match self {
             Database::SQLite(local) => local.insert_file(hash, access, index_group, filter).await,
         }
@@ -192,6 +192,12 @@ impl Database {
     //         Database::SQLite(local) => local.list_indices().await,
     //     }
     // }
+
+    pub async fn list_filters(&self, kind: &str, goal: usize) -> Result<Vec<Filter>> {
+        match self {
+            Database::SQLite(local) => local.list_filters(kind, goal).await,
+        }
+    }
 
     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
         match self {
