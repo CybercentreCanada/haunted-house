@@ -367,7 +367,7 @@ async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Res
     for power in bloom::START_POWER..=bloom::END_POWER {
         let size = 1 << power;
         debug!("Attempting {size} {}", hex::encode(&hash));
-        let filter = Filter::build(size, 1, 1, &prepared_indices);
+        let filter = Filter::build(size, core.config.filter_hits, core.config.filter_hashes, &prepared_indices);
         if power == bloom::END_POWER || filter.density() < core.config.target_density {
             return Ok(Some(filter));
         }

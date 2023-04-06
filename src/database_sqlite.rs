@@ -100,7 +100,7 @@ fn filter_table_name(name: &IndexGroup) -> String {
 }
 
 
-const GROUP_SIZE: usize = 128;
+const GROUP_SIZE: usize = 16;
 
 impl SQLiteInterface {
     pub async fn new(config: CoreConfig, url: &str) -> Result<Self> {
@@ -335,6 +335,7 @@ impl SQLiteInterface {
                     "UPDATE {file_table} SET access = ? WHERE hash = ? AND access = ?"))
                     .bind(new_access.to_string()).bind(hash).bind(old_buffer)
                     .execute(&mut conn).await?;
+
                 if res.rows_affected() > 0 {
                     return Ok(true)
                 }
@@ -370,6 +371,10 @@ impl SQLiteInterface {
             match result {
                 Ok(_) => break stack,
                 Err(err) => {
+                    if err.to_string().contains("UNIQUE constraint failed") {
+                        self.update_file_access(hash, access, index_group).await?;
+                        return Ok(());
+                    }
                     error!("Could not insert file: {err}");
                 },
             };
@@ -466,12 +471,12 @@ impl SQLiteInterface {
 
     fn _pick_best(target: &Filter, options: &Vec<&Filter>) -> Result<usize> {
         let mut best = 0;
-        let mut best_cost = f64::INFINITY;
+        let mut best_score = 0;
         for (index, other) in options.iter().enumerate() {
-            let cost = other.cost() - target.overlap(other)?.cost();
-            if cost < best_cost {
+            let score = target.overlap(other)?.count_zeros();
+            if score > best_score {
                 best = index;
-                best_cost = cost;
+                best_score = score;
             }
         }
         Ok(best)
@@ -854,190 +859,6 @@ impl SQLiteInterface {
         return Ok(out)
     }
 
-//     pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, u64)>> {
-//         let mut conn = self.db.acquire().await?;
-
-//         // Get all the groups that expire later than this one
-//         let list: Vec<(IndexID, Vec<u8>)> = query_as("
-//             SELECT label, data FROM index_index
-//             WHERE block = ?")
-//             .bind(index_group.as_str())
-//             .fetch_all(&mut conn).await?;
-
-//         // loop until we find an index
-//         let mut best: Option<(IndexID, IndexEntry)> = None;
-//         for (key, value) in list {
-//             let value: IndexEntry = postcard::from_bytes(&value)?;
-
-//             if value.size_bytes >= self.config.index_soft_bytes_max {
-//                 debug!("index {} chunk over size {}/{} skipping", key, value.size_bytes, self.config.index_soft_bytes_max);
-//                 continue;
-//             }
-
-//             if value.size_entries >= self.config.index_soft_entries_max {
-//                 debug!("index {} chunk over capacity {}/{} skipping", key, value.size_entries, self.config.index_soft_entries_max);
-//                 continue;
-//             }
-
-//             match best {
-//                 Some(old_best) => {
-//                     if old_best.1.size_bytes > value.size_bytes {
-//                         best = Some((key, value))
-//                     } else {
-//                         best = Some(old_best)
-//                     }
-//                 },
-//                 None => best = Some((key, value)),
-//             }
-//         }
-
-//         match best {
-//             Some((label, best)) => Ok(Some((label, best.current_blob, best.size_entries))),
-//             None => Ok(None),
-//         }
-//     }
-
-//     pub async fn create_index_data(&self, index_group: &IndexGroup, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, new_size: u64) -> Result<()> {
-//         let index_id = IndexID::new();
-//         debug!("create collection for new index {index_group} {index_id}");
-//         self.setup_filter_table(&index_id).await?;
-//         self.update_index_data(index_group, index_id, &blob_id, &blob_id, meta, 0, new_size).await
-//     }
-
-//     pub async fn update_index_data(&self, index_group: &IndexGroup, index_id: IndexID, old_blob_id: &BlobID, blob_id: &BlobID, meta: Vec<(Vec<u8>, AccessControl)>, index_offset: u64, new_size: u64) -> Result<()> {
-//         debug!("update collection for {index_group} {index_id}");
-//         let mut conn = self.db.acquire().await?;
-//         // Open column family for the index meta data
-//         let table_name = filter_table_name(&index_id);
-
-//         // Add all the new file entries
-//         let new_entries = meta.len() as u64;
-//         for (index, (hash, access)) in meta.into_iter().enumerate() {
-//             let index = index as i64 + index_offset as i64;
-//             sqlx::query(&format!("INSERT INTO {table_name}(hash, number, access) VALUES(?, ?, ?)"))
-//                 .bind(hash).bind(index).bind(&postcard::to_allocvec(&access)?)
-//                 .execute(&mut conn).await?;
-//         }
-//         debug!("update {index_group} {index_id} file records updated");
-
-//         // Update size in index table
-//         loop {
-//             debug!("update {index_group} {index_id} get old index entry");
-//             let mut trans = conn.begin().await?;
-//             // Get
-//             let old: Option<(Vec<u8>, )> = sqlx::query_as(
-//                 "SELECT data FROM index_index WHERE label = ?")
-//                 .bind(index_id.as_str())
-//                 .fetch_optional(&mut trans).await?;
-
-//             // modify
-//             let entry = match &old {
-//                 Some((old, )) => {
-//                     debug!("update {index_group} {index_id} update index entry");
-//                     let old: IndexEntry = postcard::from_bytes(old)?;
-//                     if &old.current_blob != old_blob_id {
-//                         return Err(anyhow::anyhow!("Blob replaced"));
-//                     }
-//                     let mut entry = old.clone();
-//                     entry.size_bytes = new_size as u64;
-//                     entry.size_entries += new_entries;
-//                     entry.current_blob = blob_id.clone();
-//                     entry
-//                 },
-//                 None => {
-//                     debug!("update {index_group} {index_id} define index entry");
-//                     IndexEntry{
-//                         current_blob: blob_id.clone(),
-//                         size_bytes: new_size as u64,
-//                         size_entries: new_entries,
-//                         group: index_group.clone(),
-//                         label: index_id.clone(),
-//                     }
-//                 },
-//             };
-//             let entry = postcard::to_allocvec(&entry)?;
-
-//             // write
-//             debug!("update {index_group} {index_id} add old blob to garbage collection");
-//             self._schedule_blob_gc(&mut trans, old_blob_id, chrono::Utc::now()).await?;
-//             self._release_blob_gc(&mut trans, blob_id).await?;
-
-//             debug!("update {index_group} {index_id} insert new index entry");
-//             let res = match old {
-//                 Some((old, )) => sqlx::query(
-//                     "UPDATE index_index SET data = ? WHERE label = ? AND data = ?")
-//                     .bind(entry).bind(index_id.as_str()).bind(old)
-//                     .execute(&mut trans).await?,
-//                 None => sqlx::query(
-//                     "INSERT OR REPLACE INTO index_index(data, label, expiry_group) VALUES(?, ?, ?)")
-//                     .bind(entry).bind(index_id.as_str()).bind(index_group.as_str())
-//                     .execute(&mut trans).await?,
-//             };
-
-//             debug!("update {index_group} {index_id} try to finalize");
-//             if res.rows_affected() > 0 {
-//                 trans.commit().await?;
-//                 return Ok(())
-//             } else {
-//                 trans.rollback().await?;
-//             }
-//         }
-//     }
-
-//     pub async fn list_indices(&self) -> Result<Vec<(IndexGroup, IndexID)>> {
-//         let mut conn = self.db.acquire().await?;
-//         let list: Vec<(IndexGroup, IndexID)> = query_as("
-//             SELECT expiry_group, label FROM index_index")
-//             .fetch_all(&mut conn).await?;
-//         Ok(list)
-//     }
-
-//     pub async fn count_files(&self, index: &IndexID) -> Result<u64> {
-//         let mut conn = self.db.acquire().await?;
-
-//         let table_name = filter_table_name(&index);
-
-//         // Add all the new file entries
-//         let (row, ): (i64, ) = sqlx::query_as(&format!("SELECT count(*) FROM {table_name}"))
-//             .fetch_one(&mut conn).await?;
-
-//         Ok(row as u64)
-//     }
-
-//     pub async fn lease_blob(&self) -> Result<BlobID> {
-//         let id = BlobID::new();
-//         self._schedule_blob_gc(&self.db, &id, chrono::Utc::now() + chrono::Duration::days(1)).await?;
-//         return Ok(id)
-//     }
-
-//     pub async fn list_garbage_blobs(&self) -> Result<Vec<BlobID>> {
-//         let rows: Vec<(BlobID, )> = sqlx::query_as(
-//             "SELECT blob_id FROM garbage WHERE time < ?")
-//             .bind(chrono::Utc::now().to_rfc3339())
-//             .fetch_all(&self.db).await?;
-//         return Ok(rows.into_iter().map(|row|row.0).collect())
-//     }
-
-//     pub async fn release_blob(&self, id: BlobID) -> Result<()> {
-//         self._release_blob_gc(&self.db, &id).await
-//     }
-
-//     async fn _schedule_blob_gc<'e, E>(&self, conn: E, id: &BlobID, when: chrono::DateTime<chrono::Utc>) -> Result<()>
-//     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
-//     {
-//         sqlx::query("INSERT OR REPLACE INTO garbage(blob_id, time) VALUES(?, ?)")
-//             .bind(id.as_str())
-//             .bind(&when.to_rfc3339())
-//             .execute(conn).await?;
-//         return Ok(())
-//     }
-
-//     async fn _release_blob_gc<'e, E>(&self, conn: E, id: &BlobID) -> Result<()>
-//     where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
-//     {
-//         sqlx::query("DELETE FROM garbage WHERE blob_id = ?").bind(id.as_str()).execute(conn).await?;
-//         return Ok(())
-//     }
 
     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
         let mut changed = false;
@@ -1472,63 +1293,63 @@ impl SQLiteInterface {
     }
 
 
-    pub async fn partition_test(&self) -> Result<()> {
-        let mut conn = self.db.acquire().await?;
+    // pub async fn partition_test(&self) -> Result<()> {
+    //     let mut conn = self.db.acquire().await?;
 
-        for index in self.list_indices().await? {
-            let filter_table = filter_table_name(&index);
-            let groups: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
-            SELECT id, leaves, kind, filter FROM {filter_table}"))
-            .fetch_all(&mut conn).await?;
+    //     for index in self.list_indices().await? {
+    //         let filter_table = filter_table_name(&index);
+    //         let groups: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
+    //         SELECT id, leaves, kind, filter FROM {filter_table}"))
+    //         .fetch_all(&mut conn).await?;
 
-            for (group_id, leaves, kind, filter) in groups {
-                let filter = Filter::load(&kind, &filter)?;
+    //         for (group_id, leaves, kind, filter) in groups {
+    //             let filter = Filter::load(&kind, &filter)?;
 
-                let items: Vec<((), (), Filter)> = if leaves {
-                    self._load_files_in_group(&mut conn, &index, group_id).await?
-                        .into_iter()
-                        .map(|(_, _, filter)|((), (), filter)).collect()
-                } else {
-                    self._load_groups_in_group(&mut conn, &index, group_id).await?
-                        .into_iter()
-                        .map(|(_, _, filter)|((), (), filter)).collect()
-                };
+    //             let items: Vec<((), (), Filter)> = if leaves {
+    //                 self._load_files_in_group(&mut conn, &index, group_id).await?
+    //                     .into_iter()
+    //                     .map(|(_, _, filter)|((), (), filter)).collect()
+    //             } else {
+    //                 self._load_groups_in_group(&mut conn, &index, group_id).await?
+    //                     .into_iter()
+    //                     .map(|(_, _, filter)|((), (), filter)).collect()
+    //             };
 
-                if items.len() == 1 {
-                    continue
-                }
+    //             if items.len() == 1 {
+    //                 continue
+    //             }
 
-                println!("{group_id}  {}  {}", items.len(), filter.density());
+    //             println!("{group_id}  {}  {}", items.len(), filter.density());
 
-                if let Some((a_items, b_items)) = Self::_partition(items.clone()) {
-                    let kind = a_items[0].2.kind();
-                    let size = Filter::parse_kind(&kind)?;
-                    let a_cover = a_items.iter()
-                        .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
-                    let b_cover = b_items.iter()
-                        .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
-                    println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
-                } else {
-                    println!("Old couldn't split.")
-                }
-
-
-                // if let Some((a_items, b_items)) = Self::_new_partition(items.clone()) {
-                //     let kind = a_items[0].2.kind();
-                //     let size = SimpleFilter::parse_kind(&kind)?;
-                //     let a_cover = a_items.iter()
-                //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-                //     let b_cover = b_items.iter()
-                //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-                //     println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
-                // } else {
-                //     println!("New couldn't split.")
-                // }
+    //             if let Some((a_items, b_items)) = Self::_partition(items.clone()) {
+    //                 let kind = a_items[0].2.kind();
+    //                 let size = Filter::parse_kind(&kind)?;
+    //                 let a_cover = a_items.iter()
+    //                     .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
+    //                 let b_cover = b_items.iter()
+    //                     .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
+    //                 println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
+    //             } else {
+    //                 println!("Old couldn't split.")
+    //             }
 
 
-            }
-        }
-        return Ok(())
-    }
+    //             // if let Some((a_items, b_items)) = Self::_new_partition(items.clone()) {
+    //             //     let kind = a_items[0].2.kind();
+    //             //     let size = SimpleFilter::parse_kind(&kind)?;
+    //             //     let a_cover = a_items.iter()
+    //             //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+    //             //     let b_cover = b_items.iter()
+    //             //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
+    //             //     println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
+    //             // } else {
+    //             //     println!("New couldn't split.")
+    //             // }
+
+
+    //         }
+    //     }
+    //     return Ok(())
+    // }
 }
 

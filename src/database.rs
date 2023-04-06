@@ -169,11 +169,11 @@ impl Database {
         Ok(Database::SQLite(SQLiteInterface::new_temp(config).await?))
     }
 
-    pub async fn partition_test(&self) -> Result<()> {
-        match self {
-            Database::SQLite(local) => local.partition_test().await,
-        }
-    }
+    // pub async fn partition_test(&self) -> Result<()> {
+    //     match self {
+    //         Database::SQLite(local) => local.partition_test().await,
+    //     }
+    // }
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {
         match self {

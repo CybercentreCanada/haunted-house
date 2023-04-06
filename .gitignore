@@ -8,3 +8,4 @@ __pycache__/
 
 /python-client/dist/*
 /mquery_query_lib/dist/*
+/test-data/*

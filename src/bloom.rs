@@ -10,7 +10,7 @@ use crate::query::Query;
 
 
 pub const START_POWER: u64 = 10;
-pub const END_POWER: u64 = 20;
+pub const END_POWER: u64 = 22;
 
 #[repr(u8)]
 #[derive(Clone, Copy, IntEnum)]
@@ -177,10 +177,10 @@ impl Filter {
         self.data.len() as u64
     }
 
-    pub fn cost(&self) -> f64 {
-        let density = self.density();
-        density / (1.0 - density)
-    }
+    // pub fn cost(&self) -> f64 {
+    //     let density = self.density();
+    //     density / (1.0 - density)
+    // }
 
     pub fn full(&self) -> bool {
         self.data.count_zeros() == 0
@@ -203,18 +203,18 @@ impl Filter {
     }
 
     pub fn kind(&self) -> String {
-        format!("simple:{}", self.size())
+        format!("in:{:0>7}:{}:{}", self.size(), self.hits, self.hashes)
     }
 
     pub fn parse_kind(kind: &str) -> Result<(u64, u32, u32)> {
-        if let Some((kind, tail)) = kind.split_once(":") {
-            if kind == "simple" {
-                if let Ok(size) = tail.parse::<u64>() {
-                    return Ok((size, 1, 1))
-                }
-            }
+        let parts: Vec<&str> = kind.split(":").collect();
+        if parts.len() != 4 || parts[0] != "in" {
+            return Err(anyhow::anyhow!("Invalid filter kind: {kind}"));
         }
-        return Err(anyhow::anyhow!("Invalid filter kind: {kind}"));
+        let size = parts[1].parse::<u64>()?;
+        let hits = parts[2].parse::<u32>()?;
+        let hashes = parts[3].parse::<u32>()?;
+        return Ok((size, hits, hashes))
     }
 
     pub fn overlap(&self, other: &Filter) -> Result<Filter> {
@@ -282,7 +282,7 @@ mod test {
         let prepared = Filter::prepare(1, &trigrams);
 
         for power in START_POWER..=END_POWER {
-            let mut filter = Filter::build(1 << power, 1, 1, &prepared);
+            let filter = Filter::build(1 << power, 1, 1, &prepared);
             let kind = filter.kind();
             let data = filter.to_buffer().unwrap();
             let unpacked = Filter::load(&kind, &data).unwrap();
