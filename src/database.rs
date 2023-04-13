@@ -292,5 +292,11 @@ impl Database {
             Database::SQLite(local) => local.add_search_error(code, error).await
         }
     }
+
+    // pub async fn report_density(&self) -> Result<()> {
+    //     match self {
+    //         Database::SQLite(local) => local.report_density().await
+    //     }
+    // }
 }
 

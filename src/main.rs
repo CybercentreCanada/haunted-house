@@ -265,8 +265,10 @@ async fn main() -> Result<()> {
             let database = Database::new(config.core.clone(), config.database).await?;
 
             // database.partition_test().await?;
+            // database.report_density().await?;
 
-            let data = database.list_filters("simple:4096", 1000).await?;
+            let data = database.list_filters("in:0004096:2:3", 1000).await?;
+
 
             let mut tree = TestTree::new(4096);
 
@@ -274,7 +276,7 @@ async fn main() -> Result<()> {
                 if tree.insert(filter) {
                     let mask = tree.mask().clone();
                     let other = tree.split();
-                    tree = TestTree::Internal(mask, vec![other, tree]);
+                    tree = TestTree::Internal(tree.height() + 1, mask, vec![other, tree]);
                 }
             }
 
@@ -319,14 +321,23 @@ async fn main() -> Result<()> {
     return Ok(())
 }
 
-
+fn layer_density(height: u32) -> f64 {
+    1.0-(1.0f64-0.3).powi(height as i32 + 2)
+    // match height {
+    //     0 => 0.5,
+    //     1 => 1.0,
+    //     2 => 1.0,
+    //     3 => 1.0,
+    //     _ => f64::INFINITY
+    // }
+}
 
 enum TestTree {
-    Internal(Filter, Vec<TestTree>),
+    Internal(u32, Filter, Vec<TestTree>),
     Leaves(Filter, Vec<Filter>)
 }
 
-const SIZE: usize = 64;
+const SIZE: usize = 512;
 
 impl TestTree {
 
@@ -341,14 +352,21 @@ impl TestTree {
 
     pub fn mask(&self) -> &Filter {
         match self {
-            TestTree::Internal(mask, _) => mask,
+            TestTree::Internal(_, mask, _) => mask,
             TestTree::Leaves(mask, _) => mask,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            TestTree::Internal(height, _, _) => *height,
+            TestTree::Leaves(_, _) => 0,
         }
     }
 
     pub fn insert(&mut self, filter: Filter) -> bool {
         match self {
-            TestTree::Internal(mask, children) => {
+            TestTree::Internal(height, mask, children) => {
                 *mask = mask.overlap(&filter).unwrap();
 
                 let mut best_score = i64::MIN;
@@ -370,12 +388,20 @@ impl TestTree {
                     todo!();
                 }
 
-                children.len() >= SIZE
+                if children.len() >= 3 {
+                    mask.density() > layer_density(*height) || children.len() >= SIZE
+                } else {
+                    false
+                }
             },
             TestTree::Leaves(mask, children) => {
                 *mask = mask.overlap(&filter).unwrap();
                 children.push(filter);
-                children.len() >= SIZE
+                if children.len() >= 3 {
+                    mask.density() > layer_density(0) || children.len() >= SIZE
+                } else {
+                    false
+                }
             },
         }
     }
@@ -407,7 +433,7 @@ impl TestTree {
 
         b.sort();
         match self {
-            TestTree::Internal(mask, children) => {
+            TestTree::Internal(height, mask, children) => {
                 *mask = a_cover;
 
                 let mut b_children = vec![];
@@ -415,7 +441,7 @@ impl TestTree {
                     b_children.push(children.swap_remove(index));
                 }
 
-                TestTree::Internal(b_cover, b_children)
+                TestTree::Internal(*height, b_cover, b_children)
             },
             TestTree::Leaves(mask, children) => {
                 *mask = a_cover;
@@ -433,7 +459,7 @@ impl TestTree {
     fn children_masks(&self) -> Vec<&Filter> {
         let mut out = vec![];
         match self {
-            TestTree::Internal(_, children) => {
+            TestTree::Internal(_, _, children) => {
                 for child in children {
                     out.push(child.mask());
                 }
@@ -450,7 +476,7 @@ impl TestTree {
     pub fn describe(&self, pad: String) {
         println!("{pad}{}", self.mask().count_zeros());
         match self {
-            TestTree::Internal(_, children) => {
+            TestTree::Internal(_, _, children) => {
                 for child in children {
                     child.describe(format!("{pad}  "))
                 }
@@ -460,7 +486,7 @@ impl TestTree {
                 for item in children {
                     slack += item.data.clone().bitxor(&mask.data).count_ones();
                 }
-                println!("{pad}  {}", slack/children.len());
+                println!("{pad}  leaf {} {}", children.len(), slack/children.len());
             },
         }
     }

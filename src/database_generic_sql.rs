@@ -1,10 +1,11 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet, HashMap};
+use std::collections::{BTreeSet, HashSet, HashMap, BTreeMap};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
 use async_trait::async_trait;
+use itertools::Itertools;
 use log::{info, error, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite, Encode, Executor};
@@ -1290,64 +1291,50 @@ impl SQLInterface {
 
     }
 
-
-    // pub async fn partition_test(&self) -> Result<()> {
+    // pub async fn report_density(&self) -> Result<()> {
+    //     let indices = self.list_indices().await?;
     //     let mut conn = self.db.acquire().await?;
 
-    //     for index in self.list_indices().await? {
-    //         let filter_table = filter_table_name(&index);
-    //         let groups: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
-    //         SELECT id, leaves, kind, filter FROM {filter_table}"))
-    //         .fetch_all(&mut conn).await?;
+    //     for index_group in indices {
+    //         // Load the base filters for this index
+    //         let outstanding_groups = self._find_all_roots(&mut conn, &index_group).await?;
+    //         let mut outstanding_groups = outstanding_groups.into_iter().map(|row| (row.0, row.1, row.2, 0)).collect_vec();
+    //         let mut densities: BTreeMap<i32, Vec<f64>> = Default::default();
+    //         let mut file_count = 0.0;
 
-    //         for (group_id, leaves, kind, filter) in groups {
-    //             let filter = Filter::load(&kind, &filter)?;
-
-    //             let items: Vec<((), (), Filter)> = if leaves {
-    //                 self._load_files_in_group(&mut conn, &index, group_id).await?
-    //                     .into_iter()
-    //                     .map(|(_, _, filter)|((), (), filter)).collect()
-    //             } else {
-    //                 self._load_groups_in_group(&mut conn, &index, group_id).await?
-    //                     .into_iter()
-    //                     .map(|(_, _, filter)|((), (), filter)).collect()
-    //             };
-
-    //             if items.len() == 1 {
-    //                 continue
+    //         // Apply filters recursively until we only have file entries left
+    //         while let Some((group_id, leaves, filter, height)) = outstanding_groups.pop() {
+    //             let density = filter.density();
+    //             match densities.get_mut(&height) {
+    //                 Some(list) => { list.push(density); },
+    //                 None => { densities.insert(height, vec![density]); },
     //             }
 
-    //             println!("{group_id}  {}  {}", items.len(), filter.density());
-
-    //             if let Some((a_items, b_items)) = Self::_partition(items.clone()) {
-    //                 let kind = a_items[0].2.kind();
-    //                 let size = Filter::parse_kind(&kind)?;
-    //                 let a_cover = a_items.iter()
-    //                     .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
-    //                 let b_cover = b_items.iter()
-    //                     .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
-    //                 println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
+    //             if leaves {
+    //                 let mut found = vec![];
+    //                 for (_, _, filter) in self._load_files_in_group(&mut conn, &index_group, group_id).await? {
+    //                     found.push(filter.density());
+    //                     file_count += 1.0;
+    //                 }
+    //                 match densities.get_mut(&height) {
+    //                     Some(list) => { list.extend(found); },
+    //                     None => { densities.insert(height, found); },
+    //                 }
     //             } else {
-    //                 println!("Old couldn't split.")
+    //                 let new = self._load_groups_in_group(&mut conn, &index_group, group_id).await?;
+    //                 outstanding_groups.extend(new.into_iter().map(|row| (row.0, row.1, row.2, height+1)));
     //             }
-
-
-    //             // if let Some((a_items, b_items)) = Self::_new_partition(items.clone()) {
-    //             //     let kind = a_items[0].2.kind();
-    //             //     let size = SimpleFilter::parse_kind(&kind)?;
-    //             //     let a_cover = a_items.iter()
-    //             //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-    //             //     let b_cover = b_items.iter()
-    //             //         .fold(SimpleFilter::empty(size), |a, b|a.overlap(&b.2).unwrap());
-    //             //     println!("Split {:>3} {:>3}  Density {:>3} {:>3}", a_items.len(), b_items.len(), a_cover.density(), b_cover.density())
-    //             // } else {
-    //             //     println!("New couldn't split.")
-    //             // }
-
-
     //         }
+
+    //         let densities = densities.into_iter().rev().map(|(a, b)|{
+    //             let len = b.len() as f64;
+    //             (a, b.into_iter().fold(0.0, |a, b|a+b)/len)
+    //         }).collect_vec();
+    //         println!("{file_count}  {:?}", densities);
     //     }
+
     //     return Ok(())
     // }
+
 }
 
