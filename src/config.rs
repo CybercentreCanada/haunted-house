@@ -37,6 +37,12 @@ pub enum Database {
         path: String,
     },
     SQLiteTemp,
+    MySQL {
+        username: String,
+        password: String,
+        host: String,
+        database: String
+    }
 }
 
 impl Default for Database {

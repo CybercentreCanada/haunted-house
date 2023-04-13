@@ -20,10 +20,10 @@ use weak_self::WeakSelf;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestStatus {
-    pub active_workers: u64,
-    pub max_workers: u64,
+    pub build_active_workers: u64,
+    pub build_max_workers: u64,
     pub build_queue_size: u64,
-    pub ingest_last_minute: u64,
+    pub build_last_minute: u64,
     pub insert_last_minute: u64,
     pub insert_queues: HashMap<String, u64>,
 }
@@ -256,10 +256,10 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     },
                     IngestMessage::Status(response) => {
                         _ = response.send(IngestStatus {
-                            active_workers: active.len() as u64,
-                            max_workers: core.config.index_workers,
+                            build_active_workers: active.len() as u64,
+                            build_max_workers: core.config.index_workers,
                             build_queue_size: buffer.len() as u64,
-                            ingest_last_minute: timer.average() as u64,
+                            build_last_minute: timer.average() as u64,
                             insert_queues: Default::default(),
                             insert_last_minute: 0,
                         });

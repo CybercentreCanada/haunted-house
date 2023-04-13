@@ -12,7 +12,7 @@ HAUNTED_HOUSE_API_KEY = os.environ['HAUNTEDHOUSE_API_KEY']
 
 async def main(verify):
 
-    printer = PrettyPrinter(width=200, compact=True, underscore_numbers=True)
+    printer = PrettyPrinter(width=100, compact=True, underscore_numbers=True)
 
     async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + HAUNTED_HOUSE_API_KEY}) as session:
         async with session.get(HAUNTED_HOUSE_URL + "/status/detailed", verify_ssl=verify) as resp:

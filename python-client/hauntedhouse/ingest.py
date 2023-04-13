@@ -44,7 +44,7 @@ class Config(pydantic.BaseModel):
     trust_all: bool = pydantic.Field(default=False)
 
 
-async def socket_main(config: Config, verify: bool) -> None:
+async def socket_main(config: Config, verify: bool, count: int) -> None:
     logger.info("Connect to assemblyline for classification configuration")
     al_client = get_client(config.assemblyline_url, apikey=(config.assemblyline_user, config.assemblyline_api_key), verify=verify)
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
@@ -117,7 +117,7 @@ async def socket_main(config: Config, verify: bool) -> None:
                 #     logger.info("current active 1", len(futures))
 
             # When there are fewer than some large number of currently batched files, add more
-            if len(current_sequence_numbers) < 10000:
+            if len(current_sequence_numbers) < count:
                 if last_seq_no < 0:
                     query = "*"
                 else:
@@ -159,8 +159,10 @@ if __name__ == '__main__':
         description='Ingest files from assemblyline into hauntedhouse',
     )
     parser.add_argument("--trust-all", help="ignore server verification", action='store_true')
+    parser.add_argument("--count", help="number of files to have outstanding", default=10000)
     parser.add_argument("config", help="path to config file")
     args = parser.parse_args()
+    count = int(args.count)
 
     if args.config.endswith(".json"):
         config = Config(**json.load(open(args.config)))
@@ -176,4 +178,4 @@ if __name__ == '__main__':
     else:
         trust_all = args.trust_all
 
-    asyncio.run(socket_main(config, verify=not trust_all))
+    asyncio.run(socket_main(config, verify=not trust_all, count=count))

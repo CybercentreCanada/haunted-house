@@ -3,12 +3,7 @@
 #[derive(Debug, PartialEq)]
 pub enum ErrorKinds {
     BlobTooLargeForCache,
-    // InvalidHashProduced,
-    // IndexHasInvalidMagic,
-    // IndexHasUnsupportedVersion,
-    // IndexHasUnsupportedType,
-    // IndexCorruptTable,
-    // VarintIncomplete,
+    UnknownSearchCode,
 }
 
 impl std::fmt::Display for ErrorKinds {

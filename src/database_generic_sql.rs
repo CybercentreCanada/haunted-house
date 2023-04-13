@@ -4,15 +4,19 @@ use std::collections::{BTreeSet, HashSet, HashMap};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
+use async_trait::async_trait;
 use log::{info, error, warn};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite, Encode};
+use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite, Encode, Executor};
 use sqlx::pool::{PoolOptions, PoolConnection};
+use tempfile::TempDir;
 
 use crate::access::AccessControl;
 use crate::bloom::Filter;
 use crate::core::{CoreConfig};
 use crate::database::{IndexGroup, SearchStage, IndexStatus};
+use crate::db_imp_mysql::MySQLImp;
+use crate::db_imp_sqlite::SqliteImp;
 use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, YaraTask, WorkError};
 use crate::query::Query;
 
@@ -42,26 +46,51 @@ use crate::query::Query;
 //     }
 // }
 
-impl<'r> Encode<'r, sqlx::Sqlite> for SearchStage {
-    fn encode_by_ref(&self, buf: &mut Vec<sqlx::sqlite::SqliteArgumentValue<'r>>) -> sqlx::encode::IsNull {
-        self.to_string().encode_by_ref(buf)
-    }
-}
+// impl<'r> Encode<'r, sqlx::Any> for SearchStage {
+//     fn encode_by_ref(&self, buf: &mut <sqlx::Any as sqlx::database::HasArguments<'r>>::ArgumentBuffer) -> sqlx::encode::IsNull {
+//         <&str as Encode<'_, sqlx::Any>>::encode_by_ref(&self.as_str(), buf)
+//     }
+//     // fn encode_by_ref(&self, buf: &mut Vec<sqlx::Any::ArgumentValue<'r>>) -> sqlx::encode::IsNull {
+//     //     self.to_string().encode_by_ref(buf)
+//     // }
+// }
 
-impl<'r> Decode<'r, sqlx::Sqlite> for SearchStage {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
+// impl<'r> Decode<'r, sqlx::Any> for SearchStage {
+//     fn decode(value: <sqlx::Any as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
+//         let value = <&str as Decode<sqlx::Any>>::decode(value)?;
+//         Ok(Self::from(value))
+//     }
+// }
 
-impl sqlx::Type<sqlx::Sqlite> for SearchStage {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
+// impl sqlx::Type<sqlx::Any> for SearchStage {
+//     fn type_info() -> <sqlx::Any as sqlx::Database>::TypeInfo {
+//         <&str as sqlx::Type<sqlx::Any>>::type_info()
+//     }
+// }
 
+// impl<'r> Encode<'r, sqlx::MySql> for SearchStage {
+//     fn encode_by_ref(&self, buf: &mut <sqlx::MySql as sqlx::database::HasArguments<'r>>::ArgumentBuffer) -> sqlx::encode::IsNull {
+//         <&str as Encode<'_, sqlx::MySql>>::encode_by_ref(&self.as_str(), buf)
+//     }
+//     // fn encode_by_ref(&self, buf: &mut Vec<sqlx::MySql::ArgumentValue<'r>>) -> sqlx::encode::IsNull {
+//     //     self.to_string().encode_by_ref(buf)
+//     // }
+// }
 
+// impl<'r> Decode<'r, sqlx::MySql> for SearchStage {
+//     fn decode(value: <sqlx::MySql as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
+//         let value = <&str as Decode<sqlx::MySql>>::decode(value)?;
+//         Ok(Self::from(value))
+//     }
+// }
+
+// impl sqlx::Type<sqlx::MySql> for SearchStage {
+//     fn type_info() -> <sqlx::MySql as sqlx::Database>::TypeInfo {
+//         <&str as sqlx::Type<sqlx::MySql>>::type_info()
+//     }
+// }
+
+pub type PoolCon = sqlx::any::AnyConnection;
 
 #[derive(Serialize, Deserialize)]
 struct SearchRecord {
@@ -80,61 +109,95 @@ struct SearchRecord {
     end: IndexGroup,
 }
 
+#[async_trait]
+pub trait ImplDetails {
+    async fn initialize(&self, conn: &mut PoolCon) -> Result<()>;
+    async fn list_tables(&self, conn: &mut PoolCon) -> Result<Vec<String>>;
+    async fn initialize_filter(&self, conn: &mut PoolCon, index: &IndexGroup) -> Result<()>;
+}
 
-
-pub struct SQLiteInterface {
-    db: SqlitePool,
+// pub struct SQLInterface<DB: sqlx::Database, Imp: ImplDetails<DB>> {
+pub struct SQLInterface {
+    db: sqlx::AnyPool,
     config: CoreConfig,
     work_notification: tokio::sync::Notify,
-    _temp_dir: Option<tempfile::TempDir>,
+    _temp_dir: Option<TempDir>,
+    imp: Box<dyn ImplDetails + Sync + Send>,
+    // _db: std::marker::PhantomData<DB>,
     cant_split: std::sync::Mutex<std::cell::RefCell<HashSet<i64>>>,
     status: tokio::sync::Mutex<std::cell::RefCell<IndexStatus>>
 }
 
-fn file_table_name(name: &IndexGroup) -> String {
+pub fn file_table_name(name: &IndexGroup) -> String {
     format!("file_{name}")
 }
 
-fn filter_table_name(name: &IndexGroup) -> String {
+pub fn filter_table_name(name: &IndexGroup) -> String {
     format!("filter_{name}")
 }
 
 
 const GROUP_SIZE: usize = 16;
 
-impl SQLiteInterface {
-    pub async fn new(config: CoreConfig, url: &str) -> Result<Self> {
+impl SQLInterface {
+    pub async fn new(config: CoreConfig, dbconf: crate::config::Database) -> Result<Self> {
 
-        let url = if url == "memory" {
-            format!("sqlite::memory:")
-        } else {
-            let path = Path::new(url);
+        let (url, imp, temp): (String, Box<dyn ImplDetails + Sync + Send>, Option<TempDir>) = match dbconf {
+            crate::config::Database::SQLite { path } => {
+                let url = path;
+                let url = if url == "memory" {
+                    format!("sqlite::memory:")
+                } else {
+                    let path = Path::new(&url);
 
-            if let Some(parent) = path.parent() {
-                if parent != Path::new("") && parent != Path::new("/") && !parent.exists() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-            }
+                    if let Some(parent) = path.parent() {
+                        if parent != Path::new("") && parent != Path::new("/") && !parent.exists() {
+                            tokio::fs::create_dir_all(parent).await?;
+                        }
+                    }
 
-            if path.is_absolute() {
-                format!("sqlite://{}?mode=rwc", url)
-            } else {
-                format!("sqlite:{}?mode=rwc", url)
+                    if path.is_absolute() {
+                        format!("sqlite://{}?mode=rwc", url)
+                    } else {
+                        format!("sqlite:{}?mode=rwc", url)
+                    }
+                };
+
+                (url, Box::new(SqliteImp{}), None)
+            },
+            crate::config::Database::SQLiteTemp => {
+                let tempdir = tempfile::tempdir()?;
+                let path = tempdir.path().join("house.db");
+
+                let url = if path.is_absolute() {
+                    format!("sqlite://{}?mode=rwc", path.to_str().unwrap())
+                } else {
+                    format!("sqlite:{}?mode=rwc", path.to_str().unwrap())
+                };
+
+                (url, Box::new(SqliteImp{}), Some(tempdir))
+            },
+            crate::config::Database::MySQL { username, password, host, database } => {
+                let url = format!("mysql://{username}:{password}@{host}/{database}");
+
+                (url, Box::new(MySQLImp{}), None)
             }
         };
 
-        let pool = PoolOptions::new()
+
+        let pool = sqlx::any::AnyPoolOptions::new()
             .max_connections(200)
             .acquire_timeout(std::time::Duration::from_secs(30))
             .connect(&url).await?;
-
-        Self::initialize(&pool).await?;
+        let mut conn = pool.acquire().await?;
+        imp.initialize(&mut conn).await?;
 
         let db = Self {
             db: pool,
             config,
             work_notification: Default::default(),
-            _temp_dir: None,
+            imp,
+            _temp_dir: temp,
             cant_split: std::sync::Mutex::new(RefCell::new(Default::default())),
             status: tokio::sync::Mutex::new(RefCell::new(Default::default()))
         };
@@ -146,93 +209,20 @@ impl SQLiteInterface {
         return Ok(db)
     }
 
-    pub async fn new_temp(config: CoreConfig) -> Result<Self> {
-        let tempdir = tempfile::tempdir()?;
-        let path = tempdir.path().join("house.db");
-
-        let mut obj = Self::new(config, path.to_str().unwrap()).await?;
-        obj._temp_dir = Some(tempdir);
-
-        Ok(obj)
-    }
-
-    async fn initialize(pool: &SqlitePool) -> Result<()> {
-        let mut con = pool.acquire().await?;
-
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
-        sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
-        sqlx::query("PRAGMA busy_timeout=120000").execute(&mut con).await?;
-
-        sqlx::query(&format!("create table if not exists searches (
-            code TEXT PRIMARY KEY,
-            stage TEXT NOT NULL,
-            data BLOB NOT NULL,
-            search_group TEXT,
-            start_time TEXT
-        )")).execute(&mut con).await.context("error creating table searches")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_group_start ON searches(search_group, start_time)")).execute(&mut con).await?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_stage ON searches(stage)")).execute(&mut con).await?;
-
-        sqlx::query(&format!("create table if not exists yara_tasks (
-            id INTEGER PRIMARY KEY,
-            search TEXT NOT NULL,
-            hashes BLOB NOT NULL,
-            hash_count INTEGER NOT NULL,
-            assigned_worker TEXT,
-            assigned_time TEXT,
-            FOREIGN KEY(search) REFERENCES searches(code)
-        )
-        ")).execute(&mut con).await.context("Error creating table yara_tasks")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS yara_assigned_work_index ON yara_tasks(assigned_worker)")).execute(&mut con).await?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS yara_search_index ON yara_tasks(search)")).execute(&mut con).await?;
-
-        sqlx::query(&format!("create table if not exists garbage (
-            blob_id TEXT PRIMARY KEY,
-            time TEXT NOT NULL
-        )")).execute(&mut con).await.context("error creating table garbage")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS garbage_blob_id ON garbage(time)")).execute(&mut con).await?;
-
-        return Ok(())
-    }
-
     async fn setup_filter_table(&self, name: &IndexGroup) -> Result<()> {
         let mut con = self.db.acquire().await?;
-        let mut trans = con.begin().await?;
-
-        let file_table = file_table_name(name);
-        let filter_table = filter_table_name(name);
-
-        sqlx::query(&format!("create table if not exists {filter_table} (
-            id INTEGER PRIMARY KEY,
-            leaves BOOLEAN,
-            block INTEGER,
-            filter BLOB NOT NULL,
-            kind TEXT NOT NULL,
-            FOREIGN KEY(block) REFERENCES {filter_table}(id)
-        )")).execute(&mut trans).await.context("Create filter table")?;
-
-        sqlx::query(&format!("create table if not exists {file_table} (
-            hash BLOB PRIMARY KEY,
-            access BLOB NOT NULL,
-            block INTEGER NOT NULL,
-            filter BLOB NOT NULL,
-            kind TEXT NOT NULL,
-            FOREIGN KEY(block) REFERENCES {filter_table}(id)
-        )")).execute(&mut trans).await.context("Create file table")?;
-
-        trans.commit().await?;
-        return Ok(())
+        return self.imp.initialize_filter(&mut con, name).await
     }
 
     pub async fn list_indices(&self) -> Result<Vec<IndexGroup>> {
         // Get tables
-        let tables: Vec<(String, )> = sqlx::query_as("SELECT name FROM sqlite_schema WHERE type='table'")
-            .fetch_all(&self.db).await?;
+        let mut conn = self.db.acquire().await?;
+        let tables = self.imp.list_tables(&mut conn).await?;
 
         // Figure out which ones are index groups
         let mut file = HashSet::new();
         let mut filter = HashSet::new();
-        for (name, ) in tables {
+        for name in tables {
             if name.starts_with("file_") {
                 file.insert(name[5..].to_owned());
             } else if name.starts_with("filter_") {
@@ -282,7 +272,7 @@ impl SQLiteInterface {
 
             let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
                 "SELECT kind, COUNT(1) FROM {file_table} GROUP BY kind"))
-                .fetch_all(&mut conn).await?;
+                .fetch_all( &mut conn).await?;
 
             for (kind, size) in rows {
                 sizes.insert(group.to_string(), *sizes.get(&group.to_string()).unwrap_or(&0) + size as u64);
@@ -371,7 +361,10 @@ impl SQLiteInterface {
             match result {
                 Ok(_) => break stack,
                 Err(err) => {
-                    if err.to_string().contains("UNIQUE constraint failed") {
+                    let constraint_failed = err.to_string().contains("UNIQUE constraint failed")
+                        || err.to_string().contains("1062 (23000)");
+
+                    if constraint_failed {
                         self.update_file_access(hash, access, index_group).await?;
                         return Ok(());
                     }
@@ -408,7 +401,7 @@ impl SQLiteInterface {
         return Ok(())
     }
 
-    async fn _find_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
+    async fn _find_roots(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
         let filter_table = filter_table_name(index_group);
 
         // Load the root group
@@ -416,20 +409,20 @@ impl SQLiteInterface {
             SELECT id, leaves, kind, filter FROM {filter_table}
             WHERE kind = ? AND block IS NULL"))
             .bind(filter.kind())
-            .fetch_all(&mut *conn).await?;
+            .fetch_all(&mut *conn).await.context("search for existing")?;
 
         // Try to atomically create it
         if rows.is_empty() {
             sqlx::query(&format!("INSERT INTO {filter_table}(leaves, block, filter, kind) VALUES(TRUE, NULL, ?, ?)"))
                 .bind(filter.to_buffer()?)
                 .bind(filter.kind())
-                .execute(&mut *conn).await?;
+                .execute(&mut *conn).await.context("insert new")?;
 
             rows = query_as(&format!("
             SELECT id, leaves, kind, filter FROM {filter_table}
             WHERE kind = ? AND block IS NULL"))
             .bind(filter.kind())
-            .fetch_all(&mut *conn).await?;
+            .fetch_all(&mut *conn).await.context("reload existing")?;
         }
 
         let mut output = vec![];
@@ -446,7 +439,7 @@ impl SQLiteInterface {
         Ok(output)
     }
 
-    async fn _find_all_roots(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup) -> Result<Vec<(i64, bool, Filter)>> {
+    async fn _find_all_roots(&self, conn: &mut PoolCon, index_group: &IndexGroup) -> Result<Vec<(i64, bool, Filter)>> {
         let filter_table = filter_table_name(index_group);
 
         // Load the root group
@@ -482,10 +475,10 @@ impl SQLiteInterface {
         Ok(best)
     }
 
-    async fn _find_insert_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
+    async fn _find_insert_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
         let mut group_stack: Vec<(i64, bool, Filter)> = vec![{
             // Get the root groups
-            let mut roots = self._find_roots(&mut *conn, index_group, filter).await?;
+            let mut roots = self._find_roots(&mut *conn, index_group, filter).await.context("_find_roots")?;
             assert!(!roots.is_empty());
 
             // Select the best of the root groups
@@ -505,7 +498,7 @@ impl SQLiteInterface {
         return Ok(group_stack)
     }
 
-    async fn _expand_filters(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, filter: &Filter, stack: &Vec<(i64, bool, Filter)>) -> Result<bool> {
+    async fn _expand_filters(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &Filter, stack: &Vec<(i64, bool, Filter)>) -> Result<bool> {
         let filter_table = filter_table_name(index_group);
         for (group_id, _, old_filter) in stack {
             // calculate the new filter for this group
@@ -542,7 +535,7 @@ impl SQLiteInterface {
         return Ok(true)
     }
 
-    async fn _count_files_in_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<usize> {
+    async fn _count_files_in_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<usize> {
         let file_table = file_table_name(&index_group);
         let (count, ) : (i64, ) = query_as(&format!("
             SELECT count(*) FROM {file_table}
@@ -552,7 +545,7 @@ impl SQLiteInterface {
         return Ok(count as usize)
     }
 
-    async fn _count_groups_in_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<usize> {
+    async fn _count_groups_in_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<usize> {
         let filter_table = filter_table_name(&index_group);
         let (count, ) : (i64, ) = query_as(&format!("
             SELECT count(*) FROM {filter_table}
@@ -562,7 +555,7 @@ impl SQLiteInterface {
         return Ok(count as usize)
     }
 
-    async fn _split_leaf_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<bool> {
+    async fn _split_leaf_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<bool> {
         if let Ok(mut table) = self.cant_split.lock() {
             let table = table.get_mut();
             if table.contains(&group) {
@@ -654,7 +647,7 @@ impl SQLiteInterface {
         }
     }
 
-    async fn _split_inner_group(&self, conn: &mut PoolConnection<Sqlite>, index_group: &IndexGroup, group: i64) -> Result<bool> {
+    async fn _split_inner_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<bool> {
         if let Ok(mut table) = self.cant_split.lock() {
             let table = table.get_mut();
             if table.contains(&group) {
@@ -794,20 +787,24 @@ impl SQLiteInterface {
     }
 
     async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &Filter) -> Result<i64>
-    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let filter_table = filter_table_name(index_group);
-        Ok(sqlx::query(&format!("INSERT INTO {filter_table}(leaves, block, filter, kind) VALUES(?, ?, ?, ?)"))
+        let result = sqlx::query(&format!("INSERT INTO {filter_table}(leaves, block, filter, kind) VALUES(?, ?, ?, ?)"))
             .bind(leaves)
             .bind(parent)
             .bind(filter.to_buffer()?)
             .bind(filter.kind())
-            .execute(conn).await?.last_insert_rowid())
+            .execute(conn).await?;
+        match result.last_insert_id() {
+            Some(id) => Ok(id),
+            None => Err(anyhow::anyhow!("Could not insert")),
+        }
     }
 
 
     async fn _load_files_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(Vec<u8>, AccessControl, Filter)>>
-    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let file_table = file_table_name(&index_group);
         let rows: Vec<(Vec<u8>, String, String, Vec<u8>)> = query_as(&format!("
@@ -837,7 +834,7 @@ impl SQLiteInterface {
     }
 
     async fn _load_groups_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(i64, bool, Filter)>>
-    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let filter_table = filter_table_name(&index_group);
         let rows: Vec<(i64, bool, String, Vec<u8>)> = query_as(&format!("
@@ -909,7 +906,7 @@ impl SQLiteInterface {
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
         sqlx::query("INSERT INTO searches(code, stage, data, search_group, start_time) VALUES(?, ?, ?, ?, ?)")
             .bind(&code)
-            .bind(SearchStage::Queued)
+            .bind(SearchStage::Queued.to_string())
             .bind(&postcard::to_allocvec(&SearchRecord{
                 code: code.clone(),
                 yara_signature: req.yara_signature,
@@ -946,12 +943,12 @@ impl SQLiteInterface {
             None => return Ok(None)
         };
 
-        let pending_files = if stage == SearchStage::Yara {
-            let (pending_files, ): (i64, ) = sqlx::query_as(
-                "SELECT SUM(hash_count) FROM yara_tasks WHERE search = ?")
+        let pending_files: i64 = if stage == SearchStage::Yara {
+            let (pending_files, ): (f64, ) = sqlx::query_as(
+                "SELECT CAST(SUM(hash_count) as DOUBLE) FROM yara_tasks WHERE search = ?")
                 .bind(&code)
                 .fetch_one(&mut conn).await.context("Couldn't list yara tasks for search")?;
-            pending_files
+            pending_files as i64
         } else {
             0
         };
@@ -1010,7 +1007,7 @@ impl SQLiteInterface {
     }
 
     async fn _release_yara_task<'e, E>(&self, conn: E, id: i64) -> Result<bool>
-    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let req = sqlx::query(
             "UPDATE yara_tasks SET assigned_worker = NULL, assigned_time = NULL
@@ -1021,30 +1018,31 @@ impl SQLiteInterface {
     }
 
     async fn _get_search<'e, E>(&self, conn: E, code: &str) -> Result<Option<(SearchStage, SearchRecord)>>
-    where E: sqlx::Executor<'e, Database = sqlx::Sqlite>
+    where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
-        let search: Option<(SearchStage, Vec<u8>)> = sqlx::query_as(
+        let search: Option<(String, Vec<u8>)> = sqlx::query_as(
             "SELECT stage, data FROM searches WHERE code = ? LIMIT 1")
             .bind(&code)
             .fetch_optional(conn).await?;
 
         Ok(match search {
-            Some((stage, search)) => Some((stage, postcard::from_bytes(&search)?)),
+            Some((stage, search)) => Some((SearchStage::from(stage.as_str()), postcard::from_bytes(&search)?)),
             None => None,
         })
     }
 
     pub async fn get_queued_or_filtering_searches(&self) -> Result<(Vec<String>, Vec<String>)> {
-        let searches: Vec<(String, SearchStage)> = sqlx::query_as(
+        let searches: Vec<(String, String)> = sqlx::query_as(
             "SELECT code, stage FROM searches WHERE stage = ? OR stage = ?")
-            .bind(SearchStage::Queued)
-            .bind(SearchStage::Filtering)
+            .bind(SearchStage::Queued.as_str())
+            .bind(SearchStage::Filtering.as_str())
             .fetch_all(&self.db).await?;
 
         let mut queued = vec![];
         let mut filtering = vec![];
 
         for (code, stage) in searches {
+            let stage = SearchStage::from(stage.as_str());
             match stage {
                 SearchStage::Queued => queued.push(code),
                 SearchStage::Filtering => filtering.push(code),
@@ -1059,7 +1057,7 @@ impl SQLiteInterface {
     pub async fn set_search_stage(&self, code: &str, stage: SearchStage) -> Result<()> {
         sqlx::query(
             "UPDATE searches SET stage = ? WHERE code = ?")
-            .bind(stage)
+            .bind(stage.as_str())
             .bind(code)
             .execute(&self.db).await?;
         return Ok(())
@@ -1138,7 +1136,7 @@ impl SQLiteInterface {
         sqlx::query(
             "UPDATE searches SET data = ?, stage = ? WHERE code = ?")
             .bind(&postcard::to_allocvec(&record)?)
-            .bind(stage)
+            .bind(stage.as_str())
             .bind(&code)
             .execute(&mut trans).await?;
 
@@ -1146,7 +1144,7 @@ impl SQLiteInterface {
         Ok(trans.commit().await?)
     }
 
-    async fn get_yara_task(&self, conn: &mut PoolConnection<sqlx::Sqlite>, worker: &String) -> Result<Vec<YaraTask>> {
+    async fn get_yara_task(&self, conn: &mut PoolCon, worker: &String) -> Result<Vec<YaraTask>> {
         let search: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
             "SELECT id, search, hashes FROM yara_tasks WHERE assigned_worker IS NULL LIMIT 1")
             .fetch_optional(&mut *conn).await?;

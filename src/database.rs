@@ -9,7 +9,8 @@ use crate::access::AccessControl;
 use crate::bloom::Filter;
 use crate::core::{CoreConfig};
 // use crate::database_rocksdb::RocksInterface;
-use crate::database_sqlite::SQLiteInterface;
+// use crate::database_sqlite::SQLiteInterface;
+use crate::database_generic_sql::SQLInterface;
 use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
 
 
@@ -146,28 +147,31 @@ impl From<&str> for SearchStage {
 
 impl std::fmt::Display for SearchStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SearchStage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
             SearchStage::Queued => "queued",
             SearchStage::Filtering => "filtering",
             SearchStage::Yara => "yara",
             SearchStage::Finished => "finished",
-        })
+        }
     }
 }
 
 pub enum Database {
-    SQLite(SQLiteInterface),
+    SQLite(SQLInterface),
 }
 
 impl Database {
 
-    pub async fn new_sqlite(config: CoreConfig, path: &str) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new(config, path).await?))
+    pub async fn new(config: CoreConfig, db_config: crate::config::Database) -> Result<Self> {
+        Ok(Database::SQLite(SQLInterface::new(config, db_config).await?))
     }
 
-    pub async fn new_sqlite_temp(config: CoreConfig) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new_temp(config).await?))
-    }
 
     // pub async fn partition_test(&self) -> Result<()> {
     //     match self {

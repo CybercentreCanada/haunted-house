@@ -4,7 +4,9 @@ mod core;
 mod storage;
 mod size_type;
 mod database;
-mod database_sqlite;
+mod database_generic_sql;
+mod db_imp_sqlite;
+mod db_imp_mysql;
 mod query;
 mod error;
 mod access;
@@ -22,7 +24,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use auth::Authenticator;
-use bitvec::macros::internal::funty::Numeric;
 use bloom::Filter;
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
@@ -160,10 +161,7 @@ async fn main() -> Result<()> {
 
             // Initialize database
             info!("Connecting to database.");
-            let database = match config.database {
-                config::Database::SQLite{path} => Database::new_sqlite(config.core.clone(), &path).await?,
-                config::Database::SQLiteTemp{..} => Database::new_sqlite_temp(config.core.clone()).await?,
-            };
+            let database = Database::new(config.core.clone(), config.database).await?;
 
             // Start server core
             info!("Starting server core.");
@@ -264,10 +262,7 @@ async fn main() -> Result<()> {
 
             // Initialize database
             info!("Connecting to database.");
-            let database = match config.database {
-                config::Database::SQLite{path} => Database::new_sqlite(config.core.clone(), &path).await?,
-                config::Database::SQLiteTemp{..} => Database::new_sqlite_temp(config.core.clone()).await?,
-            };
+            let database = Database::new(config.core.clone(), config.database).await?;
 
             // database.partition_test().await?;
 

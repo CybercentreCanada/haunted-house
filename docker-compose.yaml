@@ -16,3 +16,18 @@ services:
     ports:
       - "10000:10000"
     command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000
+
+  mysql:
+    image: mysql
+    ports:
+      - "3306:3306"
+      - "33060:33060"
+    # command: --binlog-expire-logs-seconds=86400
+    command: --binlog-expire-logs-seconds=3600
+    environment:
+      MYSQL_DATABASE: haunted
+      MYSQL_USER: haunted
+      MYSQL_PASSWORD: d4941d0d8bf64e1b64fb
+      MYSQL_RANDOM_ROOT_PASSWORD: "true"
+    volumes:
+      - "./test-data/mysql:/var/lib/mysql"

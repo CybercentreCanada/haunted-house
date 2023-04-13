@@ -270,15 +270,12 @@ pub struct Access {
 
 
 #[handler]
-async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>, query: Option<poem::web::Query<Access>>, body: Option<Json<Access>>) -> (StatusCode, Response) {
-    let status = match interface.search_status(code).await {
-        Ok(status) => status,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}").into_response())
-    };
+async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>, query: Option<poem::web::Query<Access>>, body: Option<Json<Access>>) -> Result<Json<SearchRequestResponse>, poem::Error> {
+    let status = interface.search_status(code).await?;
 
     let status = match status {
         Some(status) => status,
-        None => return (StatusCode::NOT_FOUND, "Search code not found.".into_response())
+        None => return Err(poem::error::NotFound(crate::error::ErrorKinds::UnknownSearchCode))
     };
 
     let access = match body {
@@ -290,10 +287,10 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
     };
 
     if !status.view.can_access(&access.access) {
-        return (StatusCode::NOT_FOUND, "Search code not found.".into_response())
+        return Err(poem::error::NotFound(crate::error::ErrorKinds::UnknownSearchCode))
     }
 
-    return (StatusCode::OK, Json(status.resp).into_response())
+    return Ok(Json(status.resp))
 }
 
 #[derive(Serialize, Deserialize)]
