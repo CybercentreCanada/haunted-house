@@ -1,95 +1,28 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet, HashMap, BTreeMap};
+use std::io::Write;
 use std::path::{Path};
 
 use anyhow::{Result, Context};
 use async_trait::async_trait;
 use itertools::Itertools;
 use log::{info, error, warn};
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, query_as, Decode, Acquire, Sqlite, Encode, Executor};
-use sqlx::pool::{PoolOptions, PoolConnection};
+use sqlx::{query_as, Acquire};
 use tempfile::TempDir;
 
 use crate::access::AccessControl;
-use crate::bloom::Filter;
+use crate::bloom::BloomFilter;
 use crate::core::{CoreConfig};
 use crate::database::{IndexGroup, SearchStage, IndexStatus};
 use crate::db_imp_mysql::MySQLImp;
 use crate::db_imp_sqlite::SqliteImp;
+use crate::filter::{Filter, LoadFilter, GenericFilter};
+use crate::insert_cursor::InsertCursor;
 use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, YaraTask, WorkError};
 use crate::query::Query;
-
-// impl<'r> Decode<'r, sqlx::Sqlite> for IndexGroup {
-//     fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-//         let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-//         Ok(Self::from(value))
-//     }
-// }
-
-// impl sqlx::Type<sqlx::Sqlite> for IndexGroup {
-//     fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-//         <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-//     }
-// }
-
-// impl<'r> Decode<'r, sqlx::Sqlite> for IndexID {
-//     fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-//         let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-//         Ok(Self::from(value))
-//     }
-// }
-
-// impl sqlx::Type<sqlx::Sqlite> for IndexID {
-//     fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-//         <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-//     }
-// }
-
-// impl<'r> Encode<'r, sqlx::Any> for SearchStage {
-//     fn encode_by_ref(&self, buf: &mut <sqlx::Any as sqlx::database::HasArguments<'r>>::ArgumentBuffer) -> sqlx::encode::IsNull {
-//         <&str as Encode<'_, sqlx::Any>>::encode_by_ref(&self.as_str(), buf)
-//     }
-//     // fn encode_by_ref(&self, buf: &mut Vec<sqlx::Any::ArgumentValue<'r>>) -> sqlx::encode::IsNull {
-//     //     self.to_string().encode_by_ref(buf)
-//     // }
-// }
-
-// impl<'r> Decode<'r, sqlx::Any> for SearchStage {
-//     fn decode(value: <sqlx::Any as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-//         let value = <&str as Decode<sqlx::Any>>::decode(value)?;
-//         Ok(Self::from(value))
-//     }
-// }
-
-// impl sqlx::Type<sqlx::Any> for SearchStage {
-//     fn type_info() -> <sqlx::Any as sqlx::Database>::TypeInfo {
-//         <&str as sqlx::Type<sqlx::Any>>::type_info()
-//     }
-// }
-
-// impl<'r> Encode<'r, sqlx::MySql> for SearchStage {
-//     fn encode_by_ref(&self, buf: &mut <sqlx::MySql as sqlx::database::HasArguments<'r>>::ArgumentBuffer) -> sqlx::encode::IsNull {
-//         <&str as Encode<'_, sqlx::MySql>>::encode_by_ref(&self.as_str(), buf)
-//     }
-//     // fn encode_by_ref(&self, buf: &mut Vec<sqlx::MySql::ArgumentValue<'r>>) -> sqlx::encode::IsNull {
-//     //     self.to_string().encode_by_ref(buf)
-//     // }
-// }
-
-// impl<'r> Decode<'r, sqlx::MySql> for SearchStage {
-//     fn decode(value: <sqlx::MySql as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-//         let value = <&str as Decode<sqlx::MySql>>::decode(value)?;
-//         Ok(Self::from(value))
-//     }
-// }
-
-// impl sqlx::Type<sqlx::MySql> for SearchStage {
-//     fn type_info() -> <sqlx::MySql as sqlx::Database>::TypeInfo {
-//         <&str as sqlx::Type<sqlx::MySql>>::type_info()
-//     }
-// }
 
 pub type PoolCon = sqlx::any::AnyConnection;
 
@@ -104,6 +37,8 @@ struct SearchRecord {
     errors: Vec<String>,
     filtered_files: u64,
     suspect_files: u64,
+    group_hits: u64,
+    group_misses: u64,
     hit_files: BTreeSet<Vec<u8>>,
     truncated: bool,
     start: IndexGroup,
@@ -137,8 +72,14 @@ pub fn filter_table_name(name: &IndexGroup) -> String {
     format!("filter_{name}")
 }
 
+const GROUP_SIZE: usize = 48;
 
-const GROUP_SIZE: usize = 16;
+fn layer_density(height: i32, target: f64) -> f64 {
+    let minimum = 1.0 - (1.0 - target).powi(3);
+    let factor = 1.0 - (0.95f64).powi(height.pow(2));
+    return minimum + (1.0-minimum)*factor;
+}
+
 
 impl SQLInterface {
     pub async fn new(config: CoreConfig, dbconf: crate::config::Database) -> Result<Self> {
@@ -237,29 +178,29 @@ impl SQLInterface {
         return Ok(groups)
     }
 
-    pub async fn list_filters(&self, kind: &str, goal: usize) -> Result<Vec<Filter>> {
-        let mut filters = vec![];
-        let indices = self.list_indices().await?;
+    // pub async fn list_filters<F: Filter>(&self, kind: &str, goal: usize) -> Result<Vec<F>> {
+    //     let mut filters: Vec<F> = vec![];
+    //     let indices = self.list_indices().await?;
 
-        for index in indices {
-            if filters.len() >= goal {
-                break
-            }
+    //     for index in indices {
+    //         if filters.len() >= goal {
+    //             break
+    //         }
 
-            let file_table = file_table_name(&index);
+    //         let file_table = file_table_name(&index);
 
-            let rows: Vec<(Vec<u8>, )> = sqlx::query_as(&format!("
-                SELECT filter FROM {file_table} WHERE kind = ? LIMIT {goal}"))
-                .bind(kind)
-                .fetch_all(&self.db).await?;
+    //         let rows: Vec<(Vec<u8>, )> = sqlx::query_as(&format!("
+    //             SELECT filter FROM {file_table} WHERE kind = ? LIMIT {goal}"))
+    //             .bind(kind)
+    //             .fetch_all(&self.db).await?;
 
-            for (data, ) in rows {
-                filters.push(Filter::load(kind, &data)?)
-            }
-        }
+    //         for (data, ) in rows {
+    //             filters.push(F::load(kind, &data)?)
+    //         }
+    //     }
 
-        return Ok(filters)
-    }
+    //     return Ok(filters)
+    // }
 
     pub async fn _init_status(&self) -> Result<IndexStatus> {
         let tables = self.list_indices().await?;
@@ -336,7 +277,7 @@ impl SQLInterface {
         return Ok(false)
     }
 
-    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &Filter) -> Result<()> {
+    pub async fn insert_file<F: Filter>(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &F, target_density: f64) -> Result<()> {
         // Setup tables to insert to
         self.setup_filter_table(index_group).await.context("setup_filter_table")?;
         let mut conn = self.db.acquire().await?;
@@ -386,23 +327,31 @@ impl SQLInterface {
         }
 
         // Check each group (bottom up) to see if it needs to be split
-        while let Some((group_id, leaf, _mask)) = stack.pop() {
+        let mut depth = 0;
+        while let Some((group_id, leaf, mask)) = stack.pop() {
+            let target_density = if stack.is_empty() {
+                1.0
+            } else {
+                layer_density(depth, target_density)
+            };
+
             if leaf {
                 let count = self._count_files_in_group(&mut conn, index_group, group_id).await?;
-                if count > GROUP_SIZE {
-                    self._split_leaf_group(&mut conn, index_group, group_id).await?;
+                if count > GROUP_SIZE || mask.density() > target_density {
+                    self._split_leaf_group::<F>(&mut conn, index_group, group_id).await?;
                 }
             } else {
                 let count = self._count_groups_in_group(&mut conn, index_group, group_id).await?;
-                if count > GROUP_SIZE {
-                    self._split_inner_group(&mut conn, index_group, group_id).await?;
+                if count > GROUP_SIZE || mask.density() > target_density {
+                    self._split_inner_group::<F>(&mut conn, index_group, group_id).await?;
                 }
             }
+            depth += 1;
         }
         return Ok(())
     }
 
-    async fn _find_roots(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
+    async fn _find_roots<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &F) -> Result<Vec<(i64, bool, F)>> {
         let filter_table = filter_table_name(index_group);
 
         // Load the root group
@@ -428,7 +377,7 @@ impl SQLInterface {
 
         let mut output = vec![];
         for (id, leaves, kind, filter) in rows {
-            let filter = match Filter::load(&kind, &filter) {
+            let filter = match F::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Couldn't load filter {id}: {err}");
@@ -440,7 +389,7 @@ impl SQLInterface {
         Ok(output)
     }
 
-    async fn _find_all_roots(&self, conn: &mut PoolCon, index_group: &IndexGroup) -> Result<Vec<(i64, bool, Filter)>> {
+    async fn _find_all_roots<F: LoadFilter>(&self, conn: &mut PoolCon, index_group: &IndexGroup) -> Result<Vec<(i64, bool, F)>> {
         let filter_table = filter_table_name(index_group);
 
         // Load the root group
@@ -451,7 +400,7 @@ impl SQLInterface {
 
         let mut output = vec![];
         for (id, leaves, kind, filter) in rows {
-            let filter = match Filter::load(&kind, &filter) {
+            let filter = match F::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Couldn't load filter {id}: {err}");
@@ -463,7 +412,7 @@ impl SQLInterface {
         Ok(output)
     }
 
-    fn _pick_best(target: &Filter, options: &Vec<&Filter>) -> Result<usize> {
+    fn _pick_best<F: Filter>(target: &F, options: &Vec<&F>) -> Result<usize> {
         let mut best = 0;
         let mut best_score = 0;
         for (index, other) in options.iter().enumerate() {
@@ -476,8 +425,8 @@ impl SQLInterface {
         Ok(best)
     }
 
-    async fn _find_insert_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &Filter) -> Result<Vec<(i64, bool, Filter)>> {
-        let mut group_stack: Vec<(i64, bool, Filter)> = vec![{
+    async fn _find_insert_group<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &F) -> Result<Vec<(i64, bool, F)>> {
+        let mut group_stack: Vec<(i64, bool, F)> = vec![{
             // Get the root groups
             let mut roots = self._find_roots(&mut *conn, index_group, filter).await.context("_find_roots")?;
             assert!(!roots.is_empty());
@@ -499,7 +448,7 @@ impl SQLInterface {
         return Ok(group_stack)
     }
 
-    async fn _expand_filters(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &Filter, stack: &Vec<(i64, bool, Filter)>) -> Result<bool> {
+    async fn _expand_filters<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &F, stack: &Vec<(i64, bool, F)>) -> Result<bool> {
         let filter_table = filter_table_name(index_group);
         for (group_id, _, old_filter) in stack {
             // calculate the new filter for this group
@@ -556,7 +505,7 @@ impl SQLInterface {
         return Ok(count as usize)
     }
 
-    async fn _split_leaf_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<bool> {
+    async fn _split_leaf_group<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<bool> {
         if let Ok(mut table) = self.cant_split.lock() {
             let table = table.get_mut();
             if table.contains(&group) {
@@ -601,11 +550,8 @@ impl SQLInterface {
             };
 
             // build the new covering filters
-            let size = Filter::parse_kind(&kind)?;
-            let a_cover = a_items.iter()
-                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
-            let b_cover = b_items.iter()
-                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
+            let a_cover = F::merge(a_items.iter().map(|(_, _, f)|f).collect_vec())?;
+            let b_cover = F::merge(b_items.iter().map(|(_, _, f)|f).collect_vec())?;
 
             let mut trans = conn.begin().await?;
             // Check for root
@@ -648,7 +594,7 @@ impl SQLInterface {
         }
     }
 
-    async fn _split_inner_group(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<bool> {
+    async fn _split_inner_group<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, group: i64) -> Result<bool> {
         if let Ok(mut table) = self.cant_split.lock() {
             let table = table.get_mut();
             if table.contains(&group) {
@@ -692,11 +638,8 @@ impl SQLInterface {
             };
 
             // build the new covering filters
-            let size = Filter::parse_kind(&kind)?;
-            let a_cover = a_items.iter()
-                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
-            let b_cover = b_items.iter()
-                .fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap());
+            let a_cover = F::merge(a_items.iter().map(|(_, _, f)|f).collect_vec())?;
+            let b_cover = F::merge(b_items.iter().map(|(_, _, f)|f).collect_vec())?;
 
             let mut trans = conn.begin().await?;
             // Check for root
@@ -739,7 +682,7 @@ impl SQLInterface {
         }
     }
 
-    fn _partition<A, B>(mut items: Vec<(A, B, Filter)>) -> Option<(Vec<(A, B, Filter)>, Vec<(A, B, Filter)>)> {
+    fn _partition<A, B, F: Filter>(mut items: Vec<(A, B, F)>) -> Option<(Vec<(A, B, F)>, Vec<(A, B, F)>)> {
         // Pick a starting item
         let mut group = vec![{
             let (_, index) = items.iter().enumerate()
@@ -782,12 +725,12 @@ impl SQLInterface {
         return Some((group, items))
     }
 
-    fn _cover_on<A, B>(items: &Vec<(A, B, Filter)>) -> Filter {
-        let size = items[0].2.params();
-        items.iter().fold(Filter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap())
-    }
+    // fn _cover_on<A, B>(items: &Vec<(A, B, BloomFilter)>) -> BloomFilter {
+    //     let size = items[0].2.params();
+    //     items.iter().fold(BloomFilter::empty(size.0, size.1, size.2), |a, b|a.overlap(&b.2).unwrap())
+    // }
 
-    async fn _new_group<'e, E>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &Filter) -> Result<i64>
+    async fn _new_group<'e, E, F: Filter>(&self, conn: E, index_group: &IndexGroup, leaves: bool, parent: Option<i64>, filter: &F) -> Result<i64>
     where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let filter_table = filter_table_name(index_group);
@@ -804,7 +747,7 @@ impl SQLInterface {
     }
 
 
-    async fn _load_files_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(Vec<u8>, AccessControl, Filter)>>
+    async fn _load_files_in_group<'e, E, F: LoadFilter>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(Vec<u8>, AccessControl, F)>>
     where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let file_table = file_table_name(&index_group);
@@ -815,7 +758,7 @@ impl SQLInterface {
             .fetch_all(conn).await?;
         let mut out = vec![];
         for (hash, access, kind, filter) in rows {
-            let filter = match Filter::load(&kind, &filter) {
+            let filter = match F::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Corrupt filter entry: {err}");
@@ -834,7 +777,7 @@ impl SQLInterface {
         return Ok(out)
     }
 
-    async fn _load_groups_in_group<'e, E>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(i64, bool, Filter)>>
+    async fn _load_groups_in_group<'e, E, F: LoadFilter>(&self, conn: E, index_group: &IndexGroup, group: i64) -> Result<Vec<(i64, bool, F)>>
     where E: sqlx::Executor<'e, Database = sqlx::Any>
     {
         let filter_table = filter_table_name(&index_group);
@@ -845,7 +788,7 @@ impl SQLInterface {
             .fetch_all(conn).await?;
         let mut out = vec![];
         for (id, leave, kind, filter) in rows {
-            let filter = match Filter::load(&kind, &filter) {
+            let filter = match F::load(&kind, &filter) {
                 Ok(filter) => filter,
                 Err(err) => {
                     error!("Corrupt filter entry: {err}");
@@ -920,6 +863,8 @@ impl SQLInterface {
                 end,
                 suspect_files: 0,
                 filtered_files: 0,
+                group_hits: 0,
+                group_misses: 0,
                 hit_files: Default::default(),
                 truncated: false,
             })?)
@@ -965,6 +910,8 @@ impl SQLInterface {
                     suspect_files: search.suspect_files,
                     filtered_files: search.filtered_files,
                     pending_files: pending_files as u64,
+                    group_hits: search.group_hits,
+                    group_misses: search.group_misses,
                     hits: search.hit_files.into_iter().map(|hash|hex::encode(hash)).collect(),
                     truncated: search.truncated,
                 }
@@ -1083,29 +1030,33 @@ impl SQLInterface {
         let indices: Vec<IndexGroup> = indices.into_iter()
             .filter(|index| &record.start <= index && index <= &record.end).collect();
 
-        let mut files: HashSet<Vec<u8>> = Default::default();
+        let mut accepted_files: HashSet<Vec<u8>> = Default::default();
         let mut rejected_files: HashSet<Vec<u8>> = Default::default();
+        let mut group_misses: u64 = 0;
+        let mut group_hits: u64 = 0;
         for index_group in indices {
             // Load the base filters for this index
-            let mut outstanding_groups = self._find_all_roots(&mut conn, &index_group).await?;
+            let mut outstanding_groups = self._find_all_roots::<GenericFilter>(&mut *conn, &index_group).await?;
 
             // Apply filters recursively until we only have file entries left
             while let Some((group_id, leaves, filter)) = outstanding_groups.pop() {
                 if !filter.query(&record.query) {
+                    group_misses += 1;
                     continue
                 }
+                group_hits += 1;
 
                 if leaves {
-                    for (hash, access, filter) in self._load_files_in_group(&mut conn, &index_group, group_id).await? {
+                    for (hash, access, filter) in self._load_files_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await? {
                         if rejected_files.contains(&hash) { continue }
                         if !access.can_access(&record.access) || !filter.query(&record.query) {
                             rejected_files.insert(hash);
                             continue
                         }
-                        files.insert(hash);
+                        accepted_files.insert(hash);
                     }
                 } else {
-                    outstanding_groups.extend(self._load_groups_in_group(&mut conn, &index_group, group_id).await?);
+                    outstanding_groups.extend(self._load_groups_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await?);
                 }
             }
         }
@@ -1113,7 +1064,7 @@ impl SQLInterface {
         let mut trans = conn.begin().await?;
 
         // Create yara jobs for these files
-        let files: Vec<Vec<u8>> = files.into_iter().collect();
+        let files: Vec<Vec<u8>> = accepted_files.into_iter().collect();
         for hash_block in files.chunks(self.config.yara_job_size as usize) {
             let hashes_data = postcard::to_allocvec(&hash_block)?;
             sqlx::query(
@@ -1134,6 +1085,8 @@ impl SQLInterface {
         let mut record = record;
         record.suspect_files = files.len() as u64;
         record.filtered_files = rejected_files.len() as u64;
+        record.group_hits = group_hits;
+        record.group_misses = group_misses;
         sqlx::query(
             "UPDATE searches SET data = ?, stage = ? WHERE code = ?")
             .bind(&postcard::to_allocvec(&record)?)
@@ -1144,6 +1097,212 @@ impl SQLInterface {
         // Apply search result
         Ok(trans.commit().await?)
     }
+
+    pub async fn simulate_filter(&self, query: &Query) -> Result<()> {
+        // Get the search in question
+        let mut conn = self.db.acquire().await?;
+
+        // Load the set of indices in the range for this job
+        let mut indices = self.list_indices().await?;
+        indices.sort_unstable();
+        let status = self.status().await?;
+
+        for index_group in indices {
+            println!("Group: {} {}", index_group, status.group_files.get(index_group.as_str()).unwrap_or(&0));
+            let mut keys: BTreeSet<String> = Default::default();
+            let mut group_misses: HashMap<String, u64> = Default::default();
+            let mut group_hits: HashMap<String, u64> = Default::default();
+            let mut accepted_files: HashMap<String, u64> = Default::default();
+            let mut rejected_files: HashMap<String, u64> = Default::default();
+
+            // Load the base filters for this index
+            let mut outstanding_groups = self._find_all_roots::<GenericFilter>(&mut *conn, &index_group).await?;
+
+            // Apply filters recursively until we only have file entries left
+            while let Some((group_id, leaves, filter)) = outstanding_groups.pop() {
+                let key = filter.kind();
+                keys.insert(key.clone());
+
+                if !filter.query(&query) {
+                    group_misses.insert(key.clone(), group_misses.get(&key).unwrap_or(&0) + 1);
+                    continue
+                }
+                group_hits.insert(key.clone(), group_hits.get(&key).unwrap_or(&0) + 1);
+
+                if leaves {
+                    for (hash, access, filter) in self._load_files_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await? {
+                        // if rejected_files.contains(&hash) { continue }
+                        if !filter.query(&query) {
+                            rejected_files.insert(key.clone(), rejected_files.get(&key).unwrap_or(&0) + 1);
+                            continue
+                        }
+                        accepted_files.insert(key.clone(), accepted_files.get(&key).unwrap_or(&0) + 1);
+                    }
+                } else {
+                    outstanding_groups.extend(self._load_groups_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await?);
+                }
+            }
+            for key in keys {
+                println!("\t{key} group {}/{} files {}/{}", group_hits.get(&key).unwrap_or(&0), group_misses.get(&key).unwrap_or(&0), accepted_files.get(&key).unwrap_or(&0), rejected_files.get(&key).unwrap_or(&0));
+            }
+            println!("");
+        }
+        return Ok(())
+    }
+
+
+    pub async fn traverse_sample(&self) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
+        let mut indices = self.list_indices().await?;
+        indices.sort_unstable();
+
+        for index_group in indices {
+            println!("{}", index_group.as_str());
+            // Get the root groups
+            let mut roots = self._find_all_roots::<GenericFilter>(&mut *conn, &index_group).await.context("_find_all_roots")?;
+            if roots.is_empty() {
+                continue
+            }
+            roots.sort_unstable_by_key(|row| row.2.kind());
+
+            for root in roots {
+                let root_kind = root.2.kind();
+                let mut  group_stack = vec![root];
+                while !group_stack.last().unwrap().1 {
+                    // Get the subgroups of this group
+                    let mut subgroups = self._load_groups_in_group(&mut *conn, &index_group, group_stack.last().unwrap().0).await?;
+                    assert!(!subgroups.is_empty());
+
+                    // select the best of the subgroups
+                    let index = thread_rng().gen_range(0..subgroups.len());
+                    group_stack.push(subgroups.swap_remove(index));
+                }
+
+                println!("\t{}", root_kind);
+                for (id, leaf, mask) in group_stack {
+                    println!("\t\t{}", mask.density())
+                }
+            }
+        }
+
+        return Ok(())
+    }
+
+    pub async fn test_shallow_group(&self, query: Query) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
+        let mut indices = self.list_indices().await?;
+        indices.sort_unstable();
+        indices.truncate(12);
+
+        // let group_id_counter: i64 = 0;
+        let mut grouping: Vec<(String, GenericFilter, u64)> = Default::default();
+        let status = self.status().await?;
+
+        for index_group in indices {
+            println!("Group: {} {}", index_group, status.group_files.get(index_group.as_str()).unwrap_or(&0));
+
+            // Load the base filters for this index
+            let mut outstanding_groups = self._find_all_roots::<GenericFilter>(&mut *conn, &index_group).await?;
+
+            let mut active: BTreeMap<String, Vec<InsertCursor>> = Default::default();
+
+            // Apply filters recursively until we only have file entries left
+            while let Some((group_id, leaves, filter)) = outstanding_groups.pop() {
+                let key = filter.kind();
+
+                let group_target: f64 = if key.starts_with("in") && key.ends_with(":1:1") {
+                    0.01
+                } else if key.starts_with("in") && key.ends_with(":2:3") {
+                    0.05
+                } else if key.starts_with("in") && key.ends_with(":3:5") {
+                    0.10
+                } else if key.starts_with("tri") {
+                    0.10
+                } else {
+                    todo!();
+                };
+                let group_target = 1.0-(1.0-group_target).powi(6);
+
+                if leaves {
+                    for (_hash, _access, filter) in self._load_files_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await? {
+                        match active.entry(key.clone()) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(vec![InsertCursor::new(filter, group_target)]);
+                            },
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                entry.get_mut().push(InsertCursor::new(filter, group_target));
+                            },
+                        }
+                    }
+                } else {
+                    outstanding_groups.extend(self._load_groups_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await?);
+                }
+            }
+
+            println!("Loaded, starting grouping");
+            let mut batches: Vec<(String, Vec<InsertCursor>)> = vec![];
+            for (kind, items) in active {
+                for b in &items.into_iter().chunks(100) {
+                    batches.push((kind.clone(), b.collect_vec()));
+                }
+            }
+
+            while let Some((kind, mut active)) = batches.pop() {
+                let mut ready_items: HashSet<usize> = Default::default();
+                for (id, (group_kind, filter, _count)) in grouping.iter().enumerate() {
+                    if kind != *group_kind { continue; }
+                    for (index, item) in active.iter_mut().enumerate() {
+                        if ready_items.contains(&index) { continue }
+                        if item.add(id as i64, filter) {
+                            ready_items.insert(index);
+                        }
+                    }
+                }
+                let mut ready_items = ready_items.into_iter().collect_vec();
+                ready_items.sort_unstable();
+                while let Some(index) = ready_items.pop() {
+                    let mut item = active.swap_remove(index);
+                    let (group_id, _, _) = item.next().unwrap();
+                    grouping[group_id as usize].2 += 1;
+                }
+
+                println!("{} {} {}", index_group, grouping.len(), batches.len());
+                while let Some(mut item) = active.pop() {
+                    match item.next() {
+                        Some((id, original, changed)) => {
+                            if original != grouping[id as usize].1.count_ones() {
+                                item.add(id, &grouping[id as usize].1);
+                                active.push(item);
+                                continue;
+                            } else {
+                                grouping[id as usize].2 += 1;
+                                if changed != 0 {
+                                    grouping[id as usize].1 = grouping[id as usize].1.overlap(&item.filter);
+                                }
+                            }
+                        },
+                        None => {
+                            let index = grouping.len() as i64;
+                            for other in active.iter_mut() {
+                                other.add(index, &item.filter);
+                            }
+                            grouping.push((kind.clone(), item.filter, 1));
+                        },
+                    }
+                }
+            }
+        }
+
+        let mut output = std::fs::OpenOptions::new().write(true).create(true).open("./groups2.csv")?;
+
+        for (kind, filter, items) in grouping {
+            output.write_fmt(format_args!("{kind}, {}, {items}, {}\n", filter.density(), filter.query(&query)))?;
+        }
+        output.flush()?;
+
+        return Ok(())
+    }
+
 
     async fn get_yara_task(&self, conn: &mut PoolCon, worker: &String) -> Result<Vec<YaraTask>> {
         let search: Option<(i64, String, Vec<u8>)> = sqlx::query_as(

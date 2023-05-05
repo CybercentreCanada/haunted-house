@@ -2,11 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::auth::Authenticator;
-use crate::bloom::{self, Filter};
+use crate::bloom::{self, BloomFilter};
 use crate::database::{Database, IndexGroup, SearchStage};
+use crate::filter::GenericFilter;
 use crate::interface::{InternalSearchStatus, SearchRequest, WorkRequest, WorkResult, WorkPackage};
 use crate::storage::BlobStorage;
 use crate::access::AccessControl;
+use crate::trigrams::TrigramFilter;
 use crate::worker_watcher::worker_watcher;
 use bitvec::vec::BitVec;
 use log::{error, debug, info};
@@ -39,17 +41,22 @@ pub enum IngestMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterConfig {
+    pub hits: u32,
+    pub hashes: u32,
+    pub density: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreConfig {
     #[serde(default="default_index_workers")]
     pub index_workers: u64,
     #[serde(default="default_search_workers")]
     pub search_workers: u64,
-    #[serde(default="default_target_density")]
-    pub target_density: f64,
-    #[serde(default="default_filter_hits")]
-    pub filter_hits: u32,
-    #[serde(default="default_filter_hashes")]
-    pub filter_hashes: u32,
+    #[serde(default="default_filter_config")]
+    pub filter_config: Vec<FilterConfig>,
+    #[serde(default="default_insert_block_size")]
+    pub insert_block_size: u32,
     #[serde(default="default_garbage_collection_interval")]
     pub garbage_collection_interval: std::time::Duration,
     #[serde(default="default_index_soft_entries_max")]
@@ -68,9 +75,12 @@ pub struct CoreConfig {
     pub task_heartbeat_interval: std::time::Duration,
 }
 
-fn default_target_density() -> f64 { 0.5 }
-fn default_filter_hits() -> u32 { 3 }
-fn default_filter_hashes() -> u32 { 3 }
+fn default_filter_config() -> Vec<FilterConfig> { vec![
+    FilterConfig{hits: 1,  hashes: 1, density: 0.01},
+    FilterConfig{hits: 2,  hashes: 3, density: 0.05},
+    FilterConfig{hits: 3,  hashes: 5, density: 0.10},
+] }
+fn default_insert_block_size() -> u32 { 8 }
 fn default_index_workers() -> u64 { 8 }
 fn default_search_workers() -> u64 { 8 }
 fn default_garbage_collection_interval() -> std::time::Duration { std::time::Duration::from_secs(60) }
@@ -295,10 +305,11 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
 async fn run_ingest_build_filter(core: Arc<HouseCore>, task: IngestTask) {
     match tokio::spawn(_run_ingest_build_filter(core.clone(), task.data.clone())).await {
-        Ok(Ok(Some(filter))) => {
+        Ok(Ok(Some((filter, density)))) => {
             _ = core.insert_queue.send(InsertMessage::Insert{
                 task,
                 filter,
+                density
             })
         },
         Ok(Ok(None)) => _ = task.response.send(Ok(())),
@@ -307,7 +318,7 @@ async fn run_ingest_build_filter(core: Arc<HouseCore>, task: IngestTask) {
     };
 }
 
-async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Result<Option<Filter>> {
+async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Result<Option<(GenericFilter, f64)>> {
 
     let index_group: IndexGroup = task.index;
     let hash: Vec<u8> = task.hash;
@@ -322,7 +333,7 @@ async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Res
 
     // Collect the file and build its trigrams
     debug!("Collect data for {}", hex::encode(&hash));
-    let mut trigrams = BitVec::repeat(false, 1 << 24);
+    let mut trigrams = BitVec::<u64>::repeat(false, 1 << 24);
     {
         // Get file content
         let label = hex::encode(&hash);
@@ -362,23 +373,30 @@ async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Res
         }
     }
 
-    let prepared_indices = Filter::prepare(core.config.filter_hashes, &trigrams);
-    // Try filter configurations until we find one that matches
-    for power in bloom::START_POWER..=bloom::END_POWER {
-        let size = 1 << power;
-        debug!("Attempting {size} {}", hex::encode(&hash));
-        let filter = Filter::build(size, core.config.filter_hits, core.config.filter_hashes, &prepared_indices);
-        if power == bloom::END_POWER || filter.density() < core.config.target_density {
-            return Ok(Some(filter));
+
+
+    for filter_config in &core.config.filter_config {
+        let prepared_indices = BloomFilter::prepare(filter_config.hashes, &trigrams);
+        // Try filter configurations until we find one that matches
+        for power in bloom::START_POWER..=bloom::END_POWER {
+            let size = 1 << power;
+            debug!("Attempting {size} {}", hex::encode(&hash));
+            let filter = BloomFilter::build(size, filter_config.hits, filter_config.hashes, &prepared_indices);
+            if filter.density() <= filter_config.density {
+                return Ok(Some((GenericFilter::Bloom(filter), filter_config.density)));
+            }
         }
     }
-    return Err(anyhow::anyhow!("Fallthrough on ingest loop: {}", hex::encode(&hash)))
+
+    // Fallback to raw trigram data
+    return Ok(Some((GenericFilter::Trigram(TrigramFilter{data: trigrams}), 0.7f64)))
 }
 
 enum InsertMessage {
     Insert {
         task: IngestTask,
-        filter: Filter,
+        filter: GenericFilter,
+        density: f64,
     },
     Status(oneshot::Sender<(HashMap<String, u64>, usize)>),
 }
@@ -397,7 +415,7 @@ async fn insert_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 
 async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<InsertMessage>) -> Result<()> {
 
-    let mut buffer: HashMap<(IndexGroup, String), VecDeque<(IngestTask, Filter)>> = Default::default();
+    let mut buffer: HashMap<(IndexGroup, String), VecDeque<(IngestTask, GenericFilter, f64)>> = Default::default();
     let mut active: JoinSet<()> = JoinSet::new();
     let mut busy: HashMap<(IndexGroup, String), tokio::task::AbortHandle> = Default::default();
     let mut timer = crate::counters::RateCounter::new(60);
@@ -414,18 +432,18 @@ async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 };
 
                 match message {
-                    InsertMessage::Insert{task, filter} => {
+                    InsertMessage::Insert{task, filter, density} => {
                         let key = (task.data.index.clone(), filter.kind());
 
                         if !busy.contains_key(&key) {
-                            busy.insert(key, active.spawn(run_insert(core.clone(), task, filter)));
+                            busy.insert(key, active.spawn(run_insert(core.clone(), task, filter, density)));
                         } else {
                             match buffer.entry(key) {
                                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                    entry.get_mut().push_back((task, filter));
+                                    entry.get_mut().push_back((task, filter, density));
                                 },
                                 std::collections::hash_map::Entry::Vacant(entry) => {
-                                    entry.insert([(task, filter)].into());
+                                    entry.insert([(task, filter, density)].into());
                                 },
                             }
                         }
@@ -453,8 +471,8 @@ async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 // kick off new jobs
                 for (key, queue) in buffer.iter_mut() {
                     if !busy.contains_key(key) {
-                        if let Some((task, filter)) = queue.pop_front() {
-                            busy.insert(key.clone(), active.spawn(run_insert(core.clone(), task, filter)));
+                        if let Some((task, filter, density)) = queue.pop_front() {
+                            busy.insert(key.clone(), active.spawn(run_insert(core.clone(), task, filter, density)));
                         }
                     }
                 }
@@ -467,7 +485,7 @@ async fn _insert_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     return Ok(())
 }
 
-async fn run_insert(core: Arc<HouseCore>, task: IngestTask, filter: Filter) {
+async fn run_insert(core: Arc<HouseCore>, task: IngestTask, filter: GenericFilter, density: f64) {
     // Make sure the expiry isn't already due
     let today_group = IndexGroup::create(&Some(Utc::now()));
     if task.data.index <= today_group {
@@ -488,10 +506,15 @@ async fn run_insert(core: Arc<HouseCore>, task: IngestTask, filter: Filter) {
     }
 
     // insert the data
-    _ = match core.database.insert_file(&task.data.hash, &task.data.access, &task.data.index, &filter).await.context("insert_file") {
-        Ok(()) => task.response.send(Ok(())),
-        Err(err) => task.response.send(Err(err)),
+    let result = match filter {
+        GenericFilter::Bloom(filter) => core.database.insert_file(&task.data.hash, &task.data.access, &task.data.index, &filter, density).await.context("insert_file"),
+        GenericFilter::Trigram(filter) => core.database.insert_file(&task.data.hash, &task.data.access, &task.data.index, &filter, density).await.context("insert_file"),
     };
+
+    match result {
+        Ok(()) => { _ = task.response.send(Ok(())); },
+        Err(err) => { _ = task.response.send(Err(err)); },
+    }
     debug!("Ingested {}", hex::encode(&task.data.hash));
 }
 

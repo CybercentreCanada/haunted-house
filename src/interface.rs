@@ -10,9 +10,8 @@ use futures::{StreamExt, SinkExt};
 use log::{error, debug, info};
 use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
-use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse, Response};
+use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse};
 use poem::web::{TypedHeader, Data, Json};
-use poem::http::{StatusCode};
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
@@ -249,6 +248,8 @@ pub struct SearchRequestResponse {
     pub errors: Vec<String>,
     pub suspect_files: u64,
     pub pending_files: u64,
+    pub group_hits: u64,
+    pub group_misses: u64,
     pub filtered_files: u64,
     pub hits: Vec<String>,
     pub truncated: bool,

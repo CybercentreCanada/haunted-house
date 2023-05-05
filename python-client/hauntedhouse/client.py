@@ -32,6 +32,8 @@ class SearchStatus(pydantic.BaseModel):
     suspect_files: int
     pending_files: int
     filtered_files: int
+    group_hits: int
+    group_misses: int
     hits: list[str]
     truncated: bool
 

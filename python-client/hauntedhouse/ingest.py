@@ -89,6 +89,9 @@ async def socket_main(config: Config, verify: bool, count: int) -> None:
                     done = set([f for f in futures if f.done()])
                     futures = futures - done
 
+                if not done:
+                    time.sleep(0.1)
+
                 for future in done:
                     _term, _seq = json.loads(await future)
                     token = (_term, _seq)

@@ -6,11 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::bloom::Filter;
-use crate::core::{CoreConfig};
+use crate::core::CoreConfig;
 // use crate::database_rocksdb::RocksInterface;
 // use crate::database_sqlite::SQLiteInterface;
 use crate::database_generic_sql::SQLInterface;
+use crate::filter::Filter;
 use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
 
 
@@ -163,13 +163,13 @@ impl SearchStage {
 }
 
 pub enum Database {
-    SQLite(SQLInterface),
+    SQL(SQLInterface),
 }
 
 impl Database {
 
     pub async fn new(config: CoreConfig, db_config: crate::config::Database) -> Result<Self> {
-        Ok(Database::SQLite(SQLInterface::new(config, db_config).await?))
+        Ok(Database::SQL(SQLInterface::new(config, db_config).await?))
     }
 
 
@@ -181,13 +181,13 @@ impl Database {
 
     pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {
         match self {
-            Database::SQLite(local) => local.update_file_access(hash, access, index_group).await,
+            Database::SQL(local) => local.update_file_access(hash, access, index_group).await,
         }
     }
 
-    pub async fn insert_file(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &Filter) -> Result<()> {
+    pub async fn insert_file<F: Filter>(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup, filter: &F, target_density: f64) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.insert_file(hash, access, index_group, filter).await,
+            Database::SQL(local) => local.insert_file(hash, access, index_group, filter, target_density).await,
         }
     }
 
@@ -197,99 +197,99 @@ impl Database {
     //     }
     // }
 
-    pub async fn list_filters(&self, kind: &str, goal: usize) -> Result<Vec<Filter>> {
-        match self {
-            Database::SQLite(local) => local.list_filters(kind, goal).await,
-        }
-    }
+    // pub async fn list_filters(&self, kind: &str, goal: usize) -> Result<Vec<BloomFilter>> {
+    //     match self {
+    //         Database::SQLite(local) => local.list_filters(kind, goal).await,
+    //     }
+    // }
 
     pub async fn release_groups(&self, id: IndexGroup) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.release_groups(id).await,
+            Database::SQL(local) => local.release_groups(id).await,
         }
     }
 
     pub async fn initialize_search(&self, req: SearchRequest) -> Result<InternalSearchStatus> {
         match self {
-            Database::SQLite(local) => local.initialize_search(req).await
+            Database::SQL(local) => local.initialize_search(req).await
         }
     }
 
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         match self {
-            Database::SQLite(local) => local.search_status(code).await
+            Database::SQL(local) => local.search_status(code).await
         }
     }
 
     pub async fn get_queued_or_filtering_searches(&self) -> Result<(Vec<String>, Vec<String>)> {
         match self {
-            Database::SQLite(local) => local.get_queued_or_filtering_searches().await
+            Database::SQL(local) => local.get_queued_or_filtering_searches().await
         }
     }
 
     pub async fn set_search_stage(&self, code: &str, stage: SearchStage) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.set_search_stage(code, stage).await
+            Database::SQL(local) => local.set_search_stage(code, stage).await
         }
     }
 
     pub async fn filter_search(&self, code: &str) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.filter_search(code).await
+            Database::SQL(local) => local.filter_search(code).await
         }
     }
 
     pub async fn status(&self) -> Result<IndexStatus> {
         match self {
-            Database::SQLite(local) => local.status().await
+            Database::SQL(local) => local.status().await
         }
     }
 
     pub async fn get_work(&self, req: &WorkRequest) -> Result<WorkPackage> {
         match self {
-            Database::SQLite(local) => local.get_work(req).await
+            Database::SQL(local) => local.get_work(req).await
         }
     }
 
     pub async fn release_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<u64> {
         match self {
-            Database::SQLite(local) => local.release_tasks_assigned_before(time).await
+            Database::SQL(local) => local.release_tasks_assigned_before(time).await
         }
     }
 
     pub async fn release_yara_task(&self, id: i64) -> Result<bool> {
         match self {
-            Database::SQLite(local) => local.release_yara_task(id).await
+            Database::SQL(local) => local.release_yara_task(id).await
         }
     }
 
     pub async fn get_yara_assignments_before(&self, time: chrono::DateTime<chrono::Utc>) -> Result<Vec<(String, i64)>> {
         match self {
-            Database::SQLite(local) => local.get_yara_assignments_before(time).await
+            Database::SQL(local) => local.get_yara_assignments_before(time).await
         }
     }
 
     pub async fn get_work_notification(&self) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.get_work_notification().await
+            Database::SQL(local) => local.get_work_notification().await
         }
     }
 
     pub async fn finish_yara_work(&self, id: i64, search: &String, hashes: Vec<Vec<u8>>) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.finish_yara_work(id, search, hashes).await
+            Database::SQL(local) => local.finish_yara_work(id, search, hashes).await
         }
     }
 
     pub async fn add_work_error(&self, err: WorkError) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.add_work_error(err).await
+            Database::SQL(local) => local.add_work_error(err).await
         }
     }
 
     pub async fn add_search_error(&self, code: &str, error: &str) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.add_search_error(code, error).await
+            Database::SQL(local) => local.add_search_error(code, error).await
         }
     }
 

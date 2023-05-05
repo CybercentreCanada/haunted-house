@@ -2,25 +2,17 @@ use std::ops::BitOr;
 
 use bitvec::vec::BitVec;
 use anyhow::Result;
-use int_enum::IntEnum;
-use itertools::Itertools;
-use rand::{thread_rng, Rng};
 
+use crate::filter::{Filter, LoadFilter};
 use crate::query::Query;
 
 
 pub const START_POWER: u64 = 10;
-pub const END_POWER: u64 = 22;
-
-#[repr(u8)]
-#[derive(Clone, Copy, IntEnum)]
-enum Encoding {
-    FixedLe = 0,
-}
+pub const END_POWER: u64 = 21;
 
 
 #[derive(Clone)]
-pub struct Filter {
+pub struct BloomFilter {
     hits: u32,
     hashes: u32,
     pub data: BitVec<u64>
@@ -58,7 +50,7 @@ fn hash_bytes(a: u8, b: u8, c: u8, hashes: u32) -> Vec<u64> {
 
 pub struct PreparedTrigrams(Vec<Vec<u64>>);
 
-impl Filter {
+impl BloomFilter {
     pub fn empty(size: u64, hits: u32, hashes: u32) -> Self {
         Self {
             hits,
@@ -67,7 +59,7 @@ impl Filter {
         }
     }
 
-    pub fn prepare(hashes: u32, trigrams: &BitVec) -> PreparedTrigrams {
+    pub fn prepare(hashes: u32, trigrams: &BitVec<u64>) -> PreparedTrigrams {
         let mut buffer = vec![];
         for index in trigrams.iter_ones() {
             buffer.push(hash(index as u32, hashes));
@@ -79,7 +71,7 @@ impl Filter {
 
     pub fn build(size: u64, hits: u32, hashes: u32, indices: &PreparedTrigrams) -> Self {
         let mut buffer = Self::empty(size, hits, hashes);
-        for index_set in &indices.0 {
+        for (counter, index_set) in indices.0.iter().enumerate() {
             let mut confirmed_hits = 0;
             let mut misses = vec![];
 
@@ -93,84 +85,13 @@ impl Filter {
             }
 
             while confirmed_hits < hits {
-                let chosen = thread_rng().gen_range(0..misses.len());
+                let chosen = counter % misses.len();
                 let index = misses.swap_remove(chosen);
                 buffer.data.set(index, true);
                 confirmed_hits += 1;
             }
         }
         buffer
-    }
-
-    // pub fn build_from(size: u64, trigrams: &BitVec) -> Self {
-    //     let mut buffer = Self::empty(size);
-    //     for index in trigrams.iter_ones() {
-    //         let index = (seahash::hash(&index.to_le_bytes()) % size) as usize;
-    //         buffer.data.set(index, true);
-    //     }
-    //     buffer
-    // }
-
-    // pub fn load(kind: &str, data: &Vec<u8>) -> Result<Self> {
-    //     let size = Self::parse_kind(kind)?;
-    //     let data: BitVec = postcard::from_bytes(data)?;
-    //     if data.len() != size as usize {
-    //         return Err(anyhow::anyhow!("Data doesn't match kind"))
-    //     }
-    //     Ok(Self{data})
-    // }
-
-    pub fn load(kind: &str, data: &Vec<u8>) -> Result<Self> {
-        let (size, hits, hashes) = Self::parse_kind(kind)?;
-
-        let encoding = Encoding::from_int(data[0])?;
-        let data = &data[1..];
-
-        let data = match encoding {
-            Encoding::FixedLe => {
-                let mut values: Vec<u64> = vec![];
-                for index in (0..data.len()).step_by(8) {
-                    if index + 8 <= data.len() {
-                        let bytes = data[index..index+8].try_into()?;
-                        values.push(u64::from_le_bytes(bytes))
-                    }
-                }
-                let extra_bytes = data.len() % 8;
-                if extra_bytes != 0 {
-                    let mut extra: Vec<u8> = data[(data.len() - extra_bytes)..data.len()].iter().cloned().collect_vec();
-                    while extra.len() < 8 {
-                        extra.push(0);
-                    }
-                    let bytes = extra[0..8].try_into()?;
-                    values.push(u64::from_le_bytes(bytes))
-                }
-
-                BitVec::from_vec(values)
-            },
-        };
-
-        if data.len() as u64 != size {
-            return Err(anyhow::anyhow!("Filter data and type mismatch"))
-        }
-
-        return Ok(Self{hits, hashes, data})
-    }
-
-    pub fn to_buffer(&self) -> Result<Vec<u8>> {
-        self.clone()._to_buffer()
-    }
-
-    pub fn _to_buffer(&mut self) -> Result<Vec<u8>> {
-        self.data.force_align();
-        let mut buffer: Vec<u8> = vec![];
-
-        buffer.push(Encoding::FixedLe.int_value());
-
-        for segment in self.data.as_raw_slice() {
-            buffer.extend(segment.to_le_bytes())
-        }
-
-        return Ok(buffer)
     }
 
     pub fn size(&self) -> u64 {
@@ -182,28 +103,12 @@ impl Filter {
     //     density / (1.0 - density)
     // }
 
-    pub fn full(&self) -> bool {
-        self.data.count_zeros() == 0
-    }
-
-    pub fn count_ones(&self) -> usize {
-        self.data.count_ones()
-    }
-
-    pub fn count_zeros(&self) -> usize {
-        self.data.count_zeros()
-    }
-
     pub fn density(&self) -> f64 {
-        (self.count_ones() as f64) / (self.data.len() as f64)
+        (self.data.count_ones() as f64) / (self.data.len() as f64)
     }
 
     pub fn params(&self) -> (u64, u32, u32) {
         (self.size(), self.hits, self.hashes)
-    }
-
-    pub fn kind(&self) -> String {
-        format!("in:{:0>7}:{}:{}", self.size(), self.hits, self.hashes)
     }
 
     pub fn parse_kind(kind: &str) -> Result<(u64, u32, u32)> {
@@ -216,14 +121,9 @@ impl Filter {
         let hashes = parts[3].parse::<u32>()?;
         return Ok((size, hits, hashes))
     }
+}
 
-    pub fn overlap(&self, other: &Filter) -> Result<Filter> {
-        if self.size() != other.size() {
-            return Err(anyhow::anyhow!("Incompatable filter combination"))
-        }
-        Ok(Filter{hits: self.hits, hashes: self.hashes, data: self.data.clone().bitor(&other.data)})
-    }
-
+impl BloomFilter {
     pub fn query(&self, query: &Query) -> bool {
         match query {
             Query::And(items) => {
@@ -261,14 +161,51 @@ impl Filter {
     }
 }
 
+impl LoadFilter for BloomFilter {
+    fn load(kind: &str, data: &Vec<u8>) -> Result<Self> where Self: Sized {
+        let (size, hits, hashes) = Self::parse_kind(kind)?;
+        let data = crate::encoding::decode(data, size as i64)?;
+        return Ok(Self{hits, hashes, data})
+    }
+}
+
+impl Filter for BloomFilter {
+    fn kind(&self) -> String {
+        format!("in:{:0>7}:{}:{}", self.size(), self.hits, self.hashes)
+    }
+
+    fn data<'a>(&'a self) -> &'a bitvec::vec::BitVec<u64> {
+        &self.data
+    }
+
+    fn overlap(&self, other: &Self) -> Result<Self> where Self: Sized {
+        if self.size() != other.size() {
+            return Err(anyhow::anyhow!("Incompatable filter combination"))
+        }
+        Ok(BloomFilter{hits: self.hits, hashes: self.hashes, data: self.data.clone().bitor(&other.data)})
+    }
+
+    fn merge(items: Vec<&Self>) -> Result<Self> where Self: Sized {
+        let (size, hits, hashes) = match items.first() {
+            Some(item) => item.params(),
+            None => return Err(anyhow::anyhow!("tried to merge empty set")),
+        };
+        let cover = items.iter()
+            .fold(BloomFilter::empty(size, hits, hashes), |a, b|a.overlap(b).unwrap());
+        return Ok(cover)
+    }
+
+}
+
 #[cfg(test)]
 mod test {
     use bitvec::vec::BitVec;
     use rand::{thread_rng, Rng};
 
+    use crate::filter::{Filter, LoadFilter};
     use crate::query::Query;
 
-    use super::{Filter, START_POWER, END_POWER};
+    use super::{BloomFilter, START_POWER, END_POWER};
 
 
     #[test]
@@ -279,13 +216,13 @@ mod test {
             trigrams.push(prng.gen());
         }
 
-        let prepared = Filter::prepare(1, &trigrams);
+        let prepared = BloomFilter::prepare(1, &trigrams);
 
         for power in START_POWER..=END_POWER {
-            let filter = Filter::build(1 << power, 1, 1, &prepared);
+            let filter = BloomFilter::build(1 << power, 1, 1, &prepared);
             let kind = filter.kind();
             let data = filter.to_buffer().unwrap();
-            let unpacked = Filter::load(&kind, &data).unwrap();
+            let unpacked = BloomFilter::load(&kind, &data).unwrap();
             assert_eq!(filter.data, unpacked.data)
         }
     }
@@ -298,17 +235,17 @@ mod test {
             trigrams.push(prng.gen());
         }
 
-        let prepared = Filter::prepare(3, &trigrams);
+        let prepared = BloomFilter::prepare(3, &trigrams);
 
         for power in START_POWER..=END_POWER {
-            let filtera = Filter::build(1 << power, 3, 3, &prepared);
-            let filterb = Filter::build(1 << power, 2, 3, &prepared);
+            let filtera = BloomFilter::build(1 << power, 3, 3, &prepared);
+            let filterb = BloomFilter::build(1 << power, 2, 3, &prepared);
             assert!(filterb.density() <= filtera.density());
 
             for filter in [filtera, filterb] {
                 let kind = filter.kind();
                 let data = filter.to_buffer().unwrap();
-                let unpacked = Filter::load(&kind, &data).unwrap();
+                let unpacked = BloomFilter::load(&kind, &data).unwrap();
                 assert_eq!(filter.data, unpacked.data)
             }
         }
@@ -330,10 +267,10 @@ mod test {
         }
 
         for hashes in [1, 2, 3, 4] {
-            let prepared = Filter::prepare(hashes, &trigrams);
+            let prepared = BloomFilter::prepare(hashes, &trigrams);
             for hits in 1..=hashes {
                 println!("{hits} {hashes}");
-                let filter = Filter::build(1 << 10, hits, hashes, &prepared);
+                let filter = BloomFilter::build(1 << 10, hits, hashes, &prepared);
 
                 for _ in 0..1000 {
                     let index = prng.gen_range(0..(data.len() - 8));
