@@ -1,5 +1,4 @@
 use std::ops::BitOr;
-
 use bitvec::vec::BitVec;
 use anyhow::Result;
 
@@ -38,9 +37,10 @@ fn hash_bytes(a: u8, b: u8, c: u8, hashes: u32) -> Vec<u64> {
             data.pop();
         }
 
-        values.push(seahash::hash(&data));
-        values.sort_unstable();
-        values.dedup();
+        let val = seahash::hash(&data);
+        if !values.contains(&val) {
+            values.push(val);
+        }
 
         counter += 1;
     }
@@ -49,6 +49,7 @@ fn hash_bytes(a: u8, b: u8, c: u8, hashes: u32) -> Vec<u64> {
 
 
 pub struct PreparedTrigrams(Vec<Vec<u64>>);
+
 
 impl BloomFilter {
     pub fn empty(size: u64, hits: u32, hashes: u32) -> Self {
@@ -64,31 +65,37 @@ impl BloomFilter {
         for index in trigrams.iter_ones() {
             buffer.push(hash(index as u32, hashes));
         }
-        buffer.sort_unstable();
-        buffer.dedup();
         PreparedTrigrams(buffer)
     }
 
     pub fn build(size: u64, hits: u32, hashes: u32, indices: &PreparedTrigrams) -> Self {
         let mut buffer = Self::empty(size, hits, hashes);
         for (counter, index_set) in indices.0.iter().enumerate() {
-            let mut confirmed_hits = 0;
-            let mut misses = vec![];
-
-            for index in index_set {
-                let index = (*index % size) as usize;
-                if *buffer.data.get(index).unwrap() {
-                    confirmed_hits += 1;
-                } else {
-                    misses.push(index);
+            let index_set = &index_set[0..hashes as usize];
+            if hits == hashes {
+                for index in index_set {
+                    let index = (*index % size) as usize;
+                    buffer.data.set(index, true);
                 }
-            }
+            } else {
+                let mut confirmed_hits = 0;
+                let mut misses = vec![];
 
-            while confirmed_hits < hits {
-                let chosen = counter % misses.len();
-                let index = misses.swap_remove(chosen);
-                buffer.data.set(index, true);
-                confirmed_hits += 1;
+                for index in index_set {
+                    let index = (*index % size) as usize;
+                    if *buffer.data.get(index).unwrap() {
+                        confirmed_hits += 1;
+                    } else {
+                        misses.push(index);
+                    }
+                }
+
+                while confirmed_hits < hits {
+                    let chosen = counter % misses.len();
+                    let index = misses.swap_remove(chosen);
+                    buffer.data.set(index, true);
+                    confirmed_hits += 1;
+                }
             }
         }
         buffer
@@ -252,6 +259,39 @@ mod test {
     }
 
     #[test]
+    fn hash_matching() {
+        let mut prng = thread_rng();
+        let mut data: Vec<u8> = vec![];
+        while data.len() < (1 << 12) {
+            data.push(prng.gen());
+        }
+
+        let mut trigrams = BitVec::repeat(false, 1 << 24);
+        let mut trigram: u32 = (data[0] as u32) << 8 | (data[1] as u32);
+        for byte in &data[2..] {
+            trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+            trigrams.set(trigram as usize, true);
+        }
+
+        let prepared = vec![
+            BloomFilter::prepare(1, &trigrams),
+            BloomFilter::prepare(2, &trigrams),
+            BloomFilter::prepare(3, &trigrams),
+            BloomFilter::prepare(4, &trigrams)
+        ];
+        let reference = BloomFilter::prepare(5, &trigrams);
+        for (index, hashset) in reference.0.iter().enumerate() {
+            for (hash_index, value) in hashset.iter().enumerate() {
+                for other in prepared.iter() {
+                    if let Some(other_value) = other.0[index].get(hash_index) {
+                        assert_eq!(value, other_value)
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn query() {
         let mut prng = thread_rng();
         let mut data: Vec<u8> = vec![];
@@ -266,8 +306,8 @@ mod test {
             trigrams.set(trigram as usize, true);
         }
 
+        let prepared = BloomFilter::prepare(4, &trigrams);
         for hashes in [1, 2, 3, 4] {
-            let prepared = BloomFilter::prepare(hashes, &trigrams);
             for hits in 1..=hashes {
                 println!("{hits} {hashes}");
                 let filter = BloomFilter::build(1 << 10, hits, hashes, &prepared);

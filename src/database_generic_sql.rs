@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet, HashMap, BTreeMap};
-use std::io::Write;
+use std::collections::{BTreeSet, HashSet, HashMap};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
@@ -14,13 +13,11 @@ use sqlx::{query_as, Acquire};
 use tempfile::TempDir;
 
 use crate::access::AccessControl;
-use crate::bloom::BloomFilter;
 use crate::core::{CoreConfig};
 use crate::database::{IndexGroup, SearchStage, IndexStatus};
 use crate::db_imp_mysql::MySQLImp;
 use crate::db_imp_sqlite::SqliteImp;
 use crate::filter::{Filter, LoadFilter, GenericFilter};
-use crate::insert_cursor::InsertCursor;
 use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, YaraTask, WorkError};
 use crate::query::Query;
 
@@ -412,40 +409,53 @@ impl SQLInterface {
         Ok(output)
     }
 
-    fn _pick_best<F: Filter>(target: &F, options: &Vec<&F>) -> Result<usize> {
-        let mut best = 0;
-        let mut best_score = 0;
-        for (index, other) in options.iter().enumerate() {
-            let score = target.overlap(other)?.count_zeros();
-            if score > best_score {
-                best = index;
-                best_score = score;
-            }
-        }
-        Ok(best)
-    }
-
     async fn _find_insert_group<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &F) -> Result<Vec<(i64, bool, F)>> {
-        let mut group_stack: Vec<(i64, bool, F)> = vec![{
-            // Get the root groups
-            let mut roots = self._find_roots(&mut *conn, index_group, filter).await.context("_find_roots")?;
-            assert!(!roots.is_empty());
+        // Get roots
+        let roots = self._find_roots(&mut *conn, index_group, filter).await.context("_find_roots")?;
+        let margin = filter.data().len()/20;
 
-            // Select the best of the root groups
-            let index = Self::_pick_best(filter, &roots.iter().map(|r|&r.2).collect())?;
-            roots.swap_remove(index)
-        }];
-
-        while !group_stack.last().unwrap().1 {
-            // Get the subgroups of this group
-            let mut subgroups = self._load_groups_in_group(&mut *conn, index_group, group_stack.last().unwrap().0).await?;
-            assert!(!subgroups.is_empty());
-
-            // select the best of the subgroups
-            let index = Self::_pick_best(filter, &subgroups.iter().map(|r|&r.2).collect())?;
-            group_stack.push(subgroups.swap_remove(index));
+        // sort the roots
+        let mut active = vec![];
+        for node in roots {
+            let (before, after) = node.2.overlap_count_ones(&filter)?;
+            let increase = after - before;
+            active.push(((increase, after), vec![node]));
         }
-        return Ok(group_stack)
+        active.sort_unstable_by_key(|(a, _)|a.clone());
+
+        let stack = loop {
+            // break out if we are finished
+            if active[0].1.last().unwrap().1 {
+                break active.swap_remove(0).1;
+            }
+
+            // prune bad options
+            let top = active[0].0.0;
+            while active.last().unwrap().0.0 > top + margin {
+                active.pop();
+            }
+
+            // expand groups
+            let mut expanded = vec![];
+            while let Some((_, stack)) = active.pop() {
+                let subgroups = self._load_groups_in_group(&mut *conn, index_group, stack.last().unwrap().0).await?;
+                for tail in subgroups {
+                    let mut stack = stack.clone();
+                    stack.push(tail);
+                    expanded.push(stack);
+                }
+            }
+
+            // update active
+            for stack in expanded {
+                let (before, after) = stack.last().unwrap().2.overlap_count_ones(&filter)?;
+                let increase = after - before;
+                active.push(((increase, after), stack));
+            }
+            active.sort_unstable_by_key(|(a, _)|a.clone());
+        };
+
+        return Ok(stack)
     }
 
     async fn _expand_filters<F: Filter>(&self, conn: &mut PoolCon, index_group: &IndexGroup, filter: &F, stack: &Vec<(i64, bool, F)>) -> Result<bool> {
@@ -1189,116 +1199,117 @@ impl SQLInterface {
     }
 
     pub async fn test_shallow_group(&self, query: Query) -> Result<()> {
-        let mut conn = self.db.acquire().await?;
-        let mut indices = self.list_indices().await?;
-        indices.sort_unstable();
-        indices.truncate(12);
+        todo!();
+        // let mut conn = self.db.acquire().await?;
+        // let mut indices = self.list_indices().await?;
+        // indices.sort_unstable();
+        // indices.truncate(12);
 
-        // let group_id_counter: i64 = 0;
-        let mut grouping: Vec<(String, GenericFilter, u64)> = Default::default();
-        let status = self.status().await?;
+        // // let group_id_counter: i64 = 0;
+        // let mut grouping: Vec<(String, GenericFilter, u64)> = Default::default();
+        // let status = self.status().await?;
 
-        for index_group in indices {
-            println!("Group: {} {}", index_group, status.group_files.get(index_group.as_str()).unwrap_or(&0));
+        // for index_group in indices {
+        //     println!("Group: {} {}", index_group, status.group_files.get(index_group.as_str()).unwrap_or(&0));
 
-            // Load the base filters for this index
-            let mut outstanding_groups = self._find_all_roots::<GenericFilter>(&mut *conn, &index_group).await?;
+        //     // Load the base filters for this index
+        //     let mut outstanding_groups = self._find_all_roots::<GenericFilter>(&mut *conn, &index_group).await?;
 
-            let mut active: BTreeMap<String, Vec<InsertCursor>> = Default::default();
+        //     let mut active: BTreeMap<String, Vec<InsertCursor>> = Default::default();
 
-            // Apply filters recursively until we only have file entries left
-            while let Some((group_id, leaves, filter)) = outstanding_groups.pop() {
-                let key = filter.kind();
+        //     // Apply filters recursively until we only have file entries left
+        //     while let Some((group_id, leaves, filter)) = outstanding_groups.pop() {
+        //         let key = filter.kind();
 
-                let group_target: f64 = if key.starts_with("in") && key.ends_with(":1:1") {
-                    0.01
-                } else if key.starts_with("in") && key.ends_with(":2:3") {
-                    0.05
-                } else if key.starts_with("in") && key.ends_with(":3:5") {
-                    0.10
-                } else if key.starts_with("tri") {
-                    0.10
-                } else {
-                    todo!();
-                };
-                let group_target = 1.0-(1.0-group_target).powi(6);
+        //         let group_target: f64 = if key.starts_with("in") && key.ends_with(":1:1") {
+        //             0.01
+        //         } else if key.starts_with("in") && key.ends_with(":2:3") {
+        //             0.05
+        //         } else if key.starts_with("in") && key.ends_with(":3:5") {
+        //             0.10
+        //         } else if key.starts_with("tri") {
+        //             0.10
+        //         } else {
+        //             todo!();
+        //         };
+        //         let group_target = 1.0-(1.0-group_target).powi(6);
 
-                if leaves {
-                    for (_hash, _access, filter) in self._load_files_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await? {
-                        match active.entry(key.clone()) {
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                entry.insert(vec![InsertCursor::new(filter, group_target)]);
-                            },
-                            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                                entry.get_mut().push(InsertCursor::new(filter, group_target));
-                            },
-                        }
-                    }
-                } else {
-                    outstanding_groups.extend(self._load_groups_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await?);
-                }
-            }
+        //         if leaves {
+        //             for (_hash, _access, filter) in self._load_files_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await? {
+        //                 match active.entry(key.clone()) {
+        //                     std::collections::btree_map::Entry::Vacant(entry) => {
+        //                         entry.insert(vec![InsertCursor::new(filter, group_target)]);
+        //                     },
+        //                     std::collections::btree_map::Entry::Occupied(mut entry) => {
+        //                         entry.get_mut().push(InsertCursor::new(filter, group_target));
+        //                     },
+        //                 }
+        //             }
+        //         } else {
+        //             outstanding_groups.extend(self._load_groups_in_group::<_, GenericFilter>(&mut *conn, &index_group, group_id).await?);
+        //         }
+        //     }
 
-            println!("Loaded, starting grouping");
-            let mut batches: Vec<(String, Vec<InsertCursor>)> = vec![];
-            for (kind, items) in active {
-                for b in &items.into_iter().chunks(100) {
-                    batches.push((kind.clone(), b.collect_vec()));
-                }
-            }
+        //     println!("Loaded, starting grouping");
+        //     let mut batches: Vec<(String, Vec<InsertCursor>)> = vec![];
+        //     for (kind, items) in active {
+        //         for b in &items.into_iter().chunks(100) {
+        //             batches.push((kind.clone(), b.collect_vec()));
+        //         }
+        //     }
 
-            while let Some((kind, mut active)) = batches.pop() {
-                let mut ready_items: HashSet<usize> = Default::default();
-                for (id, (group_kind, filter, _count)) in grouping.iter().enumerate() {
-                    if kind != *group_kind { continue; }
-                    for (index, item) in active.iter_mut().enumerate() {
-                        if ready_items.contains(&index) { continue }
-                        if item.add(id as i64, filter) {
-                            ready_items.insert(index);
-                        }
-                    }
-                }
-                let mut ready_items = ready_items.into_iter().collect_vec();
-                ready_items.sort_unstable();
-                while let Some(index) = ready_items.pop() {
-                    let mut item = active.swap_remove(index);
-                    let (group_id, _, _) = item.next().unwrap();
-                    grouping[group_id as usize].2 += 1;
-                }
+        //     while let Some((kind, mut active)) = batches.pop() {
+        //         let mut ready_items: HashSet<usize> = Default::default();
+        //         for (id, (group_kind, filter, _count)) in grouping.iter().enumerate() {
+        //             if kind != *group_kind { continue; }
+        //             for (index, item) in active.iter_mut().enumerate() {
+        //                 if ready_items.contains(&index) { continue }
+        //                 if item.add(id as i64, filter) {
+        //                     ready_items.insert(index);
+        //                 }
+        //             }
+        //         }
+        //         let mut ready_items = ready_items.into_iter().collect_vec();
+        //         ready_items.sort_unstable();
+        //         while let Some(index) = ready_items.pop() {
+        //             let mut item = active.swap_remove(index);
+        //             let (group_id, _, _) = item.next().unwrap();
+        //             grouping[group_id as usize].2 += 1;
+        //         }
 
-                println!("{} {} {}", index_group, grouping.len(), batches.len());
-                while let Some(mut item) = active.pop() {
-                    match item.next() {
-                        Some((id, original, changed)) => {
-                            if original != grouping[id as usize].1.count_ones() {
-                                item.add(id, &grouping[id as usize].1);
-                                active.push(item);
-                                continue;
-                            } else {
-                                grouping[id as usize].2 += 1;
-                                if changed != 0 {
-                                    grouping[id as usize].1 = grouping[id as usize].1.overlap(&item.filter);
-                                }
-                            }
-                        },
-                        None => {
-                            let index = grouping.len() as i64;
-                            for other in active.iter_mut() {
-                                other.add(index, &item.filter);
-                            }
-                            grouping.push((kind.clone(), item.filter, 1));
-                        },
-                    }
-                }
-            }
-        }
+        //         println!("{} {} {}", index_group, grouping.len(), batches.len());
+        //         while let Some(mut item) = active.pop() {
+        //             match item.next() {
+        //                 Some((id, original, changed)) => {
+        //                     if original != grouping[id as usize].1.count_ones() {
+        //                         item.add(id, &grouping[id as usize].1);
+        //                         active.push(item);
+        //                         continue;
+        //                     } else {
+        //                         grouping[id as usize].2 += 1;
+        //                         if changed != 0 {
+        //                             grouping[id as usize].1 = grouping[id as usize].1.overlap(&item.filter);
+        //                         }
+        //                     }
+        //                 },
+        //                 None => {
+        //                     let index = grouping.len() as i64;
+        //                     for other in active.iter_mut() {
+        //                         other.add(index, &item.filter);
+        //                     }
+        //                     grouping.push((kind.clone(), item.filter, 1));
+        //                 },
+        //             }
+        //         }
+        //     }
+        // }
 
-        let mut output = std::fs::OpenOptions::new().write(true).create(true).open("./groups2.csv")?;
+        // let mut output = std::fs::OpenOptions::new().write(true).create(true).open("./groups2.csv")?;
 
-        for (kind, filter, items) in grouping {
-            output.write_fmt(format_args!("{kind}, {}, {items}, {}\n", filter.density(), filter.query(&query)))?;
-        }
-        output.flush()?;
+        // for (kind, filter, items) in grouping {
+        //     output.write_fmt(format_args!("{kind}, {}, {items}, {}\n", filter.density(), filter.query(&query)))?;
+        // }
+        // output.flush()?;
 
         return Ok(())
     }

@@ -76,6 +76,8 @@ pub struct CoreConfig {
 }
 
 fn default_filter_config() -> Vec<FilterConfig> { vec![
+    FilterConfig{hits: 3,  hashes: 3, density: 0.01},
+    FilterConfig{hits: 2,  hashes: 2, density: 0.01},
     FilterConfig{hits: 1,  hashes: 1, density: 0.01},
     FilterConfig{hits: 2,  hashes: 3, density: 0.05},
     FilterConfig{hits: 3,  hashes: 5, density: 0.10},
@@ -373,14 +375,18 @@ async fn _run_ingest_build_filter(core: Arc<HouseCore>, task: IngestData) -> Res
         }
     }
 
-
-
+    // Figure out how many hashes are going to be needed worst case.
+    let mut max_hashes = 1;
     for filter_config in &core.config.filter_config {
-        let prepared_indices = BloomFilter::prepare(filter_config.hashes, &trigrams);
-        // Try filter configurations until we find one that matches
+        max_hashes = max_hashes.max(filter_config.hashes);
+    }
+    let prepared_indices = BloomFilter::prepare(max_hashes, &trigrams);
+
+    // Try filter configurations until we find one that matches
+    for filter_config in &core.config.filter_config {
         for power in bloom::START_POWER..=bloom::END_POWER {
             let size = 1 << power;
-            debug!("Attempting {size} {}", hex::encode(&hash));
+            debug!("Attempting {} {} {size} {}", filter_config.hits, filter_config.hashes, hex::encode(&hash));
             let filter = BloomFilter::build(size, filter_config.hits, filter_config.hashes, &prepared_indices);
             if filter.density() <= filter_config.density {
                 return Ok(Some((GenericFilter::Bloom(filter), filter_config.density)));
