@@ -77,6 +77,7 @@ async def socket_main(config: Config, verify: bool, count: int) -> None:
             assert house_client.access_engine.enforce
 
         logger.info("Starting loop")
+        assignment = {}
 
         while True:
             await asyncio.sleep(0)
@@ -93,7 +94,19 @@ async def socket_main(config: Config, verify: bool, count: int) -> None:
                     time.sleep(0.1)
 
                 for future in done:
-                    _term, _seq = json.loads(await future)
+                    args = assignment.pop(future)
+                    try:
+                        _term, _seq = json.loads(await future)
+                    except Exception:
+                        try:
+                            print("Retrying...")
+                            future = await house_client.ingest(args[0], args[1], args[2], token=args[3])
+                            assignment[future] = args
+                            futures.add(future)
+                        except DuplicateToken:
+                            pass
+                        continue
+
                     token = (_term, _seq)
                     current_sequence_numbers.remove(token)
                     waiting_sequence_numbers.append(token)
@@ -142,6 +155,7 @@ async def socket_main(config: Config, verify: bool, count: int) -> None:
                     try:
                         future = await house_client.ingest(item['sha256'], item['classification'],
                                                            item.get('expiry_ts', None), token=token_str)
+                        assignment[future] = (item['sha256'], item['classification'], item.get('expiry_ts', None), token_str)
                         futures.add(future)
                     except DuplicateToken:
                         pass
