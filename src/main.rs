@@ -270,8 +270,8 @@ async fn main() -> Result<()> {
             // Print a sample density slice
             if let Database::SQL(db) = db {
                 // db.traverse_sample().await?;
-                // db.simulate_filter(test_query).await?;
-                db.test_shallow_group(test_query).await?;
+                db.simulate_filter(&test_query).await?;
+                // db.test_shallow_group(test_query).await?;
             }
         }
     }
