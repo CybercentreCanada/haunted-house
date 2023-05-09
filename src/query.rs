@@ -12,6 +12,7 @@ pub enum Query {
     And(Vec<Query>),
     Or(Vec<Query>),
     Literal(Vec<u8>),
+    MinOf(i32, Vec<Query>)
 }
 
 impl FromStr for Query {
@@ -29,6 +30,7 @@ impl Display for Query {
             Query::And(sub) => format!("({})", sub.iter().join(" & ")),
             Query::Or(sub) => format!("({})", sub.iter().join(" | ")),
             Query::Literal(bytes) => format!("{{{}}}", hex::encode(bytes)),
+            Query::MinOf(num, expr) => format!("(min {num} of ({}))", expr.iter().map(|x|x.to_string()).join(","))
         })
     }
 }
@@ -36,10 +38,10 @@ impl Display for Query {
 mod parse_ursa {
     use nom::branch::alt;
     use nom::bytes::complete::{tag, is_not, is_a};
-    use nom::character::complete::multispace0;
-    use nom::combinator::opt;
+    use nom::character::complete::{multispace0, multispace1, digit1};
+    use nom::combinator::{opt, map_res};
     use nom::error::ParseError;
-    use nom::multi::{many1};
+    use nom::multi::{many1, separated_list1};
     use nom::sequence::{delimited, tuple, preceded};
     use nom::{IResult};
     use super::Query;
@@ -47,10 +49,10 @@ mod parse_ursa {
     pub fn query(input: &str) -> anyhow::Result<Query> {
         let (remain, query) = match parse_query(input) {
             Ok(result) => result,
-            Err(err) => return Err(anyhow::anyhow!("Could not parse access string: {err}")),
+            Err(err) => return Err(anyhow::anyhow!("Could not parse query string: {err}")),
         };
         if !remain.is_empty() {
-            return Err(anyhow::anyhow!("Could not parse access string trailing data: {remain}"))
+            return Err(anyhow::anyhow!("Could not parse query string trailing data: {remain}"))
         }
         return Ok(query)
     }
@@ -72,7 +74,7 @@ mod parse_ursa {
     }
 
     fn parse_brackets(input: &str) -> IResult<&str, Query> {
-        let (remain, query) = delimited(ws(tag("(")), parse_query, ws(tag(")")))(input)?;
+        let (remain, query) = delimited(ws(tag("(")), alt((parse_of, parse_query)), ws(tag(")")))(input)?;
         return Ok((remain, query))
     }
 
@@ -80,6 +82,11 @@ mod parse_ursa {
     //     let (remain, query) = delimited(pair(ws(tag_no_case("not")), ws(tag("("))), parse_query, ws(tag(")")))(input)?;
     //     return Ok((remain, Query::Not(Box::new(query))))
     // }
+
+    fn parse_of(input: &str) -> IResult<&str, Query> {
+        let (remain, (_, _, _, num, _, _, items, _)) = tuple((multispace0, tag("min"), multispace1, map_res(digit1, |s: &str| s.parse::<i32>()), ws(tag("of")), ws(tag("(")), separated_list1(ws(tag(",")), parse_atom), ws(tag(")"))))(input)?;
+        return Ok((remain, Query::MinOf(num, items)))
+    }
 
     fn parse_hex(input: &str) -> IResult<&str, Query> {
         let (remain, value) = delimited(tag("{"), many1(is_a("0123456789abcdefABCDEF")), tag("}"))(input)?;
@@ -101,6 +108,8 @@ mod parse_ursa {
 
     fn parse_sequence<'a>(input: &'a str) -> IResult<&'a str, Query> {
         let (remain, (query, ops)) = tuple((parse_atom, opt(alt((and_tail, or_tail)))))(input)?;
+
+        // This should only match on operations that are written as suffixes
         let query = match ops {
             Some(parts) => match parts {
                 // Query::Not(_) => panic!(),
@@ -113,6 +122,7 @@ mod parse_ursa {
                     Query::Or(parts)
                 },
                 Query::Literal(_) => panic!(),
+                Query::MinOf(_, _) => panic!(),
             },
             None => query,
         };
@@ -155,6 +165,12 @@ mod test {
             ]),
             Query::Literal(b"hmm".to_vec()),
         ]));
+    }
+
+    #[test]
+    fn parse_of() {
+        assert_eq!(Query::from_str("(min 1 of ({737472696e67}))").unwrap(), Query::MinOf(1, vec![Query::Literal(vec![0x73, 0x74, 0x72, 0x69, 0x6e, 0x67])]));
+        assert_eq!(Query::from_str("(min 1 of ({73747269}, {6e67}))").unwrap(), Query::MinOf(1, vec![Query::Literal(vec![0x73, 0x74, 0x72, 0x69]), Query::Literal(vec![0x6e, 0x67])]));
     }
 
     #[test]
