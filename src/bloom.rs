@@ -149,6 +149,18 @@ impl BloomFilter {
                 }
                 return false
             },
+            Query::MinOf(target, queries) => {
+                let mut count = 0;
+                for query in queries {
+                    if self.query(query) {
+                        count += 1;
+                    }
+                    if count >= *target {
+                        return true
+                    }
+                }
+                return count >= *target;
+            },
             Query::Literal(term) => {
                 let size = self.data.len() as u64;
                 for trigram in term.windows(3) {

@@ -34,6 +34,18 @@ impl TrigramFilter {
                 }
                 return false
             },
+            Query::MinOf(target, queries) => {
+                let mut count = 0;
+                for query in queries {
+                    if self.query(query) {
+                        count += 1;
+                    }
+                    if count >= *target {
+                        return true
+                    }
+                }
+                return count >= *target;
+            },
             Query::Literal(term) => {
                 for trigram in term.windows(3) {
                     let index = (trigram[0] as u32) << 16 | (trigram[1] as u32) << 8 | (trigram[2] as u32);
