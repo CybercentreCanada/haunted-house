@@ -12,7 +12,7 @@ from assemblyline.common.classification import Classification
 from mquery_query_lib import yaraparse
 
 
-logger = logging.getLogger('hauntedhouse.clinte')
+logger = logging.getLogger('hauntedhouse.client')
 FALSE_LEVELS = ['NULL', 'INV']
 
 
