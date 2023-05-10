@@ -6,12 +6,13 @@ import uuid
 import arrow
 import aiohttp
 import requests
+import json
 import pydantic
 from assemblyline.common.classification import Classification
 from mquery_query_lib import yaraparse
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('hauntedhouse.client')
 FALSE_LEVELS = ['NULL', 'INV']
 
 
@@ -69,6 +70,7 @@ class Client:
                            archive_only=False) -> SearchStatus:
         # Parse the access string into a set of key words
         access_fields = self.prepare_access(access_control)
+        search_view = self.prepare_classification(access_control)
 
         # If we only want archived material set the start date to the far future
         start_date = None
@@ -77,6 +79,7 @@ class Client:
 
         # Send the search request
         result = await self.session.post('/search/', json={
+            'view': search_view,
             'access': access_fields,
             'query': query_from_yara(yara_rule),
             'group': group,
@@ -221,30 +224,34 @@ class Client:
     async def _get_ingest_socket(self) -> aiohttp.ClientWebSocketResponse:
         async with self.ingest_connection_lock:
             if self.ingest_connection is None:
-                self.ingest_connection = await self.session.ws_connect("/ingest/stream/")
+                self.ingest_connection = await self.session.ws_connect("/ingest/stream/", protocols=['ingest-stream'])
                 self.ingest_task = asyncio.create_task(self._socket_listener(self.ingest_connection))
             return self.ingest_connection
 
     async def _socket_listener(self, ws: aiohttp.ClientWebSocketResponse):
         while not ws.closed:
-            message = await ws.receive_json()
-            # Figure out any token with the message
-            token = message.get('token', None)
-            if token is None:
-                logger.error(f"Unknown message from ingest feed: {message}")
-                continue
+            try:
+                message = await ws.receive_json()
+                # Figure out any token with the message
+                token = message.get('token', None)
+                if token is None:
+                    logger.error(f"Unknown message from ingest feed: {message}")
+                    continue
 
-            # Find the future associated with the token
-            future = self.ingest_futures.pop(token, None)
-            if future is None:
-                logger.error(f"Unexpected message from ingest feed: {message}")
-                continue
+                # Find the future associated with the token
+                future = self.ingest_futures.pop(token, None)
+                if future is None:
+                    logger.error(f"Unexpected message from ingest feed: {message}")
+                    continue
 
-            # Satisfy the future
-            if message.get('success'):
-                future.set_result(message.get("token", ""))
-            else:
-                future.set_exception(IngestError(message.get('error', '')))
+                # Satisfy the future
+                if message.get('success'):
+                    future.set_result(message.get("token", ""))
+                else:
+                    future.set_exception(IngestError(message.get('error', '')))
+            except Exception:
+                logger.exception("Error in receiveed message")
+        self.ingest_connection = None
 
 
 def query_from_yara(yara_rule: str) -> str:

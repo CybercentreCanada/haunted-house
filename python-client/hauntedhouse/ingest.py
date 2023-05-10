@@ -12,7 +12,7 @@ import pydantic
 from .client import Client, DuplicateToken
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('hauntedhouse.ingest')
 FL = 'classification,sha256,expiry_ts,_seq_no,_primary_term'
 
 
@@ -50,6 +50,11 @@ async def socket_main(config: Config, verify: bool) -> None:
     classification_definition = al_client._connection.get('api/v4/help/classification_definition')
 
     try:
+        os.makedirs(config.write_path)
+    except FileExistsError:
+        pass
+
+    try:
         with open(os.path.join(config.write_path, "state.json"), 'r') as handle:
             data = json.load(handle)
             completed_seq_no = data['completed']
@@ -72,8 +77,10 @@ async def socket_main(config: Config, verify: bool) -> None:
             assert house_client.access_engine.enforce
 
         logger.info("Starting loop")
+        assignment = {}
 
         while True:
+            await asyncio.sleep(0)
 
             # Process any completed ingestion, moving the cursor for completed sequence numbers ahead
             if futures:
@@ -83,8 +90,23 @@ async def socket_main(config: Config, verify: bool) -> None:
                     done = set([f for f in futures if f.done()])
                     futures = futures - done
 
+                if not done:
+                    time.sleep(0.1)
+
                 for future in done:
-                    _term, _seq = json.loads(await future)
+                    args = assignment.pop(future)
+                    try:
+                        _term, _seq = json.loads(await future)
+                    except Exception:
+                        try:
+                            print("Retrying...")
+                            future = await house_client.ingest(args[0], args[1], args[2], token=args[3])
+                            assignment[future] = args
+                            futures.add(future)
+                        except DuplicateToken:
+                            pass
+                        continue
+
                     token = (_term, _seq)
                     current_sequence_numbers.remove(token)
                     waiting_sequence_numbers.append(token)
@@ -133,6 +155,7 @@ async def socket_main(config: Config, verify: bool) -> None:
                     try:
                         future = await house_client.ingest(item['sha256'], item['classification'],
                                                            item.get('expiry_ts', None), token=token_str)
+                        assignment[future] = (item['sha256'], item['classification'], item.get('expiry_ts', None), token_str)
                         futures.add(future)
                     except DuplicateToken:
                         pass
@@ -161,6 +184,7 @@ if __name__ == '__main__':
     else:
         config = Config(**get_env_data_as_dict(args.config))
 
+    logger = logging.getLogger('hauntedhouse')
     logger.setLevel(logging.INFO)
     logger.addHandler(logging.StreamHandler(sys.stdout))
 
