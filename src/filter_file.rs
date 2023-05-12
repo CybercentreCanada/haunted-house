@@ -5,7 +5,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Serialize, Deserialize};
 // use tracing::instrument;
 use std::fs::File;
-use std::io::{Write, Seek, SeekFrom, Read};
+use std::io::{Write, Seek, SeekFrom, Read, BufRead};
 use std::path::{Path, PathBuf};
 
 use crate::encoding::{encode, cost_to_add};
@@ -45,8 +45,8 @@ enum SegmentAddress {
 }
 
 #[derive(Serialize, Deserialize)]
-enum UpdateOperations {
-    WriteSegment{segment: SegmentAddress, data: Vec<u8>},
+enum UpdateOperations<'a> {
+    WriteSegment{segment: SegmentAddress, data: &'a[u8]},
     ExtendSegment{segment: SegmentAddress, new_segment: u32},
 }
 
@@ -205,17 +205,24 @@ impl ExtensibleTrigramFile {
         let mut writer = std::io::BufWriter::new(write_buffer);
         writer.write_u64::<LittleEndian>(0)?;
 
+        // Timing information
         let start = std::time::Instant::now();
         let mut invert_time: f64 = 0.0;
         let mut build_ops_time: f64 = 0.0;
         let mut op_write_time: f64 = 0.0;
         let mut seg_read_time: f64 = 0.0;
 
+        // Buffers reused in this loop
+        let mut file_ids = vec![];
+        let mut extend_data_buffer = vec![0u8; 128];
+        let mut write_data_buffer = vec![];
+
+        // track how many segments are added in this batch
         let mut added_segments = 0u32;
         for trigram in 0u32..TRIGRAM_RANGE as u32 {
             let stamp = std::time::Instant::now();
             // Invert batch into REVERSED index lists
-            let mut file_ids = vec![];
+            file_ids.clear();
             for (id, grams) in files.iter() {
                 if *grams.get(trigram as usize).unwrap() {
                     file_ids.push(*id);
@@ -261,7 +268,9 @@ impl ExtensibleTrigramFile {
             // if we changed the content of that segment add the write op
             if changed {
                 let stamp = std::time::Instant::now();
-                writer.write_all(&postcard::to_allocvec_cobs(&UpdateOperations::WriteSegment { segment: address, data: encode(&content) })?)?;
+                let data = encode(&content);
+                write_data_buffer.resize(data.len() + 128, 0);
+                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &data }, &mut write_data_buffer)?)?;
                 op_write_time += stamp.elapsed().as_secs_f64();
             }
 
@@ -288,8 +297,10 @@ impl ExtensibleTrigramFile {
 
                 let new_address = SegmentAddress::Segment(new_segment);
                 let stamp = std::time::Instant::now();
-                writer.write_all(&postcard::to_allocvec_cobs(&UpdateOperations::ExtendSegment { segment: address, new_segment })?)?;
-                writer.write_all(&postcard::to_allocvec_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: encode(&content) })?)?;
+                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { segment: address, new_segment }, &mut extend_data_buffer)?)?;
+                let data = encode(&content);
+                write_data_buffer.resize(data.len() + 128, 0);
+                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: &data }, &mut write_data_buffer)?)?;
                 op_write_time += stamp.elapsed().as_secs_f64();
                 address = new_address;
             }
@@ -358,16 +369,19 @@ impl ExtensibleTrigramFile {
         let mut reader = std::io::BufReader::new(source);
         let offset = reader.read_u64::<LittleEndian>().context("reading change offset value")?;
         let mut bytes_read = 8;
+        let mut buffer = vec![];
         while bytes_read < offset {
-            let mut buffer = vec![];
-            loop {
-                let byte = reader.read_u8().context("reading single byte")?;
-                bytes_read += 1;
-                if byte == 0 || bytes_read >= offset {
-                    break;
-                }
-                buffer.push(byte);
-            }
+            // let mut buffer = vec![];
+            buffer.clear();
+            bytes_read += reader.read_until(0, &mut buffer)? as u64;
+            // loop {
+            //     let byte = reader.read_u8().context("reading single byte")?;
+            //     bytes_read += 1;
+            //     if byte == 0 || bytes_read >= offset {
+            //         break;
+            //     }
+            //     buffer.push(byte);
+            // }
             if !buffer.is_empty() {
                 let operation: UpdateOperations = postcard::from_bytes_cobs(&mut buffer).context("parsing operation")?;
                 self.apply_operation(operation).context("applying operation")?;
@@ -419,56 +433,6 @@ mod test {
     use crate::filter_file::ExtensibleTrigramFile;
 
     use super::TRIGRAM_RANGE;
-
-    // use tracing_flame::FlameLayer;
-    // use tracing_subscriber::{prelude::*, fmt};
-
-    // fn setup_global_subscriber() -> impl Drop {
-    //     let fmt_layer = fmt::Layer::default();
-
-    //     let (flame_layer, _guard) = FlameLayer::with_file("./tracing.folded").unwrap();
-
-    //     tracing_subscriber::registry()
-    //         .with(fmt_layer)
-    //         .with(flame_layer)
-    //         .init();
-    //     _guard
-    // }
-
-    // #[test]
-    // fn memmap() -> Result<()> {
-    //     // build test data
-    //     let mut trigrams = vec![];
-    //     for ii in 1..102 {
-    //         let mut data = BitVec::repeat(false, TRIGRAM_RANGE as usize);
-    //         data.set(500, true);
-    //         if ii < 50 {
-    //             data.set(0, true);
-    //         } else {
-    //             data.set(TRIGRAM_RANGE as usize - 1, true);
-    //         }
-    //         trigrams.push((ii, data));
-    //     }
-
-
-    //     // write it
-    //     let tempdir = tempfile::tempdir()?;
-    //     let location = tempdir.path().join("test");
-    //     {
-    //         let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
-    //         file.write_batch(&mut trigrams).context("write batch")?;
-    //         assert_eq!(file.extended_segments, 0)
-    //     }
-
-    //     let handle = std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(location)?;
-    //     let mema = unsafe { memmap2::MmapMut::map_mut(&handle)? };
-    //     let memb = unsafe { memmap2::MmapMut::map_mut(&handle)? };
-
-    //     println!("{:?}", mema);
-    //     println!("{:?}", memb);
-
-    //     Ok(())
-    // }
 
     #[test]
     fn simple_save_and_load() -> Result<()> {
