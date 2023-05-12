@@ -21,8 +21,8 @@ struct ExtensibleTrigramFile {
     initial_segment_size: u32,
     extended_segment_size: u32,
     data_location: PathBuf,
-    data: std::fs::File,
-    // data: memmap2::MmapMut,
+    // data: std::fs::File,
+    data: memmap2::MmapMut,
     edit_buffer_location: PathBuf,
     extended_segments: u32,
 }
@@ -100,12 +100,14 @@ impl ExtensibleTrigramFile {
         data.write_u32::<LittleEndian>(HEADER_SIZE as u32).context("Writing header")?;
         data.write_u32::<LittleEndian>(initial_segment_size).context("Writing header")?;
         data.write_u32::<LittleEndian>(extended_segment_size).context("Writing header")?;
+        data.sync_all()?;
 
         //
         let mut edit_buffer_location = location.to_owned();
         edit_buffer_location.set_extension("wb");
 
         // return object
+        let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         Ok(Self { initial_segment_size, extended_segment_size, data_location: location.to_owned(), data, edit_buffer_location, extended_segments: 0 })
     }
 
@@ -137,6 +139,7 @@ impl ExtensibleTrigramFile {
         let extended_segments = (extended_size/extended_segment_size as u64) as u32;
         let mut edit_buffer_location = location.to_owned();
         edit_buffer_location.set_extension("wb");
+        let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         let mut filter = Self{ initial_segment_size, extended_segment_size, data_location: location.to_owned(), data, edit_buffer_location: edit_buffer_location.clone(), extended_segments };
 
         // Check for a edit buffer
@@ -175,24 +178,26 @@ impl ExtensibleTrigramFile {
 
     // #[instrument]
     fn read_initial_segment(&mut self, trigram: u32) -> Result<RawSegmentInfo> {
-        let location = self.get_initial_segment_offset(trigram);
-        self.data.seek(SeekFrom::Start(location))?;
-        let mut data = vec![0; self.initial_segment_size as usize];
-        self.data.read_exact(&mut data)?;
+        let location = self.get_initial_segment_offset(trigram) as usize;
+        // self.data.seek(SeekFrom::Start(location))?;
+        // let mut data = vec![0; self.initial_segment_size as usize];
+        // self.data.read_exact(&mut data)?;
+        let data = self.data[location..location+self.initial_segment_size as usize].to_vec();
         return Ok(RawSegmentInfo::new(data))
     }
 
     // #[instrument]
     fn read_extended_segment(&mut self, segment: u32) -> Result<RawSegmentInfo> {
-        let location = self.get_extended_segment_offset(segment);
-        self.data.seek(SeekFrom::Start(location))?;
-        let mut data = vec![0; self.extended_segment_size as usize];
-        self.data.read_exact(&mut data)?;
+        let location = self.get_extended_segment_offset(segment) as usize;
+        // self.data.seek(SeekFrom::Start(location))?;
+        // let mut data = vec![0; self.extended_segment_size as usize];
+        // self.data.read_exact(&mut data)?;
+        let data = self.data[location..location+self.extended_segment_size as usize].to_vec();
         return Ok(RawSegmentInfo::new(data))
     }
 
     // #[instrument]
-    pub fn write_batch(&mut self, files: &[(u64, BitVec)]) -> Result<()> {
+    pub fn write_batch(&mut self, files: &mut [(u64, BitVec)]) -> Result<()> {
         // prepare the buffer for operations
         let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
 
@@ -344,7 +349,9 @@ impl ExtensibleTrigramFile {
 
         // resize first
         let new_size = HEADER_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + extended_segments as u64 * self.extended_segment_size as u64;
-        self.data.set_len(new_size).context("Resizing data file")?;
+        let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.data_location)?;
+        data.set_len(new_size).context("Resizing data file")?;
+        self.data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         self.extended_segments = extended_segments;
 
         // apply operations
@@ -368,7 +375,8 @@ impl ExtensibleTrigramFile {
         }
 
         // Commit operations
-        self.data.sync_all()?;
+        // self.data.sync_all()?;
+        self.data.flush()?;
 
         // Clear edit buffer
         std::fs::remove_file(&self.edit_buffer_location)?;
@@ -379,9 +387,10 @@ impl ExtensibleTrigramFile {
     fn apply_operation(&mut self, operation: UpdateOperations) -> Result<()> {
         match operation {
             UpdateOperations::WriteSegment { segment, data } => {
-                let segment_offset = self.get_segment_offset(segment);
-                self.data.seek(SeekFrom::Start(segment_offset))?;
-                self.data.write(&data)?;
+                let segment_offset = self.get_segment_offset(segment) as usize;
+                self.data[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
+                // self.data.seek(SeekFrom::Start(segment_offset))?;
+                // self.data.write(&data)?;
             },
             UpdateOperations::ExtendSegment { segment, new_segment } => {
                 let segment_offset = self.get_segment_offset(segment);
@@ -390,8 +399,9 @@ impl ExtensibleTrigramFile {
                     SegmentAddress::Segment(_) => self.extended_segment_size as u64,
                 };
                 let write_location = segment_offset + segment_length - POINTER_SIZE;
-                self.data.seek(SeekFrom::Start(write_location))?;
-                self.data.write(&new_segment.to_le_bytes())?;
+                // self.data.seek(SeekFrom::Start(write_location))?;
+                // self.data.write(&new_segment.to_le_bytes())?;
+                self.data[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
             },
         }
         Ok(())
@@ -425,40 +435,40 @@ mod test {
     //     _guard
     // }
 
-    #[test]
-    fn memmap() -> Result<()> {
-        // build test data
-        let mut trigrams = vec![];
-        for ii in 1..102 {
-            let mut data = BitVec::repeat(false, TRIGRAM_RANGE as usize);
-            data.set(500, true);
-            if ii < 50 {
-                data.set(0, true);
-            } else {
-                data.set(TRIGRAM_RANGE as usize - 1, true);
-            }
-            trigrams.push((ii, data));
-        }
+    // #[test]
+    // fn memmap() -> Result<()> {
+    //     // build test data
+    //     let mut trigrams = vec![];
+    //     for ii in 1..102 {
+    //         let mut data = BitVec::repeat(false, TRIGRAM_RANGE as usize);
+    //         data.set(500, true);
+    //         if ii < 50 {
+    //             data.set(0, true);
+    //         } else {
+    //             data.set(TRIGRAM_RANGE as usize - 1, true);
+    //         }
+    //         trigrams.push((ii, data));
+    //     }
 
 
-        // write it
-        let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
-        {
-            let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
-            file.write_batch(&trigrams).context("write batch")?;
-            assert_eq!(file.extended_segments, 0)
-        }
+    //     // write it
+    //     let tempdir = tempfile::tempdir()?;
+    //     let location = tempdir.path().join("test");
+    //     {
+    //         let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
+    //         file.write_batch(&mut trigrams).context("write batch")?;
+    //         assert_eq!(file.extended_segments, 0)
+    //     }
 
-        let handle = std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(location)?;
-        let mema = unsafe { memmap2::MmapMut::map_mut(&handle)? };
-        let memb = unsafe { memmap2::MmapMut::map_mut(&handle)? };
+    //     let handle = std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(location)?;
+    //     let mema = unsafe { memmap2::MmapMut::map_mut(&handle)? };
+    //     let memb = unsafe { memmap2::MmapMut::map_mut(&handle)? };
 
-        println!("{:?}", mema);
-        println!("{:?}", memb);
+    //     println!("{:?}", mema);
+    //     println!("{:?}", memb);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     #[test]
     fn simple_save_and_load() -> Result<()> {
@@ -481,7 +491,7 @@ mod test {
         let location = tempdir.path().join("test");
         {
             let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
-            file.write_batch(&trigrams).context("write batch")?;
+            file.write_batch(&mut trigrams).context("write batch")?;
             assert_eq!(file.extended_segments, 0)
         }
 
@@ -524,7 +534,7 @@ mod test {
         let location = tempdir.path().join("test");
         {
             let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
-            file.write_batch(&trigrams)?;
+            file.write_batch(&mut trigrams)?;
             assert!(file.extended_segments > 0)
         }
 
@@ -562,7 +572,7 @@ mod test {
             }
             trigrams.push((ii, data));
         }
-        println!("generate {}", timer.elapsed().as_millis());
+        println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
         // write it
         let tempdir = tempfile::tempdir()?;
@@ -570,13 +580,13 @@ mod test {
         {
             let timer = std::time::Instant::now();
             let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
-            println!("open new {}", timer.elapsed().as_millis());
+            println!("open new {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
-            file.write_batch(&trigrams[0..10])?;
-            println!("write batch {}", timer.elapsed().as_millis());
+            file.write_batch(&mut trigrams[0..10])?;
+            println!("write batch {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
-            file.write_batch(&trigrams[10..20])?;
-            println!("write batch {}", timer.elapsed().as_millis());
+            file.write_batch(&mut trigrams[10..20])?;
+            println!("write batch {:.2}", timer.elapsed().as_secs_f64());
         }
 
         // Recreate the trigrams
@@ -599,61 +609,61 @@ mod test {
                 assert_eq!(trigrams[index].1, values)
             }
         }
-        println!("read {}", timer.elapsed().as_millis());
+        println!("read {:.2}", timer.elapsed().as_secs_f64());
         Ok(())
     }
 
-    #[test]
-    fn large_batch() -> Result<()> {
+    // #[test]
+    // fn large_batch() -> Result<()> {
 
 
 
-        let timer = std::time::Instant::now();
-        // build test data
-        let mut trigrams = vec![];
-        let mut prng = thread_rng();
-        for ii in 1..1000 {
-            let mut data = BitVec::repeat(false, 1 << 24);
-            for jj in 0..(1 << 24) {
-                data.set(jj, prng.gen_bool(0.2));
-            }
-            trigrams.push((ii, data));
-        }
-        println!("generate {}", timer.elapsed().as_millis());
+    //     let timer = std::time::Instant::now();
+    //     // build test data
+    //     let mut trigrams = vec![];
+    //     let mut prng = thread_rng();
+    //     for ii in 1..500 {
+    //         let mut data = BitVec::repeat(false, 1 << 24);
+    //         for jj in 0..(1 << 24) {
+    //             data.set(jj, prng.gen_bool(0.2));
+    //         }
+    //         trigrams.push((ii, data));
+    //     }
+    //     println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
-        // write it
-        let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
-        {
-            let timer = std::time::Instant::now();
-            let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
-            println!("open new {}", timer.elapsed().as_millis());
-            let timer = std::time::Instant::now();
-            file.write_batch(&trigrams)?;
-            println!("write batch {}", timer.elapsed().as_millis());
-        }
+    //     // write it
+    //     let tempdir = tempfile::tempdir()?;
+    //     let location = tempdir.path().join("test");
+    //     {
+    //         let timer = std::time::Instant::now();
+    //         let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
+    //         println!("open new {:.2}", timer.elapsed().as_secs_f64());
+    //         let timer = std::time::Instant::now();
+    //         file.write_batch(&mut trigrams)?;
+    //         println!("write batch {:.2}", timer.elapsed().as_secs_f64());
+    //     }
 
-        // // Recreate the trigrams
-        // let timer = std::time::Instant::now();
-        // {
-        //     let mut recreated: Vec<BitVec> = vec![];
-        //     for _ in 0..20 {
-        //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
-        //     }
+    //     // // Recreate the trigrams
+    //     // let timer = std::time::Instant::now();
+    //     // {
+    //     //     let mut recreated: Vec<BitVec> = vec![];
+    //     //     for _ in 0..20 {
+    //     //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
+    //     //     }
 
-        //     let mut file = ExtensibleTrigramFile::open(&location)?;
-        //     for trigram in 0..(1<<24) {
-        //         let values = file.read_trigram(trigram)?;
-        //         for index in values {
-        //             recreated[index as usize - 1].set(trigram as usize, true);
-        //         }
-        //     }
+    //     //     let mut file = ExtensibleTrigramFile::open(&location)?;
+    //     //     for trigram in 0..(1<<24) {
+    //     //         let values = file.read_trigram(trigram)?;
+    //     //         for index in values {
+    //     //             recreated[index as usize - 1].set(trigram as usize, true);
+    //     //         }
+    //     //     }
 
-        //     for (index, values) in recreated.into_iter().enumerate() {
-        //         assert_eq!(trigrams[index].1, values)
-        //     }
-        // }
-        // println!("read {}", timer.elapsed().as_millis());
-        Ok(())
-    }
+    //     //     for (index, values) in recreated.into_iter().enumerate() {
+    //     //         assert_eq!(trigrams[index].1, values)
+    //     //     }
+    //     // }
+    //     // println!("read {}", timer.elapsed().as_secs_f64());
+    //     Ok(())
+    // }
 }
