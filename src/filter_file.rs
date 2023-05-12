@@ -216,7 +216,7 @@ impl ExtensibleTrigramFile {
             let stamp = std::time::Instant::now();
             // Invert batch into REVERSED index lists
             let mut file_ids = vec![];
-            for (id, grams) in files {
+            for (id, grams) in files.iter() {
                 if *grams.get(trigram as usize).unwrap() {
                     file_ids.push(*id);
                 }
