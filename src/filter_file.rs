@@ -1,14 +1,12 @@
-use bitvec::macros::internal::funty::Numeric;
 use bitvec::vec::BitVec;
 use anyhow::{Result, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Serialize, Deserialize};
-// use tracing::instrument;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
 use std::path::{Path, PathBuf};
 
-use crate::encoding::{encode, cost_to_add};
+use crate::encoding::{cost_to_add, encode_into};
 
 
 const HEADER_SIZE: u64 = 4 + 4 + 4 + 4;
@@ -216,6 +214,7 @@ impl ExtensibleTrigramFile {
         let mut file_ids = vec![];
         let mut extend_data_buffer = vec![0u8; 128];
         let mut write_data_buffer = vec![];
+        let mut encode_data_buffer = vec![];
 
         // track how many segments are added in this batch
         let mut added_segments = 0u32;
@@ -268,9 +267,10 @@ impl ExtensibleTrigramFile {
             // if we changed the content of that segment add the write op
             if changed {
                 let stamp = std::time::Instant::now();
-                let data = encode(&content);
-                write_data_buffer.resize(data.len() + 128, 0);
-                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &data }, &mut write_data_buffer)?)?;
+                encode_data_buffer.clear();
+                encode_into(&content, &mut encode_data_buffer);
+                write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
+                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                 op_write_time += stamp.elapsed().as_secs_f64();
             }
 
@@ -298,9 +298,10 @@ impl ExtensibleTrigramFile {
                 let new_address = SegmentAddress::Segment(new_segment);
                 let stamp = std::time::Instant::now();
                 writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { segment: address, new_segment }, &mut extend_data_buffer)?)?;
-                let data = encode(&content);
-                write_data_buffer.resize(data.len() + 128, 0);
-                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: &data }, &mut write_data_buffer)?)?;
+                encode_data_buffer.clear();
+                encode_into(&content, &mut encode_data_buffer);
+                write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
+                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                 op_write_time += stamp.elapsed().as_secs_f64();
                 address = new_address;
             }

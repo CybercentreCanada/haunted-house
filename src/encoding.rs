@@ -27,17 +27,21 @@ pub fn encode_value_into(mut value: u64, buffer: &mut Vec<u8>){
     }
 }
 
-
 pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
     let mut buffer = vec![];
+    encode_into(indices, &mut buffer);
+    return buffer
+}
+
+pub fn encode_into(indices: &Vec<u64>, buffer: &mut Vec<u8>) {
     if indices.len() == 0 {
-        return buffer;
+        return;
     }
     if indices.len() == 1 {
-        encode_value_into(indices[0], &mut buffer);
-        return buffer;
+        encode_value_into(indices[0], buffer);
+        return;
     }
-    encode_value_into(indices[0], &mut buffer);
+    encode_value_into(indices[0], buffer);
     let mut last = indices[0];
     let mut run_length = 0;
     for pair in indices.windows(2) {
@@ -50,7 +54,7 @@ pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
         //         run_length = 0;
         //     }
 
-        encode_value_into(d, &mut buffer);
+        encode_value_into(d, buffer);
             // last = d;
         // }
     }
@@ -59,7 +63,6 @@ pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
     //     buffer.extend(encode_duplicates(run_length));
     // }
 
-    return buffer
 }
 
 pub fn encoded_number_size(value: u64) -> u32 {
