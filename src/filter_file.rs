@@ -70,8 +70,8 @@ impl RawSegmentInfo {
         self.data.len() as u32 - POINTER_SIZE as u32
     }
 
-    fn decode(&self) -> Result<(Vec<u64>, u32)> {
-        Ok(crate::encoding::decode(&self.data[0..self.data.len() - POINTER_SIZE as usize]))
+    fn decode_into(&self, buffer: &mut Vec<u64>) -> u32 {
+        crate::encoding::decode_into(&self.data[0..self.data.len() - POINTER_SIZE as usize], buffer)
     }
 
     fn extension(&self) -> Option<u32> {
@@ -151,10 +151,10 @@ impl ExtensibleTrigramFile {
     pub fn read_trigram(&mut self, trigram: u32) -> Result<Vec<u64>> {
         let mut output = vec![];
         let mut segment = self.read_initial_segment(trigram).context("reading initial segment")?;
-        output.extend(segment.decode()?.0);
+        segment.decode_into(&mut output);
         while let Some(extension) = segment.extension() {
             segment = self.read_extended_segment(extension).context("reading extended segment")?;
-            output.extend(segment.decode()?.0);
+            segment.decode_into(&mut output);
         }
         return Ok(output);
     }
@@ -216,6 +216,9 @@ impl ExtensibleTrigramFile {
         let mut write_data_buffer = vec![];
         let mut encode_data_buffer = vec![];
 
+        // sort the files so that file ids always end up reversed below
+        files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
         // track how many segments are added in this batch
         let mut added_segments = 0u32;
         for trigram in 0u32..TRIGRAM_RANGE as u32 {
@@ -231,7 +234,7 @@ impl ExtensibleTrigramFile {
                 continue
             }
 
-            file_ids.sort_unstable_by(|a, b| b.cmp(a));
+            // file_ids.sort_unstable_by(|a, b| b.cmp(&a));
             invert_time += stamp.elapsed().as_secs_f64();
             let stamp = std::time::Instant::now();
 
@@ -249,7 +252,8 @@ impl ExtensibleTrigramFile {
 
             // Pack as many numbers into that segment as we can
             let mut changed = false;
-            let (mut content, mut encoded_size) = active_segment.decode()?;
+            let mut content = vec![];
+            let mut encoded_size = active_segment.decode_into(&mut content);
             let limit = active_segment.payload_bytes();
             while let Some(index) = file_ids.pop() {
                 let new_size = encoded_size + cost_to_add(&content, index);
@@ -381,7 +385,6 @@ impl ExtensibleTrigramFile {
         }
 
         // Commit operations
-        // self.data.sync_all()?;
         self.data.flush()?;
 
         // Clear edit buffer
@@ -417,10 +420,12 @@ impl ExtensibleTrigramFile {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
     use anyhow::{Result, Context};
     use bitvec::vec::BitVec;
     use itertools::Itertools;
-    use rand::{thread_rng, Rng};
+    use rand::{thread_rng, Rng, SeedableRng};
 
     use crate::filter_file::ExtensibleTrigramFile;
 
@@ -520,8 +525,9 @@ mod test {
         let timer = std::time::Instant::now();
         // build test data
         let mut trigrams = vec![];
-        let mut prng = thread_rng();
-        for ii in 1..21 {
+        let mut prng = rand::rngs::StdRng::seed_from_u64(0);
+
+        for ii in (1..21).rev() {
             let mut data = BitVec::repeat(false, 1 << 24);
             for jj in 0..(1 << 24) {
                 data.set(jj, prng.gen_bool(0.2));
@@ -561,62 +567,64 @@ mod test {
                 }
             }
 
+            let trigrams: HashMap<u64, BitVec> = trigrams.into_iter().collect();
+
             for (index, values) in recreated.into_iter().enumerate() {
-                assert_eq!(trigrams[index].1, values)
+                assert_eq!(*trigrams.get(&(index as u64+1)).unwrap(), values)
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
         Ok(())
     }
 
-    // #[test]
-    // fn large_batch() -> Result<()> {
-    //     let timer = std::time::Instant::now();
-    //     // build test data
-    //     let mut trigrams = vec![];
-    //     let mut prng = thread_rng();
-    //     for ii in 1..500 {
-    //         let mut data = BitVec::repeat(false, 1 << 24);
-    //         for jj in 0..(1 << 24) {
-    //             data.set(jj, prng.gen_bool(0.2));
-    //         }
-    //         trigrams.push((ii, data));
-    //     }
-    //     println!("generate {:.2}", timer.elapsed().as_secs_f64());
+    #[test]
+    fn large_batch() -> Result<()> {
+        let timer = std::time::Instant::now();
+        // build test data
+        let mut trigrams = vec![];
+        let mut prng = rand::rngs::StdRng::seed_from_u64(0);
+        for ii in 1..500 {
+            let mut data = BitVec::repeat(false, 1 << 24);
+            for jj in 0..(1 << 24) {
+                data.set(jj, prng.gen_bool(0.2));
+            }
+            trigrams.push((ii, data));
+        }
+        println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
-    //     // write it
-    //     let tempdir = tempfile::tempdir()?;
-    //     let location = tempdir.path().join("test");
-    //     {
-    //         let timer = std::time::Instant::now();
-    //         let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
-    //         println!("open new {:.2}", timer.elapsed().as_secs_f64());
-    //         let timer = std::time::Instant::now();
-    //         file.write_batch(&mut trigrams)?;
-    //         println!("write batch {:.2}", timer.elapsed().as_secs_f64());
-    //     }
+        // write it
+        let tempdir = tempfile::tempdir()?;
+        let location = tempdir.path().join("test");
+        {
+            let timer = std::time::Instant::now();
+            let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
+            println!("open new {:.2}", timer.elapsed().as_secs_f64());
+            let timer = std::time::Instant::now();
+            file.write_batch(&mut trigrams)?;
+            println!("write batch {:.2}", timer.elapsed().as_secs_f64());
+        }
 
-    //     // // Recreate the trigrams
-    //     // let timer = std::time::Instant::now();
-    //     // {
-    //     //     let mut recreated: Vec<BitVec> = vec![];
-    //     //     for _ in 0..20 {
-    //     //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
-    //     //     }
+        // // Recreate the trigrams
+        // let timer = std::time::Instant::now();
+        // {
+        //     let mut recreated: Vec<BitVec> = vec![];
+        //     for _ in 0..20 {
+        //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
+        //     }
 
-    //     //     let mut file = ExtensibleTrigramFile::open(&location)?;
-    //     //     for trigram in 0..(1<<24) {
-    //     //         let values = file.read_trigram(trigram)?;
-    //     //         for index in values {
-    //     //             recreated[index as usize - 1].set(trigram as usize, true);
-    //     //         }
-    //     //     }
+        //     let mut file = ExtensibleTrigramFile::open(&location)?;
+        //     for trigram in 0..(1<<24) {
+        //         let values = file.read_trigram(trigram)?;
+        //         for index in values {
+        //             recreated[index as usize - 1].set(trigram as usize, true);
+        //         }
+        //     }
 
-    //     //     for (index, values) in recreated.into_iter().enumerate() {
-    //     //         assert_eq!(trigrams[index].1, values)
-    //     //     }
-    //     // }
-    //     // println!("read {}", timer.elapsed().as_secs_f64());
-    //     Ok(())
-    // }
+        //     for (index, values) in recreated.into_iter().enumerate() {
+        //         assert_eq!(trigrams[index].1, values)
+        //     }
+        // }
+        // println!("read {}", timer.elapsed().as_secs_f64());
+        Ok(())
+    }
 }

@@ -78,6 +78,11 @@ pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
 
 pub fn decode(data: &[u8]) -> (Vec<u64>, u32) {
     let mut values = vec![];
+    let size = decode_into(data, &mut values);
+    return (values, size)
+}
+
+pub fn decode_into(data: &[u8], values: &mut Vec<u64>) -> u32 {
 
     let mut used_bytes = 0;
     let mut index = 0;
@@ -91,7 +96,7 @@ pub fn decode(data: &[u8]) -> (Vec<u64>, u32) {
             index += 1;
             taken += 1;
             if index >= data.len() || data[index] == 0 {
-                return (values, used_bytes)
+                return used_bytes
             }
             value |= ((data[index] & 0b0111_1111) as u64) << offset;
             offset += 7;
@@ -104,7 +109,7 @@ pub fn decode(data: &[u8]) -> (Vec<u64>, u32) {
         last = value;
     }
 
-    return (values, used_bytes);
+    return used_bytes;
 }
 
 
