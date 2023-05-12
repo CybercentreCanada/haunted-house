@@ -16,9 +16,7 @@ pub fn encode_duplicates(mut count: u64) -> Vec<u8> {
 }
 
 
-pub fn encode_value(mut value: u64) -> Vec<u8> {
-    let mut buffer = Vec::new();
-
+pub fn encode_value_into(mut value: u64, buffer: &mut Vec<u8>){
     while value > 0 {
         let mut fragment = value & 0b0111_1111;
         value >>= 7;
@@ -27,19 +25,19 @@ pub fn encode_value(mut value: u64) -> Vec<u8> {
         }
         buffer.push(fragment as u8);
     }
-
-    return buffer;
 }
 
 
 pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
+    let mut buffer = vec![];
     if indices.len() == 0 {
-        return vec![];
+        return buffer;
     }
     if indices.len() == 1 {
-        return encode_value(indices[0]);
+        encode_value_into(indices[0], &mut buffer);
+        return buffer;
     }
-    let mut buffer = encode_value(indices[0]);
+    encode_value_into(indices[0], &mut buffer);
     let mut last = indices[0];
     let mut run_length = 0;
     for pair in indices.windows(2) {
@@ -52,7 +50,7 @@ pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
         //         run_length = 0;
         //     }
 
-            buffer.extend(encode_value(d));
+        encode_value_into(d, &mut buffer);
             // last = d;
         // }
     }

@@ -307,7 +307,7 @@ impl ExtensibleTrigramFile {
             build_ops_time += stamp.elapsed().as_secs_f64();
         }
 
-        println!("Operation file built {} [in {:.2}, bu {:.2}, bu>wr {:.2}, bu>sr {:.2}]", start.elapsed().as_millis(), invert_time, build_ops_time, op_write_time, seg_read_time);
+        println!("Operation file built {:.2} [in {:.2}, bu {:.2}, bu>wr {:.2}, bu>sr {:.2}]", start.elapsed().as_secs_f64(), invert_time, build_ops_time, op_write_time, seg_read_time);
         let stamp = std::time::Instant::now();
 
         // Write where the finalization is
@@ -324,12 +324,12 @@ impl ExtensibleTrigramFile {
         // Sync
         write_buffer.sync_all()?;
 
-        println!("Operation file synced {}", stamp.elapsed().as_millis());
+        println!("Operation file synced {:.2}", stamp.elapsed().as_secs_f64());
         let stamp = std::time::Instant::now();
 
         // Apply operation set
         self.apply_operations(write_buffer, self.extended_segments + added_segments).context("apply operations")?;
-        println!("Operation file applied {}", stamp.elapsed().as_millis());
+        println!("Operation file applied {:.2}", stamp.elapsed().as_secs_f64());
         return Ok(())
     }
 
@@ -371,17 +371,8 @@ impl ExtensibleTrigramFile {
         let mut bytes_read = 8;
         let mut buffer = vec![];
         while bytes_read < offset {
-            // let mut buffer = vec![];
             buffer.clear();
             bytes_read += reader.read_until(0, &mut buffer)? as u64;
-            // loop {
-            //     let byte = reader.read_u8().context("reading single byte")?;
-            //     bytes_read += 1;
-            //     if byte == 0 || bytes_read >= offset {
-            //         break;
-            //     }
-            //     buffer.push(byte);
-            // }
             if !buffer.is_empty() {
                 let operation: UpdateOperations = postcard::from_bytes_cobs(&mut buffer).context("parsing operation")?;
                 self.apply_operation(operation).context("applying operation")?;
@@ -579,9 +570,6 @@ mod test {
 
     // #[test]
     // fn large_batch() -> Result<()> {
-
-
-
     //     let timer = std::time::Instant::now();
     //     // build test data
     //     let mut trigrams = vec![];
