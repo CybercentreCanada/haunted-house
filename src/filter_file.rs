@@ -57,12 +57,12 @@ enum UpdateOperations<'a> {
 //     }
 // }
 
-struct RawSegmentInfo {
-    data: Vec<u8>,
+struct RawSegmentInfo<'a> {
+    data: &'a[u8],
 }
 
-impl RawSegmentInfo {
-    fn new(data: Vec<u8>) -> Self {
+impl<'a> RawSegmentInfo<'a> {
+    fn new(data: &'a[u8]) -> Self {
         RawSegmentInfo { data }
     }
 
@@ -106,6 +106,7 @@ impl ExtensibleTrigramFile {
 
         // return object
         let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
+        data.advise(memmap2::Advice::Random)?;
         Ok(Self { initial_segment_size, extended_segment_size, data_location: location.to_owned(), data, edit_buffer_location, extended_segments: 0 })
     }
 
@@ -138,6 +139,7 @@ impl ExtensibleTrigramFile {
         let mut edit_buffer_location = location.to_owned();
         edit_buffer_location.set_extension("wb");
         let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
+        data.advise(memmap2::Advice::Random)?;
         let mut filter = Self{ initial_segment_size, extended_segment_size, data_location: location.to_owned(), data, edit_buffer_location: edit_buffer_location.clone(), extended_segments };
 
         // Check for a edit buffer
@@ -180,7 +182,9 @@ impl ExtensibleTrigramFile {
         // self.data.seek(SeekFrom::Start(location))?;
         // let mut data = vec![0; self.initial_segment_size as usize];
         // self.data.read_exact(&mut data)?;
-        let data = self.data[location..location+self.initial_segment_size as usize].to_vec();
+        // let data = self.data[location..location+self.initial_segment_size as usize].to_vec();
+        // return Ok(RawSegmentInfo::new(data))
+        let data = &self.data[location..location+self.initial_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
@@ -190,7 +194,9 @@ impl ExtensibleTrigramFile {
         // self.data.seek(SeekFrom::Start(location))?;
         // let mut data = vec![0; self.extended_segment_size as usize];
         // self.data.read_exact(&mut data)?;
-        let data = self.data[location..location+self.extended_segment_size as usize].to_vec();
+        // let data = self.data[location..location+self.extended_segment_size as usize].to_vec();
+        // return Ok(RawSegmentInfo::new(data))
+        let data = &self.data[location..location+self.extended_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
@@ -215,6 +221,7 @@ impl ExtensibleTrigramFile {
         let mut extend_data_buffer = vec![0u8; 128];
         let mut write_data_buffer = vec![];
         let mut encode_data_buffer = vec![];
+        let mut content = vec![];
 
         // sort the files so that file ids always end up reversed below
         files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -252,7 +259,7 @@ impl ExtensibleTrigramFile {
 
             // Pack as many numbers into that segment as we can
             let mut changed = false;
-            let mut content = vec![];
+            content.clear();
             let mut encoded_size = active_segment.decode_into(&mut content);
             let limit = active_segment.payload_bytes();
             while let Some(index) = file_ids.pop() {
@@ -285,7 +292,7 @@ impl ExtensibleTrigramFile {
                 let new_segment = self.extended_segments + added_segments;
 
                 //
-                let mut content = vec![];
+                content.clear();
                 let mut encoded_size = 0;
                 while let Some(index) = file_ids.pop() {
                     let new_size = encoded_size + cost_to_add(&content, index);
@@ -361,6 +368,7 @@ impl ExtensibleTrigramFile {
 
     // #[instrument]
     fn apply_operations(&mut self, mut source: File, extended_segments: u32) -> Result<()> {
+        let stamp = std::time::Instant::now();
         source.seek(SeekFrom::Start(0)).context("reseting the operation source")?;
 
         // resize first
@@ -368,7 +376,11 @@ impl ExtensibleTrigramFile {
         let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.data_location)?;
         data.set_len(new_size).context("Resizing data file")?;
         self.data = unsafe { memmap2::MmapMut::map_mut(&data)? };
+        self.data.advise(memmap2::Advice::Random)?;
         self.extended_segments = extended_segments;
+
+        let resize_time = stamp.elapsed().as_secs_f64();
+        let apply_stamp = std::time::Instant::now();
 
         // apply operations
         let mut reader = std::io::BufReader::new(source);
@@ -384,8 +396,14 @@ impl ExtensibleTrigramFile {
             }
         }
 
+        let apply_time = apply_stamp.elapsed().as_secs_f64();
+        let flush_stamp = std::time::Instant::now();
+
         // Commit operations
         self.data.flush()?;
+
+        let flush_time = flush_stamp.elapsed().as_secs_f64();
+        println!("time to apply {:.2} [rs {:.2}, ap {:.2}, fl {:.2}]", stamp.elapsed().as_secs_f64(), resize_time, apply_time, flush_time);
 
         // Clear edit buffer
         std::fs::remove_file(&self.edit_buffer_location)?;
@@ -425,7 +443,7 @@ mod test {
     use anyhow::{Result, Context};
     use bitvec::vec::BitVec;
     use itertools::Itertools;
-    use rand::{thread_rng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     use crate::filter_file::ExtensibleTrigramFile;
 
