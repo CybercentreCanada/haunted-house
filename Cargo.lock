@@ -1604,6 +1604,7 @@ dependencies = [
  "azure_storage",
  "azure_storage_blobs",
  "bitvec",
+ "byteorder",
  "bytes",
  "chrono",
  "clap",
@@ -1616,6 +1617,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "log",
+ "memmap2",
  "nom",
  "openssl",
  "parse-size",
@@ -2273,6 +2275,15 @@ name = "memchr"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dffe52ecf27772e601905b7522cb4ef790d2cc203488bbd0e2fe85fcb74566d"
+
+[[package]]
+name = "memmap2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0aa1b505aeecb0adb017db2b6a79a17a38e64f882a201f05e9de8a982cd6096"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "memoffset"

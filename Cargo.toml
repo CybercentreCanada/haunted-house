@@ -8,10 +8,14 @@ edition = "2021"
 name = "operator"
 required-features = ["operator"]
 
-[profile.release]
-lto = true
-
 [dependencies]
+
+#tracing = "0.1"
+#tracing-flame = "*"
+#tracing-subscriber = "*"
+memmap2 = "*"
+
+
 serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0"
 serde_with = "2.2"
@@ -19,6 +23,7 @@ serde_with = "2.2"
 postcard = { version = "1.0.2", features = ["alloc"] }
 nom = "7"
 bytes = "*"
+byteorder = "1.4"
 # humansize = "2"
 parse-size = { version = "1", features = ["std"] }
 

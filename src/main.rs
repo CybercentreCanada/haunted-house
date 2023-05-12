@@ -15,6 +15,8 @@ mod varint;
 mod blob_cache;
 mod worker;
 mod worker_watcher;
+mod filter_file;
+mod encoding;
 
 use std::path::PathBuf;
 use std::str::FromStr;

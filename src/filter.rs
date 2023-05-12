@@ -269,6 +269,9 @@ impl TrigramFilter {
             },
             // Query::String(string) => self.buffer_query(string.as_bytes()),
             Query::Literal(data) => self.buffer_query(data),
+            Query::MinOf(_, _) => {
+                todo!();
+            }
         }
     }
 
