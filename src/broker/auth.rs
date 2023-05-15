@@ -16,25 +16,14 @@ use serde::{Serialize, Deserialize};
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Role {
     Search,
-    Worker,
     Ingest,
 }
 
-#[cfg(feature = "python")]
-impl IntoPy<PyObject> for Role {
-    fn into_py(self, py: pyo3::Python<'_>) -> PyObject {
-        match self {
-            Role::Search => intern!(py, "Search").into(),
-            Role::Worker => intern!(py, "Worker").into(),
-        }
-    }
-}
 
 impl Display for Role {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Role::Search => "Search",
-            Role::Worker => "Worker",
             Role::Ingest => "Ingest",
         })
     }

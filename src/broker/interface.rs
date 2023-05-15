@@ -22,11 +22,12 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::access::AccessControl;
-use crate::auth::Role;
 use crate::config::TLSConfig;
-use crate::core::{HouseCore, IngestStatus};
-use crate::database::{BlobID, IndexID, IndexGroup};
+use crate::logging::LoggerMiddleware;
 use crate::query::Query;
+
+use super::{HouseCore, IngestStatus};
+use super::auth::Role;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
 
@@ -63,9 +64,9 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
             Err(_) => Default::default()
         };
 
-        if roles.contains(&Role::Worker) {
-            req.extensions_mut().insert(WorkerInterface::new(self.core.clone()));
-        }
+        // if roles.contains(&Role::Worker) {
+        //     req.extensions_mut().insert(WorkerInterface::new(self.core.clone()));
+        // }
 
         if roles.contains(&Role::Search) {
             req.extensions_mut().insert(SearcherInterface::new(self.core.clone()));
@@ -86,40 +87,6 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
 }
 
 
-pub struct LoggerMiddleware;
-
-impl<E: Endpoint> Middleware<E> for LoggerMiddleware {
-    type Output = LoggerMiddlewareImpl<E>;
-
-    fn transform(&self, ep: E) -> Self::Output {
-        LoggerMiddlewareImpl { ep }
-    }
-}
-
-pub struct LoggerMiddlewareImpl<E> {
-    ep: E,
-}
-
-
-#[poem::async_trait]
-impl<E: Endpoint> Endpoint for LoggerMiddlewareImpl<E> {
-    type Output = E::Output;
-
-    async fn call(&self, req: Request) -> poem::Result<Self::Output> {
-        let start = Instant::now();
-        let uri = req.uri().clone();
-        match self.ep.call(req).await {
-            Ok(resp) => {
-                debug!("request for {uri} handled ({} ms)", start.elapsed().as_millis());
-                Ok(resp)
-            },
-            Err(err) => {
-                error!("error handling {uri} ({} ms) {err}", start.elapsed().as_millis());
-                Err(err)
-            },
-        }
-    }
-}
 
 struct StatusInterface {
     core: Arc<HouseCore>
@@ -132,65 +99,65 @@ impl StatusInterface {
 
     pub async fn get_status(&self) -> Result<StatusReport> {
         let ingest = self.core.ingest_status().await?;
-        let mut indices = self.core.database.list_indices().await?;
-        indices.sort();
+        // let mut indices = self.core.database.list_indices().await?;
+        // indices.sort();
 
-        let mut file_count: HashMap<IndexGroup, u64> = Default::default();
+        // let mut file_count: HashMap<IndexGroup, u64> = Default::default();
 
-        for (group, index) in indices.iter() {
-            let mut count = *file_count.get(group).unwrap_or(&0);
-            count += self.core.database.count_files(index).await?;
-            file_count.insert(group.clone(), count);
-        }
+        // for (group, index) in indices.iter() {
+            // let mut count = *file_count.get(group).unwrap_or(&0);
+            // count += self.core.database.count_files(index).await?;
+            // file_count.insert(group.clone(), count);
+        // }
 
-        let mut file_counts: Vec<_> = file_count.into_iter().collect();
-        file_counts.sort();
+        // let mut file_counts: Vec<_> = file_count.into_iter().collect();
+        // file_counts.sort();
 
         Ok(StatusReport {
             ingest,
-            active_filters: indices,
-            file_counts
+            // active_filters: indices,
+            // file_counts
         })
     }
 }
 
 
-struct WorkerInterface {
-    core: Arc<HouseCore>
-}
+// struct WorkerInterface {
+//     core: Arc<HouseCore>
+// }
 
-impl WorkerInterface {
-    pub fn new(core: Arc<HouseCore>) -> Self {
-        Self{core}
-    }
+// impl WorkerInterface {
+//     pub fn new(core: Arc<HouseCore>) -> Self {
+//         Self{core}
+//     }
 
-    pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
-        let start = std::time::Instant::now();
-        loop {
-            let work = self.core.get_work(&req).await?;
-            if !work.is_empty() {
-                return Ok(work);
-            }
+//     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
+//         let start = std::time::Instant::now();
+//         loop {
+//             let work = self.core.get_work(&req).await?;
+//             if !work.is_empty() {
+//                 return Ok(work);
+//             }
 
-            let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
-                Some(wait) => wait,
-                None => return Ok(Default::default()),
-            };
+//             let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
+//                 Some(wait) => wait,
+//                 None => return Ok(Default::default()),
+//             };
 
-            if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
-                return Ok(Default::default())
-            }
-        }
-    }
+//             if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
+//                 return Ok(Default::default())
+//             }
+//         }
+//     }
 
-    pub fn finish_work(&self, req: WorkResult) -> Result<()> {
-        self.core.finish_work(req)
-    }
+//     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
+//         self.core.finish_work(req)
+//     }
 
-    pub async fn work_error(&self, req: WorkError) -> Result<()> {
-        self.core.work_error(req).await
-    }
-}
+//     pub async fn work_error(&self, req: WorkError) -> Result<()> {
+//         self.core.work_error(req).await
+//     }
+// }
 
 struct SearcherInterface {
     core: Arc<HouseCore>
@@ -230,7 +197,7 @@ impl IngestInterface {
         if hash.len() != 32 {
             return Err(anyhow::anyhow!("Invalid hash: wrong number of bytes"));
         }
-        self.core.ingest_queue.send(crate::core::IngestMessage::IngestMessage(hash, request.access, request.expiry, send))?;
+        self.core.ingest_queue.send(super::IngestMessage::IngestMessage(hash, request.access, request.expiry, send))?;
         return recv.await?;
     }
 }
@@ -310,88 +277,6 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
     return (StatusCode::OK, Json(status.resp).into_response())
 }
 
-// pub struct ListRequest {
-
-// }
-
-// pub struct ListResponse {
-
-// }
-
-// #[handler]
-// async fn list_searches(Data(interface): Data<&SearcherInterface>, query: Option<poem::web::Query<ListRequest>>, body: Option<Json<ListRequest>>) -> (StatusCode, Response) {
-//     todo!()
-// }
-
-
-#[derive(Serialize, Deserialize)]
-pub struct FilterTask {
-    pub id: i64,
-    pub search: String,
-    pub filter_id: IndexID,
-    pub filter_blob: BlobID,
-    pub query: Query,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct YaraTask {
-    pub id: i64,
-    pub search: String,
-    pub yara_rule: String,
-    pub hashes: Vec<Vec<u8>>,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-pub struct WorkPackage {
-    pub filter: Vec<FilterTask>,
-    pub yara: Vec<YaraTask>
-}
-
-impl WorkPackage {
-    pub fn is_empty(&self) -> bool {
-        self.filter.is_empty() && self.yara.is_empty()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct WorkRequest {
-    pub worker: String,
-    pub cached_filters: HashSet<BlobID>
-}
-
-#[handler]
-async fn get_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkRequest>) -> Result<Json<WorkPackage>> {
-    Ok(Json(interface.get_work(request).await?))
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum WorkResultValue {
-    Filter(IndexID, BlobID, Vec<u64>),
-    Yara(Vec<Vec<u8>>),
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct WorkResult {
-    pub id: i64,
-    pub search: String,
-    pub value: WorkResultValue
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum WorkError {
-    Yara(i64, String),
-    Filter(i64, String),
-}
-
-#[handler]
-fn finish_work(Data(interface): Data<&WorkerInterface>, Json(request): Json<WorkResult>) -> Result<()> {
-    interface.finish_work(request)
-}
-
-#[handler]
-async fn work_error(Data(interface): Data<&WorkerInterface>, Json(error): Json<WorkError>) -> Result<()> {
-    interface.work_error(error).await
-}
 
 #[derive(Serialize, Deserialize)]
 pub struct IngestRequest {
@@ -539,8 +424,8 @@ async fn get_status() -> Result<()> {
 #[derive(Serialize, Deserialize)]
 struct StatusReport {
     ingest: IngestStatus,
-    active_filters: Vec<(IndexGroup, IndexID)>,
-    file_counts: Vec<(IndexGroup, u64)>,
+    // active_filters: Vec<(IndexGroup, IndexID)>,
+    // file_counts: Vec<(IndexGroup, u64)>,
 }
 
 #[handler]
@@ -548,30 +433,6 @@ async fn get_detailed_status(interface: Data<&StatusInterface>) -> Result<Json<S
     Ok(Json(interface.get_status().await?))
 }
 
-// #[derive(Serialize, Deserialize, Default)]
-// pub struct PromptQuery {
-//     tag: String,
-//     value: Option<String>,
-// }
-
-// #[derive(Serialize, Deserialize)]
-// pub struct PromptResult {
-//     tag_suggestions: Vec<String>,
-//     value_suggestions: Vec<String>,
-// }
-
-// #[handler]
-// async fn tag_prompt(interface: Data<&SearcherInterface>, body: Option<Json<PromptQuery>>, query: Option<poem::web::Query<PromptQuery>>) -> Result<Json<PromptResult>> {
-//     let query = match query {
-//         Some(query) => query.0,
-//         None => match body {
-//             Some(query) => query.0,
-//             None => Default::default()
-//         }
-//     };
-
-//     Ok(Json(interface.tag_prompt(query).await?))
-// }
 
 pub async fn serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<HouseCore>) {
     if let Err(err) = _serve(bind_address, tls, core).await {
@@ -583,11 +444,6 @@ pub async fn _serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<Hous
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
-        // .at("/search/", get(list_searches))
-        // .at("/tags/prompt", get(tag_prompt))
-        .at("/work/", get(get_work))
-        .at("/work/finished/", post(finish_work))
-        .at("/work/error/", post(work_error))
         .at("/ingest/sha256/", post(insert_sha))
         .at("/ingest/stream/", get(ingest_stream))
         .at("/status/online", get(get_status))

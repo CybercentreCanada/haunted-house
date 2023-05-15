@@ -1,12 +1,16 @@
-pub mod interface;
-mod manager;
-
-pub use manager::{worker_manager, WorkerData};
 use serde::{Serialize, Deserialize};
 
+use crate::types::Sha256;
+
+pub mod interface;
+mod database;
+mod database_sqlite;
+mod manager;
 
 #[derive(Serialize, Deserialize)]
-pub struct StatusReport {
-    pub active_filter: Vec<i64>,
-    pub active_yara: Vec<i64>,
+pub struct YaraTask {
+    pub id: i64,
+    pub search: String,
+    pub yara_rule: String,
+    pub hashes: Vec<Sha256>,
 }
