@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
+use crate::types::{ExpiryGroup, FilterID, WorkerID};
 
 use super::database_sqlite::SQLiteInterface;
 use super::interface::{SearchRequest, InternalSearchStatus};
@@ -23,7 +24,13 @@ impl Database {
         Ok(Database::SQLite(SQLiteInterface::new_temp().await?))
     }
 
-    pub async fn initialize_search(&self, code: String, req: SearchRequest) -> Result<InternalSearchStatus> {
+    pub async fn list_active_searches(&self) -> Result<Vec<String>> {
+        match self {
+            Database::SQLite(local) => local.list_active_searches().await
+        }
+    }
+
+    pub async fn initialize_search(&self, code: &str, req: &SearchRequest) -> Result<InternalSearchStatus> {
         match self {
             Database::SQLite(local) => local.initialize_search(code, req).await
         }
@@ -33,6 +40,16 @@ impl Database {
         match self {
             Database::SQLite(local) => local.search_status(code).await
         }
+    }
+
+    pub async fn list_filters(&self) -> Result<Vec<(WorkerID, FilterID, ExpiryGroup)>> {
+        match self {
+            Database::SQLite(local) => local.list_filters().await
+        }
+    }
+
+    pub async fn create_filter(&self, worker: &WorkerID, expiry: &ExpiryGroup) -> Result<FilterID> {
+        todo!()
     }
 
 }

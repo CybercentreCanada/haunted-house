@@ -81,3 +81,9 @@ pub struct FileInfo {
     pub access: AccessControl,
     pub expiry: ExpiryGroup
 }
+
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Copy)]
+pub struct FilterID(u128);
+
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
+pub struct WorkerID(String);

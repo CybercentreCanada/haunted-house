@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context};
-use poem::{handler, Route, get, EndpointExt, Server, delete};
+use poem::{handler, Route, get, EndpointExt, Server, delete, post};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
 use poem::web::{Data, Json};
 use serde::{Serialize, Deserialize};
@@ -13,10 +13,10 @@ use crate::access::AccessControl;
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
 use crate::query::Query;
-use crate::types::{Sha256, ExpiryGroup, FileInfo};
+use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID};
 use crate::worker::YaraTask;
 
-use super::manager::WorkerState;
+use super::manager::{WorkerState};
 
 // use crate::config::TLSConfig;
 // use crate::interface::LoggerMiddleware;
@@ -25,8 +25,15 @@ use super::manager::WorkerState;
 
 // type Connection = mpsc::UnboundedSender<WorkerMessage>;
 
+#[derive(Serialize, Deserialize)]
+pub struct CreateIndexRequest {
+    filter_id: FilterID,
+    expiry: ExpiryGroup
+}
+
+
 #[handler]
-fn create_index() -> poem::Result<()> {
+fn create_index(state: Data<&Arc<WorkerState>>, request: Json<CreateIndexRequest>) -> poem::Result<()> {
     todo!();
 }
 
@@ -114,7 +121,12 @@ pub struct UpdateFileInfoRequest {
 #[derive(Serialize, Deserialize)]
 pub struct UpdateFileInfoResponse {
     pub proccessed: Vec<Sha256>,
-    pub in_progress: Vec<Sha256>,
+    pub in_progress: HashMap<Sha256, FilterID>,
+    pub assignments: HashMap<Sha256, Vec<FilterID>>,
+    pub free_bytes: u64,
+    pub storage_pressure: bool,
+    pub filter_sizes: HashMap<FilterID, u64>,
+    pub filter_pending: HashMap<FilterID, u64>,
 }
 
 #[handler]
@@ -122,8 +134,19 @@ fn update_file_info(state: Data<&Arc<WorkerState>>, request: Json<UpdateFileInfo
     todo!();
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct IngestFilesRequest {
+    files: Vec<(FilterID, FileInfo)>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct IngestFilesResponse {
+    pub completed: Vec<Sha256>,
+    pub unknown_filters: Vec<FilterID>
+}
+
 #[handler]
-fn ingest_file() -> poem::Result<()> {
+fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesRequest>) -> Json<IngestFilesResponse> {
     todo!();
 }
 
@@ -154,8 +177,8 @@ pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<
         .at("/index/:id", delete(delete_index))
         .at("/search/filter", get(run_filter_search))
         .at("/search/yara", get(run_yara_search))
-        .at("/file/update", post(update_file_info))
-        .at("/file/ingest", get(ingest_file))
+        .at("/files/update", post(update_file_info))
+        .at("/files/ingest", post(ingest_files))
         .at("/status/online", get(get_status))
         .at("/status/detailed", get(get_detailed_status))
         .data(state)

@@ -31,8 +31,6 @@ use super::YaraTask;
 
 // use super::StatusReport;
 
-pub type FilterID = uuid::Uuid;
-
 pub struct WorkerState {
     database: super::database::Database
 }
