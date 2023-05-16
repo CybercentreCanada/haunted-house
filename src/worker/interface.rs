@@ -113,8 +113,8 @@ pub struct UpdateFileInfoRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct UpdateFileInfoResponse {
-    proccessed: Vec<Sha256>,
-    in_progress: Vec<Sha256>
+    pub proccessed: Vec<Sha256>,
+    pub in_progress: Vec<Sha256>,
 }
 
 #[handler]

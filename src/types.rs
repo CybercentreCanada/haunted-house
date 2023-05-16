@@ -7,7 +7,7 @@ use crate::access::AccessControl;
 
 
 /// A binary representation of a 256 bit hash. Heap allocated.
-#[derive(SerializeDisplay, DeserializeFromStr, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(SerializeDisplay, DeserializeFromStr, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub struct Sha256(Box<[u8; 32]>);
 
 impl Sha256 {
@@ -77,7 +77,7 @@ impl std::fmt::Display for ExpiryGroup {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileInfo {
-    hash: Sha256,
-    access: AccessControl,
-    expiry: ExpiryGroup
+    pub hash: Sha256,
+    pub access: AccessControl,
+    pub expiry: ExpiryGroup
 }

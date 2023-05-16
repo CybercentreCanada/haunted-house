@@ -3,7 +3,7 @@ mod auth;
 mod database;
 mod database_sqlite;
 
-use std::collections::{HashSet, VecDeque, HashMap};
+use std::collections::{HashSet, VecDeque, HashMap, hash_map};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::access::AccessControl;
 use crate::types::{Sha256, ExpiryGroup, FileInfo};
-use crate::worker::interface::UpdateFileInfoRequest;
+use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse};
 
 use self::auth::Authenticator;
 use self::database::Database;
@@ -34,7 +34,8 @@ pub struct HouseCore {
     pub authenticator: Authenticator,
 //     pub config: CoreConfig,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
-    pub running_searches: RwLock<HashSet<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>
+    pub worker_ingest: RwLock<HashMap<String, (JoinHandle<()>, mpsc::UnboundedSender<WorkerIngestMessage>)>>,
+    pub running_searches: RwLock<HashMap<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>
 //     garbage_collection_notification: tokio::sync::Notify,
 }
 
@@ -71,7 +72,7 @@ impl HouseCore {
         return Ok(core)
     }
 
-    pub async fn initialize_search(self: Arc<Self>, req: SearchRequest) -> Result<InternalSearchStatus> {
+    pub async fn initialize_search(self: &Arc<Self>, req: SearchRequest) -> Result<InternalSearchStatus> {
         // Create a record for the search
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
         let res = self.database.initialize_search(&code, &req).await?;
@@ -84,7 +85,7 @@ impl HouseCore {
         return Ok(res)
     }
 
-    pub async fn get_workers(self: Arc<Self>) -> Vec<String> {
+    pub async fn get_workers(self: &Arc<Self>) -> Vec<String> {
         todo!();
     }
 }
@@ -97,8 +98,16 @@ pub struct IngestStatus {
 
 #[derive(Debug)]
 struct IngestTask {
-    info: FileInfo,
-    response: Vec<oneshot::Sender<Result<()>>>
+    pub info: FileInfo,
+    pub response: Vec<oneshot::Sender<Result<()>>>
+}
+
+impl IngestTask {
+    pub fn merge(&mut self, task: IngestTask) {
+        self.info.expiry = self.info.expiry.max(task.info.expiry);
+        self.info.access = self.info.access.or(&task.info.access).simplify();
+        self.response.extend(task.response.into_iter());
+    }
 }
 
 #[derive(Debug)]
@@ -106,6 +115,14 @@ pub enum IngestMessage {
     IngestMessage(IngestTask),
     Status(oneshot::Sender<IngestStatus>)
 }
+
+#[derive(Debug)]
+pub enum WorkerIngestMessage {
+    IngestMessage(IngestTask),
+    Status(oneshot::Sender<IngestStatus>)
+}
+
+
 
 async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<IngestMessage>) {
     loop {
@@ -127,9 +144,9 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
         // Restart the check worker
         if check_worker.is_none() && !unchecked_buffer.is_empty() {
             let core = core.clone();
-            let tasks = unchecked_buffer;
+            // let tasks = ;
+            check_worker = Some(tokio::spawn(_ingest_check(core, unchecked_buffer)));
             unchecked_buffer = Default::default();
-            check_worker = Some(tokio::spawn(_ingest_check(core, tasks)));
         }
 
         //
@@ -143,7 +160,10 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
                 match message {
                     IngestMessage::IngestMessage(task) => {
-                        unchecked_buffer.push_back(task);
+                        match unchecked_buffer.entry(task.info.hash) {
+                            hash_map::Entry::Occupied(entry) => { entry.get_mut().merge(task); },
+                            hash_map::Entry::Vacant(entry) => { entry.insert(task); },
+                        };
                     },
                     IngestMessage::Status(_) => todo!(),
                 }
@@ -153,7 +173,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
             res = check_worker.unwrap(), if check_worker.is_some() => {
                 check_worker = None;
                 match res {
-                    Ok(Ok(outstanding)) => checked_buffer.extend(outstanding.into_iter()),
+                    Ok(Ok(())) => {},
                     Ok(Err(err)) => {
                         error!("ingest checker error: {err}");
                     }
@@ -164,25 +184,62 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
             }
         }
     }
+    return Ok(())
 }
 
-async fn _ingest_check(core: Arc<HouseCore>, tasks: HashMap<Sha256, IngestTask>) -> Result<()> {
+async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTask>) -> Result<()> {
     // Turn the update tasks into a format for the worker
     let files: Vec<FileInfo> = tasks.values().map(|f|f.info.clone()).collect();
     let payload = UpdateFileInfoRequest {files};
-    // let payload = serde_json::to_string(&payload)?;
+    let payload = serde_json::to_string(&payload)?;
 
     // Send off the update requests
-    let client = core.open_client();
-    // let requests = tokio::task::JoinSet::new();
+    let mut requests = tokio::task::JoinSet::new();
     for worker in core.get_workers().await {
-        // let request = core.client.post(worker + "/file/update")
-        //     .json(&payload);
-        // requests.spawn(request.send());
+        let core = core.clone();
+        let payload = payload.clone();
+        requests.spawn(async move {
+            // Ask the worker to update information for this batch of files
+            let resp = core.client.post(worker + "/file/update")
+            .header("Content-Type", "application/json")
+            .body(payload)
+            .send().await?;
+
+            // Decode the result
+            let resp: UpdateFileInfoResponse = resp.json().await?;
+            anyhow::Ok(resp)
+        });
     }
 
-    // Collect unsatisfied tasks
-    todo!()
+    // Collect tasks that could be processed fully already
+    while let Some(res) = requests.join_next().await {
+        let res = match res {
+            Ok(Ok(data)) => data,
+            Ok(Err(err)) => {
+                error!("{err}");
+                continue
+            }
+            Err(err) => {
+                error!("{err}");
+                continue
+            },
+        };
+
+        for sha in res.proccessed {
+            if let Some(task) = tasks.remove(&sha) {
+                for response in task.response {
+                    response.send(Ok(()));
+                }
+            }
+        }
+    }
+
+    // Forward the remaining tasks for ingestion
+    let workers = core.worker_ingest.write().await;
+    for (_, task) in tasks {
+        workers.entry(key)
+    }
+    Ok(())
 }
 
 
