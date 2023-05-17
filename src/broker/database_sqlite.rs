@@ -13,6 +13,7 @@ use crate::core::{SearchCache, CoreConfig};
 use crate::database::{IndexGroup, BlobID, IndexID};
 use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
 use crate::query::Query;
+use crate::types::ExpiryGroup;
 
 impl<'r> Decode<'r, sqlx::Sqlite> for IndexGroup {
     fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
@@ -88,9 +89,8 @@ fn filter_table_name(name: &IndexID) -> String {
     format!("filter_{name}")
 }
 
-
 #[derive(Serialize, Deserialize)]
-struct SearchRecord {
+pub struct SearchRecord {
     code: String,
     group: String,
     yara_signature: String,
@@ -98,10 +98,10 @@ struct SearchRecord {
     view: AccessControl,
     access: HashSet<String>,
     errors: Vec<String>,
-    initial_indices: u64,
-    // pending_indices: Vec<BlobID>,
-    // pending_files: BTreeSet<Vec<u8>>,
+    pub start_date: ExpiryGroup,
+    pub end_date: ExpiryGroup,
     hit_files: BTreeSet<Vec<u8>>,
+    pub finished: bool,
     truncated: bool,
 }
 
@@ -166,6 +166,7 @@ impl SQLiteInterface {
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
             data BLOB NOT NULL,
+            finished BOOLEAN NOT NULL,
             search_group TEXT,
             start_time TEXT
         )")).execute(&mut con).await.context("error creating table searches")?;

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::AccessControl;
 use crate::types::{ExpiryGroup, FilterID, WorkerID};
 
-use super::database_sqlite::SQLiteInterface;
+use super::database_sqlite::{SQLiteInterface, SearchRecord};
 use super::interface::{SearchRequest, InternalSearchStatus};
 
 
@@ -36,7 +36,13 @@ impl Database {
         }
     }
 
-    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
+    pub async fn search_record(&self, code: &str) -> Result<Option<SearchRecord>> {
+        match self {
+            Database::SQLite(local) => local.search_status(code).await
+        }
+    }
+
+    pub async fn search_status(&self, code: &str) -> Result<Option<InternalSearchStatus>> {
         match self {
             Database::SQLite(local) => local.search_status(code).await
         }

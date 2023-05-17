@@ -14,7 +14,7 @@ use reqwest_retry::policies::ExponentialBackoff;
 use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use anyhow::Result;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, CreateIndexRequest, IngestFilesRequest, IngestFilesResponse};
@@ -80,8 +80,8 @@ impl HouseCore {
         // Launch worker inget watchers.
         for (worker, address) in core.config.workers.iter() {
             let (send, recv) = mpsc::unbounded_channel();
-            let handle = tokio::task::spawn(ingest_watcher(core.clone(), recv, code.clone()));
-            core.worker_ingest.insert(worker, send);
+            let handle = tokio::task::spawn(ingest_watcher(core.clone(), recv, worker.clone(), address.clone()));
+            core.worker_ingest.insert(worker.clone(), send);
         }
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
@@ -401,12 +401,12 @@ async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver
 
 async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: &WorkerID, address: &String) -> Result<()> {
     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
-    let query: Option<JoinHandle<Result<reqwest::Response>>> = None;
+    let mut query: Option<JoinHandle<Result<reqwest::Response>>> = None;
 
     loop {
         //
         if query.is_none() && !active.is_empty() {
-            let request = core.client.post(address + "/files/ingest")
+            let request = core.client.post(address.clone() + "/files/ingest")
             .json(&IngestFilesRequest{
                 files: active.values().map(|(filter, task)|{
                     (*filter, task.info.clone())
@@ -429,13 +429,22 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
 
                 match message {
                     WorkerIngestMessage::IngestMessage((task, filter)) => {
-                        active.push((filter, task))
+                        match active.entry(task.info.hash.clone()) {
+                            hash_map::Entry::Occupied(mut entry) => {
+                                let (old_filter, old_task) = entry.get_mut();
+                                if old_task.info.expiry < task.info.expiry {
+                                    *old_filter = filter;
+                                } 
+                                old_task.merge(task);
+                            },
+                            hash_map::Entry::Vacant(entry) => { entry.insert((filter, task)); },
+                        }
                     },
                     WorkerIngestMessage::Status(_) => todo!(),
                 }
             },
 
-            response = query.unwrap(), if query.is_some() => {
+            response = query.as_mut().unwrap(), if query.is_some() => {
                 query = None;
                 let response: IngestFilesResponse = match response {
                     Ok(Ok(resp)) => resp.json().await?,
@@ -451,7 +460,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
 
                 // Pull out the tasks that have been finished
                 for hash in response.completed {
-                    if let Some((_, task)) = active.get(&hash) {
+                    if let Some((_, task)) = active.remove(&hash) {
                         for response in task.response {
                             response.send(Ok(()));
                         }
@@ -481,10 +490,23 @@ async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherM
 
 async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<SearcherMessage>, code: &str) -> Result<()> {
     // Load the search status
-    todo!();
+    let status = match core.database.search_record(code).await? {
+        Some(status) => status,
+        None => return Ok(()),
+    };
+    if status.finished {
+        return Ok(())
+    }
 
-    // Process the search
-    loop {
+    // Run through filters
+    let mut requests: JoinSet<Result<reqwest::Response>> = JoinSet::new();
+    for (worker, address) in &core.config.workers {
+        requests.spawn(async move {
+            
+        })
+    }
+
+    while !requests.is_empty() {
         tokio::select!{
             message = input.recv() => {
                 // Read an update command
@@ -493,18 +515,38 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     None => break
                 };
 
-                match message {
-                    SearcherMessage::Status(status) => {
-
-
-
-                        status.send(InternalSearchStatus {
-                            view: ,
-                            resp:
-                        })
+                todo!();
+                // match message {                    
+                //     // SearcherMessage::Status(status) => {
+                //     //     status.send(InternalSearchStatus {
+                //     //         view: ,
+                //     //         resp:
+                //     //     })
+                //     // },
+                // }
+            },
+            response = requests.join_next() => {
+                let response: IngestFilesResponse = match response {
+                    Ok(Ok(resp)) => resp.json().await?,
+                    Ok(Err(err)) => {
+                        error!("Ingest error: {err}");
+                        continue;
                     },
-                }
+                    Err(err) => {
+                        error!("Ingest error: {err}");
+                        continue;
+                    },
+                };
+                todo!();
             }
         }
     }
+
+    // Run through yara jobs
+    todo!();
+
+
+    // Save results
+    todo!()
+
 }
