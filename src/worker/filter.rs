@@ -1,10 +1,17 @@
 use bitvec::vec::BitVec;
 use anyhow::{Result, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use itertools::Itertools;
 use serde::{Serialize, Deserialize};
+use std::collections::{HashMap, BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
+
+use crate::query::Query;
+use crate::types::FilterID;
 
 use super::encoding::{cost_to_add, encode_into, decode_into};
 
@@ -15,7 +22,103 @@ const POINTER_SIZE: u64 = 4;
 const TRIGRAM_RANGE: u64 = 1 << 24;
 
 
-struct ExtensibleTrigramFile {
+struct TrigramCursor<'a> {
+    host: &'a ExtensibleTrigramFile,
+    current: Vec<u64>,
+    offset: usize,
+    next: Option<u32>
+}
+
+impl<'a> TrigramCursor<'a> {
+    pub fn new(host: &'a ExtensibleTrigramFile, trigram: u32) -> Result<Self> {
+        let mut buffer = vec![];
+        let segment = host.read_initial_segment(trigram)?;
+        let next = segment.extension();
+        segment.decode_into(&mut buffer);
+
+        Ok(Self {
+            host,
+            current: buffer,
+            offset: 0,
+            next
+        })
+    }
+}
+
+impl<'a> Iterator for TrigramCursor<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset < self.current.len() {
+            self.offset += 1;
+            return Some(self.current[self.offset-1])
+        }
+
+        match self.next {
+            Some(address) => {
+                let segment = match self.host.read_extended_segment(address) {
+                    Ok(segment) => segment,
+                    Err(_) => return None
+                };
+
+                self.current.clear();
+                segment.decode_into(&mut self.current);
+                self.next = segment.extension();
+                self.offset = 1;
+                match self.current.get(0) {
+                    Some(val) => Some(*val),
+                    None => None,
+                }
+            },
+            None => None,
+        }
+    }
+}
+
+fn into_trigrams(bytes: &Vec<u8>) -> Vec<u32> {
+    if bytes.len() < 3 {
+        return vec![];
+    }
+    let mut trigrams = vec![];
+    let mut trigram: u32 = (bytes[0] as u32) << 8 | (bytes[1] as u32);
+
+    for index in 2.. {
+        trigram = (trigram & 0x00FFFF) << 8 | (bytes[index] as u32);
+        trigrams.push(trigram);
+    }
+
+    return trigrams;
+}
+
+fn union(base: &mut Vec<u64>, other: &Vec<u64>) {
+    base.extend(other);
+    base.sort_unstable();
+    base.dedup();
+}
+
+fn intersection(base: &mut Vec<u64>, other: &Vec<u64>) {
+
+    let mut base_read_index = 0;
+    let mut base_write_index = 0;
+    let mut other_index = 0;
+
+    while base_read_index < base.len() && other_index < other.len() {
+        match base[base_read_index].cmp(&other[other_index]) {
+            std::cmp::Ordering::Less => { base_read_index += 1},
+            std::cmp::Ordering::Equal => {
+                base[base_write_index] = base[base_read_index];
+                base_write_index += 1;
+                base_read_index += 1;
+                other_index += 1;
+            },
+            std::cmp::Ordering::Greater => {other_index += 1},
+        }
+    }
+
+    base.truncate(base_write_index);
+}
+
+pub struct ExtensibleTrigramFile {
     initial_segment_size: u32,
     extended_segment_size: u32,
     data_location: PathBuf,
@@ -36,7 +139,7 @@ struct ExtensibleTrigramFile {
 // }
 
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 enum SegmentAddress {
     Trigram(u32),
     Segment(u32),
@@ -84,7 +187,6 @@ impl<'a> RawSegmentInfo<'a> {
         }
     }
 }
-
 
 impl ExtensibleTrigramFile {
 
@@ -149,8 +251,7 @@ impl ExtensibleTrigramFile {
         return Ok(filter);
     }
 
-    // #[instrument]
-    pub fn read_trigram(&mut self, trigram: u32) -> Result<Vec<u64>> {
+    pub fn read_trigram(&self, trigram: u32) -> Result<Vec<u64>> {
         let mut output = vec![];
         let mut segment = self.read_initial_segment(trigram).context("reading initial segment")?;
         segment.decode_into(&mut output);
@@ -159,6 +260,103 @@ impl ExtensibleTrigramFile {
             segment.decode_into(&mut output);
         }
         return Ok(output);
+    }
+
+    pub fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
+        // Handle corner cases
+        if trigrams.len() == 0 {
+            return Ok(vec![])
+        }
+        if trigrams.len() == 1 {
+            return self.read_trigram(trigrams[0])
+        }
+
+        let mut output = vec![];
+        let mut sources = vec![];
+        for trigram in trigrams {
+            sources.push(TrigramCursor::new(self, trigram)?.peekable());
+        }
+
+        let mut candidate = match sources[0].peek() {
+            Some(item) => *item,
+            None => return Ok(vec![]),
+        };
+
+        'next_candidate: loop {
+            'next_cursor: for cursor in &sources {
+                loop {
+                    let next = match cursor.peek() {
+                        Some(next) => *next,
+                        None => break 'next_candidate,
+                    };
+
+                    match next.cmp(&candidate) {
+                        std::cmp::Ordering::Less => { cursor.next(); continue },
+                        std::cmp::Ordering::Equal => { continue 'next_cursor },
+                        std::cmp::Ordering::Greater => { candidate = next; continue 'next_candidate },
+                    }
+                }
+            }
+
+            output.push(candidate);
+            candidate += 1;
+        }
+        return Ok(output)
+    }
+
+    pub fn query(&self, query: &Query) -> Result<Vec<u64>> {
+        let mut cache = Default::default();
+        self._query(query, &mut cache)
+    }
+
+    pub fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {
+        match query {
+            Query::And(items) => {
+                let mut base = self._query(&items[0], cache)?;
+                for item in &items[1..] {
+                    intersection(&mut base, &self._query(item, cache)?);
+                    if base.is_empty() {
+                        break
+                    }
+                }
+                Ok(base)
+            },
+            Query::Or(items) => {
+                let mut base = vec![];
+                for item in items {
+                    union(&mut base, &self._query(item, cache)?);
+                }
+                Ok(base)
+            },
+            Query::Literal(values) => {
+                match cache.entry(values.clone()) {
+                    Entry::Occupied(entry) => Ok(entry.get().clone()),
+                    Entry::Vacant(entry) => {
+                        let hits = self.read_trigrams(into_trigrams(values))?;
+                        entry.insert(hits.clone());
+                        Ok(hits)
+                    },
+                }
+            },
+            Query::MinOf(count, items) => {
+                let mut hits = HashMap::<u64, u32>::new();
+                for item in items {
+                    for file in self._query(item, cache)? {
+                        match hits.entry(file) {
+                            Entry::Occupied(mut entry) => { *entry.get_mut() += 1; },
+                            Entry::Vacant(entry) => { entry.insert(1); },
+                        }
+                    }
+                }
+                Ok(hits.into_iter().filter_map(|(file, hits)|{
+                    if hits >= *count as u32 {
+                        Some(file)
+                    } else {
+                        None
+                    }
+                }).collect_vec())
+            },
+        }
     }
 
     fn get_segment_offset(&self, address: SegmentAddress) -> u64 {
@@ -179,11 +377,6 @@ impl ExtensibleTrigramFile {
     // #[instrument]
     fn read_initial_segment(&mut self, trigram: u32) -> Result<RawSegmentInfo> {
         let location = self.get_initial_segment_offset(trigram) as usize;
-        // self.data.seek(SeekFrom::Start(location))?;
-        // let mut data = vec![0; self.initial_segment_size as usize];
-        // self.data.read_exact(&mut data)?;
-        // let data = self.data[location..location+self.initial_segment_size as usize].to_vec();
-        // return Ok(RawSegmentInfo::new(data))
         let data = &self.data[location..location+self.initial_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
@@ -191,19 +384,15 @@ impl ExtensibleTrigramFile {
     // #[instrument]
     fn read_extended_segment(&mut self, segment: u32) -> Result<RawSegmentInfo> {
         let location = self.get_extended_segment_offset(segment) as usize;
-        // self.data.seek(SeekFrom::Start(location))?;
-        // let mut data = vec![0; self.extended_segment_size as usize];
-        // self.data.read_exact(&mut data)?;
-        // let data = self.data[location..location+self.extended_segment_size as usize].to_vec();
-        // return Ok(RawSegmentInfo::new(data))
         let data = &self.data[location..location+self.extended_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
     // #[instrument]
-    pub fn write_batch(&mut self, files: &mut [(u64, BitVec)]) -> Result<()> {
+    pub fn write_batch(&mut self, files: &mut [(u64, BitVec)]) -> Result<HashSet<u64>> {
         // prepare the buffer for operations
         let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
+        let mut skipped = HashSet::<u64>::new();
 
         // Leave room for the end offset at the start
         let mut writer = std::io::BufWriter::new(write_buffer);
@@ -228,11 +417,14 @@ impl ExtensibleTrigramFile {
 
         // track how many segments are added in this batch
         let mut added_segments = 0u32;
-        for trigram in 0u32..TRIGRAM_RANGE as u32 {
+        'trigrams: for trigram in 0u32..TRIGRAM_RANGE as u32 {
             let stamp = std::time::Instant::now();
             // Invert batch into REVERSED index lists
             file_ids.clear();
             for (id, grams) in files.iter() {
+                if skipped.contains(id) {
+                    continue
+                }
                 if *grams.get(trigram as usize).unwrap() {
                     file_ids.push(*id);
                 }
@@ -252,15 +444,50 @@ impl ExtensibleTrigramFile {
             seg_read_time += seg_stamp.elapsed().as_secs_f64();
             while let Some(extension) = active_segment.extension() {
                 let seg_stamp = std::time::Instant::now();
+                content.clear();
+                active_segment.decode_into(&mut content);
+                if let Some(&peak) = content.last() {
+                    loop {
+                        let next = match file_ids.last() {
+                            Some(next) => *next,
+                            None => continue 'trigrams,
+                        };
+
+                        if peak < next {
+                            break
+                        } else {
+                            file_ids.pop();
+                            skipped.insert(next);
+                        }
+                    }
+                }
+
                 active_segment = self.read_extended_segment(extension)?;
                 seg_read_time += seg_stamp.elapsed().as_secs_f64();
                 address = SegmentAddress::Segment(extension);
             }
 
-            // Pack as many numbers into that segment as we can
-            let mut changed = false;
+            // Load the existing segment content
             content.clear();
             let mut encoded_size = active_segment.decode_into(&mut content);
+            if let Some(&peak) = content.last() {
+                loop {
+                    let next = match file_ids.last() {
+                        Some(next) => *next,
+                        None => continue 'trigrams,
+                    };
+
+                    if peak < next {
+                        break
+                    } else {
+                        file_ids.pop();
+                        skipped.insert(next);
+                    }
+                }
+            }
+
+            // pack in as many more values as we can
+            let mut changed = false;
             let limit = active_segment.payload_bytes();
             while let Some(index) = file_ids.pop() {
                 let new_size = encoded_size + cost_to_add(&content, index);
@@ -342,7 +569,7 @@ impl ExtensibleTrigramFile {
         // Apply operation set
         self.apply_operations(write_buffer, self.extended_segments + added_segments).context("apply operations")?;
         println!("Operation file applied {:.2}", stamp.elapsed().as_secs_f64());
-        return Ok(())
+        return Ok(skipped)
     }
 
     fn check_and_apply_operations(&mut self, mut buffer: File) -> Result<()> {
@@ -593,6 +820,11 @@ mod test {
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
         Ok(())
+    }
+
+    #[test]
+    fn duplicate_batch() -> Result<()> {
+        todo!()
     }
 
     #[test]

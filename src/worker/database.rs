@@ -75,7 +75,7 @@ impl Database {
         }
     }
 
-    pub async fn select_file_hashes(&self, id: FilterID, file_indices: &Vec<i64>, access: &HashSet<String>) -> Result<Vec<Sha256>> {
+    pub async fn select_file_hashes(&self, id: FilterID, file_indices: &Vec<u64>, access: &HashSet<String>) -> Result<Vec<Sha256>> {
         match self {
             Database::SQLite(db) => db.select_file_hashes(id, file_indices, access).await,
         }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::error::ErrorKinds;
@@ -20,41 +20,49 @@ use super::filter_worker::FilterWorker;
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse};
 
 
-#[derive(Serialize, Deserialize)]
-struct WorkerConfig {
-    filter_item_limit: u64,
-    data_path: PathBuf,
-    data_limit: u64,
-    data_reserve: u64
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WorkerConfig {
+    pub filter_item_limit: u64,
+    pub data_path: PathBuf,
+    pub data_limit: u64,
+    pub data_reserve: u64,
+    pub initial_segment_size: u32,
+    pub extended_segment_size: u32,
 }
 
 pub struct WorkerState {
-    database: Database,
-    filters: tokio::sync::RwLock<HashMap<FilterID, FilterWorker>>,
-    file_cache: BlobCache,
-    config: WorkerConfig
+    pub database: Arc<Database>,
+    pub running: watch::Receiver<bool>,
+    pub filters: tokio::sync::RwLock<HashMap<FilterID, FilterWorker>>,
+    pub file_cache: BlobCache,
+    pub config: WorkerConfig
 }
 
 impl WorkerState {
 
-    pub async fn new(database: Database, file_cache: BlobCache, config: WorkerConfig) -> Result<Self> {
-        // Start workers for every filter
-        let mut filters: HashMap<FilterID, FilterWorker> = Default::default();
-        for id in database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
-            filters.insert(id, FilterWorker::open(&config.data_path, id)?);
-        }
-
-        Ok(Self {
+    pub async fn new(database: Arc<Database>, file_cache: BlobCache, config: WorkerConfig, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
+        let new = Arc::new(Self {
             database,
-            filters: tokio::sync::RwLock::new(filters),
+            running,
+            filters: tokio::sync::RwLock::new(Default::default()),
             file_cache,
             config,
-        })
+        });
+
+        // Start workers for every filter
+        {
+            let mut filters = new.filters.write().await;
+            for id in new.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+                filters.insert(id, FilterWorker::open(Arc::<WorkerState>::downgrade(&new), id)?);
+            }
+        }
+
+        Ok(new)
     }
 
-    pub async fn create_index(&self, id: FilterID, expiry: ExpiryGroup) -> Result<()> {
+    pub async fn create_index(self: &Arc<Self>, id: FilterID, expiry: ExpiryGroup) -> Result<()> {
         self.database.create_filter(id, &expiry).await?;
-        let worker = FilterWorker::new(&self.config.data_path, id)?;
+        let worker = FilterWorker::open(Arc::<WorkerState>::downgrade(self), id)?;
         let mut filters = self.filters.write().await;
         filters.insert(id, worker);
         return Ok(())

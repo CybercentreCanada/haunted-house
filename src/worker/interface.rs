@@ -164,6 +164,7 @@ async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesR
             }
         }
     }
+    state.notify(filters).await;
     return Json(IngestFilesResponse { completed, unknown_filters })
 }
 

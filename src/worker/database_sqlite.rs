@@ -216,12 +216,12 @@ impl SQLiteInterface {
     }
 
 
-    pub async fn select_file_hashes(&self, id: FilterID, indices: &Vec<i64>, view: &HashSet<String>) -> Result<Vec<Sha256>> {
+    pub async fn select_file_hashes(&self, id: FilterID, indices: &Vec<u64>, view: &HashSet<String>) -> Result<Vec<Sha256>> {
         let mut selected: Vec<Sha256> = vec![];
         let mut conn = self.db.acquire().await?;
         for file_id in indices {
             let row: Option<(String, Vec<u8>)> = sqlx::query_as(&format!("SELECT access, hash FROM filter_{id} WHERE number = ?"))
-                .bind(file_id).fetch_optional(&mut conn).await?;
+                .bind(*file_id as i64).fetch_optional(&mut conn).await?;
             if let Some((access, hash)) = row {
                 let access = AccessControl::from_str(&access)?;
                 if access.can_access(&view) {

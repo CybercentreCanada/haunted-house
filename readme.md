@@ -16,5 +16,5 @@
 - Finish encoded_size calculation
 - more efficent way to monitor search progress
 - add tracing
-- task retry
 - use more single value structs for better build time error detection
+- join query and of literals into block ands
