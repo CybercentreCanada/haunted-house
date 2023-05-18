@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
 use std::path::{Path, PathBuf};
 
-use crate::encoding::{cost_to_add, encode_into};
+use super::encoding::{cost_to_add, encode_into, decode_into};
 
 
 const HEADER_SIZE: u64 = 4 + 4 + 4 + 4;
@@ -71,7 +71,7 @@ impl<'a> RawSegmentInfo<'a> {
     }
 
     fn decode_into(&self, buffer: &mut Vec<u64>) -> u32 {
-        crate::encoding::decode_into(&self.data[0..self.data.len() - POINTER_SIZE as usize], buffer)
+        decode_into(&self.data[0..self.data.len() - POINTER_SIZE as usize], buffer)
     }
 
     fn extension(&self) -> Option<u32> {
@@ -445,7 +445,7 @@ mod test {
     use itertools::Itertools;
     use rand::{Rng, SeedableRng};
 
-    use crate::filter_file::ExtensibleTrigramFile;
+    use crate::worker::filter::ExtensibleTrigramFile;
 
     use super::TRIGRAM_RANGE;
 

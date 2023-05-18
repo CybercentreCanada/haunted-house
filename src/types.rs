@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 use serde_with::{SerializeDisplay, DeserializeFromStr};
 
 use crate::access::AccessControl;
+use crate::error::ErrorKinds;
 
 
 /// A binary representation of a 256 bit hash. Heap allocated.
@@ -13,6 +14,21 @@ pub struct Sha256(Box<[u8; 32]>);
 impl Sha256 {
     pub fn hex(&self) -> String {
         hex::encode(*self.0)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+
+impl TryFrom<&[u8]> for Sha256 {
+    type Error = ErrorKinds;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Ok(Self(match value.try_into(){
+            Ok(val) => Box::new(val),
+            Err(_) => return Err(ErrorKinds::Sha256Corrupt),
+        }))
     }
 }
 
@@ -32,6 +48,9 @@ impl std::str::FromStr for Sha256 {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 64 {
+            return Err(anyhow::anyhow!("Invalid hash: wrong number of bytes"));   
+        }
         let bytes = Box::new([0u8; 32]);
         hex::decode_to_slice(s, &mut *bytes)?;
         Ok(Self(bytes))
@@ -83,7 +102,29 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Copy)]
-pub struct FilterID(u128);
+pub struct FilterID(i64);
+
+impl std::fmt::Display for FilterID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(self.0.to_le_bytes()))
+    }
+}
+
+impl std::str::FromStr for FilterID {
+    type Err = ErrorKinds;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 16 {
+            return Err(Self::Err::CorruptFilterID);   
+        }
+        let mut bytes = [0u8; 8];
+        if let Err(_) = hex::decode_to_slice(s, &mut bytes) {
+            return Err(Self::Err::CorruptFilterID);
+        }
+        Ok(Self(i64::from_le_bytes(bytes)))
+    }
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
 pub struct WorkerID(String);

@@ -116,9 +116,8 @@ pub fn decode_into(data: &[u8], values: &mut Vec<u64>) -> u32 {
 #[cfg(test)]
 mod test {
     use rand::{thread_rng, Rng};
-    use crate::encoding::encoded_number_size;
 
-    use super::{decode, encode};
+    use super::{decode, encode, encoded_number_size};
 
     #[test]
     fn round_trip() {

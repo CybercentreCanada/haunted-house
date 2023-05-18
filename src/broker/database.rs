@@ -1,10 +1,12 @@
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::types::{ExpiryGroup, FilterID, WorkerID};
+use crate::types::{ExpiryGroup, FilterID, WorkerID, Sha256};
 
 use super::database_sqlite::{SQLiteInterface, SearchRecord};
 use super::interface::{SearchRequest, InternalSearchStatus};
@@ -36,9 +38,15 @@ impl Database {
         }
     }
 
+    pub async fn finalize_search(&self, code: &str, hits: &HashSet<Sha256>, truncated: bool) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.finalize_search(code, hits, truncated).await
+        }
+    }
+
     pub async fn search_record(&self, code: &str) -> Result<Option<SearchRecord>> {
         match self {
-            Database::SQLite(local) => local.search_status(code).await
+            Database::SQLite(local) => local.search_record(code).await
         }
     }
 

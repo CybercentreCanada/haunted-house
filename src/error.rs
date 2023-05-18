@@ -9,6 +9,10 @@ pub enum ErrorKinds {
     IndexHasUnsupportedType,
     IndexCorruptTable,
     VarintIncomplete,
+    FilterUnknown,
+    CorruptFilterID,
+    DatabaseError,
+    Sha256Corrupt
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -19,4 +23,10 @@ impl std::fmt::Display for ErrorKinds {
 
 impl std::error::Error for ErrorKinds {
 
+}
+
+impl From<sqlx::Error> for ErrorKinds {
+    fn from(value: sqlx::Error) -> Self {
+        Self::DatabaseError
+    }
 }

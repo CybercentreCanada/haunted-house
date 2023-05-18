@@ -1,22 +1,18 @@
-mod auth;
 mod config;
 mod core;
 mod storage;
 mod size_type;
 mod query;
 mod error;
-mod filter;
 mod access;
-mod ursadb;
 mod varint;
 mod types;
 mod logging;
+mod sqlite_set;
 mod broker;
 mod blob_cache;
 mod worker;
 mod worker_watcher;
-mod filter_file;
-mod encoding;
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -28,7 +24,6 @@ use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use log::{info, error};
 use tokio::sync::mpsc;
-use worker::{worker_manager, WorkerData};
 
 use crate::blob_cache::BlobCache;
 use crate::core::HouseCore;

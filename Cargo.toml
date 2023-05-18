@@ -35,6 +35,7 @@ parse_duration = "2"
 
 tempfile = "3"
 rand = "0.8"
+deadpool = "0.9"
 
 log = "*"
 env_logger = "0.9"
@@ -58,6 +59,8 @@ openssl = { version = "0.10" }
 reqwest = { version = "0.11", features = ["json"] }
 reqwest-middleware = "0.2"
 reqwest-retry = "0.2"
+http = "0.2"
+tokio-tungstenite = "0.19"
 
 sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
 

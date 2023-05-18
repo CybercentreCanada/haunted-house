@@ -6,8 +6,10 @@ mod database_sqlite;
 use std::collections::{HashSet, HashMap, hash_map};
 use std::sync::Arc;
 
+use futures::{StreamExt, SinkExt};
 use itertools::Itertools;
 use log::{error, info};
+use rand::{thread_rng, Rng};
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
@@ -15,9 +17,12 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use anyhow::Result;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_tungstenite::tungstenite::Message;
 
+use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
-use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, CreateIndexRequest, IngestFilesRequest, IngestFilesResponse};
+use crate::worker::YaraTask;
+use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, CreateIndexRequest, IngestFilesRequest, IngestFilesResponse, FilterSearchRequest, FilterSearchResponse, YaraSearchResponse};
 
 use self::auth::Authenticator;
 use self::database::Database;
@@ -28,6 +33,9 @@ pub struct CoreConfig {
     pub workers: HashMap<WorkerID, String>,
     pub per_filter_pending_limit: u64,
     pub per_worker_group_duplication: u32,
+    pub search_hit_limit: usize,
+    pub yara_jobs_per_worker: usize,
+    pub yara_batch_size: u32,
 }
 
 pub struct HouseCore {
@@ -39,12 +47,21 @@ pub struct HouseCore {
     pub config: CoreConfig,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     pub worker_ingest: HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>,
-    pub running_searches: RwLock<HashMap<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>
+    pub running_searches: RwLock<HashMap<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>,
+    pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)>,
 }
 
 impl HouseCore {
     pub async fn new(database: Database, authenticator: Authenticator, config: CoreConfig) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
+
+        // setup pool for yara assignments
+        let mut yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)> = Default::default();
+        for _ in 0..(config.yara_jobs_per_worker.max(1)) {
+            for row in config.workers.clone() {
+                yara_permits.add(row);
+            }
+        }
 
         // Stop flag
         // let (quit_trigger, quit_signal) = tokio::sync::watch::channel(false);
@@ -65,6 +82,7 @@ impl HouseCore {
             client,
             worker_ingest: Default::default(),
             running_searches: RwLock::new(Default::default()),
+            yara_permits
             // search_watchers: send_search,
             // garbage_collection_notification: tokio::sync::Notify::new()
         });
@@ -273,7 +291,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         };
 
         // If an ingestion is totally processed by the worker, we can respond to the caller
-        for sha in res.proccessed {
+        for sha in res.processed {
             if let Some(task) = tasks.remove(&sha) {
                 for response in task.response {
                     response.send(Ok(()));
@@ -282,7 +300,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         }
 
         // If the ingestion is in progress we can forward this task to the relivant watcher
-        for (sha, filter) in res.in_progress {
+        for (sha, filter) in res.pending {
             if let Some(task) = tasks.remove(&sha) {
                 core.send_to_ingest_watcher(&worker, task, filter).await?;
             }
@@ -488,6 +506,10 @@ async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherM
     }
 }
 
+fn websocket_address(address: &str) -> String {
+    address.replace("https://", "wss://").replace("http://", "ws://")
+}
+
 async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<SearcherMessage>, code: &str) -> Result<()> {
     // Load the search status
     let status = match core.database.search_record(code).await? {
@@ -498,15 +520,43 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
         return Ok(())
     }
 
-    // Run through filters
-    let mut requests: JoinSet<Result<reqwest::Response>> = JoinSet::new();
+    // Open a connection for each worker
+    let request_body = serde_json::to_string(&FilterSearchRequest{
+        expiry_group_range: (status.start_date.clone(), status.end_date.clone()),
+        query: status.query.clone(),
+        access: status.access.clone(),
+    })?;
+
+    let (client_sender, mut result_stream) = mpsc::channel(128);
     for (worker, address) in &core.config.workers {
-        requests.spawn(async move {
-            
-        })
+        let address = websocket_address(address);
+        let (mut socket, _) = tokio_tungstenite::connect_async(address + "/search/filter").await?;
+        let client_sender = client_sender.clone();
+        let request_body = request_body.clone();
+        tokio::spawn(async move {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await;
+
+            while let Some(message) = socket.next().await {
+                let message: FilterSearchResponse = match message {
+                    Ok(message) => if let Message::Text(text) = message {
+                        match serde_json::from_str(&text) {
+                            Ok(message) => message,
+                            Err(err) => FilterSearchResponse::Error(format!("decode error: {err}")),
+                        }
+                    } else {
+                        continue
+                    },
+                    Err(err) => FilterSearchResponse::Error(format!("message error: {err}")),
+                };
+                client_sender.send(message);
+            }
+        });
     }
 
-    while !requests.is_empty() {
+    // Absorb messages from the workers until we have them all
+    let mut errors = vec![];
+    let candidates = SqliteSet::<Sha256>::new_temp().await?;
+    loop {
         tokio::select!{
             message = input.recv() => {
                 // Read an update command
@@ -525,28 +575,92 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                 //     // },
                 // }
             },
-            response = requests.join_next() => {
-                let response: IngestFilesResponse = match response {
-                    Ok(Ok(resp)) => resp.json().await?,
-                    Ok(Err(err)) => {
-                        error!("Ingest error: {err}");
-                        continue;
-                    },
-                    Err(err) => {
-                        error!("Ingest error: {err}");
-                        continue;
-                    },
+            message = result_stream.recv() => {
+                let message = match message {
+                    Some(message) => message,
+                    None => break,
                 };
-                todo!();
+
+                match message {
+                    FilterSearchResponse::Candidates(hashes) => { candidates.insert_batch(&hashes).await?; },
+                    FilterSearchResponse::Error(error) => { errors.push(error); },
+                }
             }
+            
         }
     }
 
     // Run through yara jobs
-    todo!();
+    let mut hits: HashSet<Sha256> = Default::default();
+    let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
+    let mut next_batch = None;
+    let truncated = loop {
 
+        if next_batch.is_none() {
+            let batch = candidates.pop_batch(core.config.yara_batch_size).await?;
+            if !batch.is_empty() {
+                next_batch = Some(batch)
+            }
+        }
+
+        if next_batch.is_none() && requests.is_empty() {
+            break false;
+        }
+
+        if hits.len() >= core.config.search_hit_limit {
+            break true;
+        }
+
+        tokio::select!{
+            message = input.recv() => {
+                // Read an update command
+                let message = match message {
+                    Some(message) => message,
+                    None => return Ok(())
+                };
+
+                todo!();
+                // match message {                    
+                //     // SearcherMessage::Status(status) => {
+                //     //     status.send(InternalSearchStatus {
+                //     //         view: ,
+                //     //         resp:
+                //     //     })
+                //     // },
+                // }
+            },
+            result = requests.join_next(), if !requests.is_empty() => {
+                let result = match result {
+                    Some(Ok(Ok(message))) => message,
+                    Some(Ok(Err(err))) => { errors.push(err.to_string()); continue }
+                    Some(Err(err)) => { errors.push(err.to_string()); continue }
+                    None => continue,
+                };
+
+                hits.extend(result.hits);
+                errors.extend(result.errors);
+            }
+            permit = core.yara_permits.get(), if next_batch.is_some() => {
+                let id = thread_rng().gen();
+                let yara_rule = status.yara_signature.clone();
+                let core = core.clone();
+                let hashes = next_batch.take().unwrap();
+                requests.spawn(async move {
+                    let permit = permit?;
+                    let response = core.client.get(permit.1.clone() + "/search/yara")
+                    .json(&YaraTask{ 
+                        id, 
+                        yara_rule, 
+                        hashes
+                    }).send().await?;
+                    let result: YaraSearchResponse = response.json().await?;
+                    return anyhow::Ok(result);
+                });
+            }
+        }
+    };
 
     // Save results
-    todo!()
-
+    core.database.finalize_search(&status.code, &hits, truncated).await?;
+    return Ok(())
 }

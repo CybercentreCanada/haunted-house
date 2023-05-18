@@ -1,73 +1,37 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, HashMap};
 use std::path::{Path};
+use std::str::FromStr;
 
 use anyhow::{Result, Context};
 use futures::{TryStreamExt};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
+use sqlx::{SqlitePool, query_as, Decode, Acquire, Row, query};
 use sqlx::pool::{PoolOptions, PoolConnection};
 
 use crate::access::AccessControl;
-use crate::core::{SearchCache, CoreConfig};
-use crate::database::{IndexGroup, BlobID, IndexID};
-use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
+use crate::error::ErrorKinds;
 use crate::query::Query;
+use crate::types::{FilterID, FileInfo, ExpiryGroup, Sha256};
 
-impl<'r> Decode<'r, sqlx::Sqlite> for IndexGroup {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
+use super::database::IngestStatus;
 
-impl sqlx::Type<sqlx::Sqlite> for IndexGroup {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
-
-impl<'r> Decode<'r, sqlx::Sqlite> for IndexID {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
-
-impl sqlx::Type<sqlx::Sqlite> for IndexID {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
-
-impl<'r> Decode<'r, sqlx::Sqlite> for BlobID {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
-
-impl sqlx::Type<sqlx::Sqlite> for BlobID {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    config: CoreConfig,
     work_notification: tokio::sync::Notify,
+    filter_sizes: tokio::sync::Mutex<HashMap<FilterID, u64>>,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct IndexEntry {
-    group: IndexGroup,
-    label: IndexID,
-    current_blob: BlobID,
-    size_bytes: u64,
-    size_entries: u64
-}
+// #[derive(Serialize, Deserialize, Clone)]
+// struct IndexEntry {
+//     group: IndexGroup,
+//     label: IndexID,
+//     current_blob: BlobID,
+//     size_bytes: u64,
+//     size_entries: u64
+// }
 
 // impl IndexEntry {
 //     fn prepare_key(group: &IndexGroup, label: &IndexID) -> String {
@@ -79,15 +43,15 @@ struct IndexEntry {
 //     }
 // }
 
-#[derive(Serialize, Deserialize)]
-struct FileEntry {
-    access: AccessControl,
-    hash: Vec<u8>
-}
+// #[derive(Serialize, Deserialize)]
+// struct FileEntry {
+//     access: AccessControl,
+//     hash: Vec<u8>
+// }
 
 
 impl SQLiteInterface {
-    pub async fn new(config: CoreConfig, url: &str) -> Result<Self> {
+    pub async fn new(url: &str) -> Result<Self> {
 
         let url = if url == "memory" {
             format!("sqlite::memory:")
@@ -114,19 +78,29 @@ impl SQLiteInterface {
 
         Self::initialize(&pool).await?;
 
-        Ok(Self {
+        let db = Self {
             db: pool,
-            config,
             work_notification: Default::default(),
             _temp_dir: None,
-        })
+            filter_sizes: tokio::sync::Mutex::new(Default::default()),
+        };
+
+        {
+            let mut sizes = db.filter_sizes.lock().await;
+            for name in db.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+                let (count, ): (i64, ) = sqlx::query_as(&format!("SELECT COUNT(1) FROM filter_{name}")).fetch_one(&db.db).await?;
+                sizes.insert(name, count as u64);
+            }
+        }
+
+        Ok(db)
     }
 
-    pub async fn new_temp(config: CoreConfig) -> Result<Self> {
+    pub async fn new_temp() -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let path = tempdir.path().join("house.db");
 
-        let mut obj = Self::new(config, path.to_str().unwrap()).await?;
+        let mut obj = Self::new(path.to_str().unwrap()).await?;
         obj._temp_dir = Some(tempdir);
 
         Ok(obj)
@@ -138,105 +112,155 @@ impl SQLiteInterface {
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
 
-        sqlx::query(&format!("create table if not exists index_index (
-            label TEXT PRIMARY KEY,
-            expiry_group TEXT NOT NULL,
-            data BLOB NOT NULL
-        )")).execute(&mut con).await.context("error creating table index_index")?;
-
-        sqlx::query(&format!("create table if not exists searches (
-            code TEXT PRIMARY KEY,
-            data BLOB NOT NULL,
-            search_group TEXT,
-            start_time TEXT
-        )")).execute(&mut con).await.context("error creating table searches")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_group_start ON searches(search_group, start_time)")).execute(&mut con).await?;
-
-        // description TEXT,
-        // sqlx::query(&format!("create virtual table if not exists search_description (
-        //     description, content='searches', content_rowid='code'
-        // )")).execute(&mut con).await.context("error creating table searches_description")?;
-
-        // sqlx::query(&format!("
-        // CREATE TRIGGER search_insert AFTER INSERT ON search BEGIN
-        //   INSERT INTO search_description(rowid, description) VALUES (new.code, new.description);
-        // END
-        // ")).execute(&mut con).await.context("error creating search_description trigger")?;
-
-        // sqlx::query(&format!("
-        // CREATE TRIGGER search_delete AFTER DELETE ON search BEGIN
-        //   INSERT INTO search_description(search_description, rowid, description) VALUES ('delete', old.code, old.description);
-        // END
-        // ")).execute(&mut con).await.context("error creating search_description trigger")?;
-
-        // sqlx::query(&format!("
-        // CREATE TRIGGER search_update AFTER UPDATE ON search BEGIN
-        //     INSERT INTO search_description(search_description, rowid, description) VALUES ('delete', old.code, old.description);
-        //     INSERT INTO search_description(rowid, description) VALUES (new.code, new.description);
-        // END;
-        // ")).execute(&mut con).await.context("error creating search_description trigger")?;
-
-        // sqlx::query(&format!("create table if not exists tags (
-        //     tagid INTEGER PRIMARY KEY,
-        //     code TEXT,
-        //     key TEXT NOT NULL,
-        //     value TEXT NOT NULL,
-        //     UNIQUE(code, key, value),
-        //     FOREIGN KEY(code) REFERENCES searches(code)
-        // )")).execute(&mut con).await.context("error creating table tags")?;
-        // sqlx::query(&format!("CREATE INDEX IF NOT EXISTS tags_keys ON tags(key, value)")).execute(&mut con).await?;
-        // sqlx::query(&format!("CREATE INDEX IF NOT EXISTS tags_code_keys ON tags(code, key)")).execute(&mut con).await?;
-        // sqlx::query(&format!("CREATE INDEX IF NOT EXISTS tags_value ON tags(value, key)")).execute(&mut con).await?;
-
-        sqlx::query(&format!("create table if not exists filter_tasks (
+        sqlx::query(&format!("create table if not exists filters (
             id INTEGER PRIMARY KEY,
-            query BLOB NOT NULL,
-            search TEXT NOT NULL,
-            filter_id TEXT NOT NULL,
-            filter_blob TEXT NOT NULL,
-            assigned_worker TEXT,
-            assigned_time TEXT,
-            FOREIGN KEY(search) REFERENCES searches(code),
-            UNIQUE (search, filter_blob)
-        )
-        ")).execute(&mut con).await.context("error creating table filter_tasks")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS filter_assigned_work_index ON filter_tasks(assigned_worker)")).execute(&mut con).await?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS filter_filter_index ON filter_tasks(filter_blob)")).execute(&mut con).await?;
-
-        sqlx::query(&format!("create table if not exists yara_tasks (
-            id INTEGER PRIMARY KEY,
-            search TEXT NOT NULL,
-            hashes BLOB NOT NULL,
-            hash_count INTEGER NOT NULL,
-            assigned_worker TEXT,
-            assigned_time TEXT,
-            FOREIGN KEY(search) REFERENCES searches(code)
-        )
-        ")).execute(&mut con).await.context("Error creating table yara_tasks")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS yara_assigned_work_index ON yara_tasks(assigned_worker)")).execute(&mut con).await?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS yara_search_index ON yara_tasks(search)")).execute(&mut con).await?;
-
-        sqlx::query(&format!("create table if not exists garbage (
-            blob_id TEXT PRIMARY KEY,
-            time TEXT NOT NULL
-        )")).execute(&mut con).await.context("error creating table garbage")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS garbage_blob_id ON garbage(time)")).execute(&mut con).await?;
+            expiry CHAR(8) NOT NULL,
+        )")).execute(&mut con).await.context("error creating table filters")?;
 
         return Ok(())
     }
 
-    async fn setup_filter_table(&self, name: &IndexID) -> Result<()> {
-        let mut con = self.db.acquire().await?;
+    pub async fn create_filter(&self, name: FilterID, expiry: &ExpiryGroup) -> Result<()> {
+        let mut con = self.db.begin().await?;
 
-        sqlx::query(&format!("create table if not exists {} (
+        sqlx::query(&format!("INSERT INTO filters(id, expiry) VALUES(?, ?) ON CONFLICT DO NOTHING"))
+            .bind(name.to_string())
+            .bind(expiry.as_str())
+            .execute(&mut con).await?;
+
+        sqlx::query(&format!("create table if not exists filter_{name} (
             hash BLOB PRIMARY KEY,
             number INTEGER NOT NULL UNIQUE,
-            access BLOB NOT NULL
-        )", filter_table_name(name))).execute(&mut con).await?;
+            access BLOB NOT NULL,
+            ingested BOOLEAN DEFAULT FALSE,
+        )")).execute(&mut con).await?;
+        sqlx::query(&format!("create index if not exists ingested ON filter_{name}(ingested)")).execute(&mut con).await?;
+        con.commit().await?;
+
+        let mut sizes = self.filter_sizes.lock().await;
+        sizes.insert(name, 0);
 
         return Ok(())
     }
 
+    pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>, ErrorKinds> {
+        let rows : Vec<(String, )> = sqlx::query_as("SELECT id FROM filters WHERE ? <= expiry AND expiry <= ?")
+            .bind(first.as_str())
+            .bind(last.as_str())
+            .fetch_all(&self.db).await?;
+        rows.into_iter().map(|(id, )|FilterID::from_str(&id)).collect()
+    }
+
+    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds> {
+        let rows : Vec<(String, String)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
+            .bind(first.as_str())
+            .bind(last.as_str())
+            .fetch_all(&self.db).await?;
+        rows.into_iter().map(|(id, expiry)|Ok((FilterID::from_str(&id)?, ExpiryGroup::from(&expiry)))).collect()
+    }
+
+    pub async fn delete_filter(&self, name: FilterID) -> Result<()> {
+        let mut con = self.db.begin().await?;
+
+        sqlx::query(&format!("DELETE FROM filters WHERE name = ?"))
+            .bind(name.to_string())
+            .execute(&mut con).await?;
+        sqlx::query(&format!("DROP TABLE filter_{name}")).execute(&mut con).await?;
+        con.commit().await?;
+
+        let mut sizes = self.filter_sizes.lock().await;
+        sizes.remove(&name);
+
+        return Ok(())
+    }
+
+    pub async fn filter_sizes(&self) -> HashMap<FilterID, u64> {
+        let sizes = self.filter_sizes.lock().await;
+        sizes.clone()
+    }
+
+    pub async fn filter_pending(&self) -> Result<HashMap<FilterID, u64>> {
+        let mut output: HashMap<FilterID, u64> = Default::default();
+        let mut conn = self.db.acquire().await?;
+        for id in self.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+            let (count, ): (i64, ) = query_as(&format!("SELECT COUNT(1) FROM filter_{id} WHERE ingested IS FALSE")).fetch_one(&mut conn).await?;
+            output.insert(id, count as u64);
+        }
+        Ok(output)
+    }
+
+    pub async fn update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
+        let mut filters = self.get_expiry(&file.expiry, &ExpiryGroup::max()).await?;
+        filters.sort_unstable_by(|a, b|b.1.cmp(&a.1));
+
+        let mut conn = self.db.acquire().await?;
+        'filters: for (id, _) in filters {
+            loop {
+                let (access_string, ingested): (String, bool) = match query_as(&format!("SELECT access, ingested FROM filter_{id} WHERE hash = ?")).bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
+                    Some(row) => row,
+                    None => continue 'filters
+                };
+
+                let access = AccessControl::from_str(&access_string)?.or(&file.access).simplify();
+
+                let result = query(&format!("UPDATE filter_{id} SET access = ? WHERE access = ?"))
+                    .bind(access.to_string())
+                    .bind(access_string)
+                    .execute(&mut conn).await?;
+                if result.rows_affected() > 0 {
+                    if ingested {
+                        return Ok(IngestStatus::Ready)
+                    } else {
+                        return Ok(IngestStatus::Pending(id))
+                    }
+                }
+            }
+        }
+        return Ok(IngestStatus::Missing)
+    }
+
+    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo) -> Result<bool, ErrorKinds> {
+        // Hold the locked filter sizes
+        let mut sizes = self.filter_sizes.lock().await;
+        let size = match sizes.get_mut(&id) {
+            Some(size) => size,
+            None => return Err(ErrorKinds::FilterUnknown),
+        };
+
+        // Try to load the file if its already in the DB
+        let mut conn = self.db.acquire().await?;
+        let row: Option<(bool, )> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
+            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await?;
+        if let Some((ingested, )) = row {
+            return Ok(ingested)
+        }
+
+        // Insert the new file if it is not there
+        sqlx::query(&format!("INSERT INTO filter_{id}(hash, number, access) VALUES(?, ?, ?)"))
+            .bind(file.hash.as_bytes())
+            .bind((*size + 1) as i64)
+            .bind(file.access.to_string())
+            .execute(&mut conn).await?;
+        *size += 1;
+        return Ok(false)
+    }
+
+
+    pub async fn select_file_hashes(&self, id: FilterID, indices: &Vec<i64>, view: &HashSet<String>) -> Result<Vec<Sha256>> {
+        let mut selected: Vec<Sha256> = vec![];
+        let mut conn = self.db.acquire().await?;
+        for file_id in indices {
+            let row: Option<(String, Vec<u8>)> = sqlx::query_as(&format!("SELECT access, hash FROM filter_{id} WHERE number = ?"))
+                .bind(file_id).fetch_optional(&mut conn).await?;
+            if let Some((access, hash)) = row {
+                let access = AccessControl::from_str(&access)?;
+                if access.can_access(&view) {
+                    selected.push(Sha256::try_from(&hash[..])?);
+                }
+            }
+        }
+        return Ok(selected)
+    }
     // async fn open_index_column(&self, name: &IndexID) -> Result<Option<Collection<FileEntry>>> {
     //     Ok(self.kv.open_collection(&format!("index_{}", name.as_str())).await?)
     // }

@@ -1,15 +1,20 @@
 
+use std::collections::{HashSet, HashMap};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::access::AccessControl;
-use crate::core::{SearchCache, CoreConfig};
-// use crate::database_rocksdb::RocksInterface;
-use crate::database_sqlite::SQLiteInterface;
-use crate::interface::{SearchRequest, InternalSearchStatus, WorkRequest, WorkPackage, WorkError};
-use crate::types::ExpiryGroup;
+use super::database_sqlite::SQLiteInterface;
+use crate::error::ErrorKinds;
+use crate::types::{ExpiryGroup, FilterID, Sha256, FileInfo};
 
+pub enum IngestStatus {
+    Ready,
+    Pending(FilterID),
+    Missing
+}
 
 pub enum Database {
     // Rocks(RocksInterface),
@@ -22,24 +27,68 @@ impl Database {
     //     Ok(Database::Rocks(RocksInterface::new(index_soft_max)?))
     // }
 
-    pub async fn new_sqlite(config: CoreConfig, path: &str) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new(config, path).await?))
+    pub async fn new_sqlite(path: &str) -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new(path).await?))
     }
 
-    pub async fn new_sqlite_temp(config: CoreConfig) -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new_temp(config).await?))
+    pub async fn new_sqlite_temp() -> Result<Self> {
+        Ok(Database::SQLite(SQLiteInterface::new_temp().await?))
     }
 
-    pub async fn create_filter(&self, expiry_group: &ExpiryGroup, id: FilterID) -> Result<bool> {
-        todo!();
-    }
-
-    pub async fn update_file_access(&self, hash: &[u8], access: &AccessControl, index_group: &IndexGroup) -> Result<bool> {
+    pub async fn create_filter(&self, id: FilterID, expiry: &ExpiryGroup) -> Result<()> {
         match self {
-            // Database::Rocks(local) => local.update_file_access(hash, access, index_group).await,
-            Database::SQLite(local) => local.update_file_access(hash, access, index_group).await,
+            Database::SQLite(db) => db.create_filter(id, expiry).await,
         }
     }
+
+    pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>, ErrorKinds> {
+        match self {
+            Database::SQLite(db) => db.get_filters(first, last).await,
+        }
+    }
+
+    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds> {
+        match self {
+            Database::SQLite(db) => db.get_expiry(first, last).await,
+        }
+    }
+
+    pub async fn delete_filter(&self, id: FilterID) -> Result<()> {
+        match self {
+            Database::SQLite(db) => db.delete_filter(id).await,
+        }
+    }
+
+    pub async fn filter_sizes(&self) -> HashMap<FilterID, u64> {
+        match self {
+            Database::SQLite(db) => db.filter_sizes().await,
+        }
+    }
+
+    pub async fn filter_pending(&self) -> Result<HashMap<FilterID, u64>> {
+        match self {
+            Database::SQLite(db) => db.filter_pending().await,
+        }
+    }
+
+    pub async fn update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
+        match self {
+            Database::SQLite(db) => db.update_file_access(file).await,
+        }
+    }
+
+    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo) -> core::result::Result<bool, ErrorKinds> {
+        match self {
+            Database::SQLite(db) => db.ingest_file(id, file).await,
+        }
+    }
+
+    pub async fn select_file_hashes(&self, id: FilterID, file_indices: &Vec<i64>, access: &HashSet<String>) -> Result<Vec<Sha256>> {
+        match self {
+            Database::SQLite(db) => db.select_file_hashes(id, file_indices, access).await,
+        }
+    }
+
 
     // pub async fn select_index_to_grow(&self, index_group: &IndexGroup) -> Result<Option<(IndexID, BlobID, u64)>> {
     //     match self {

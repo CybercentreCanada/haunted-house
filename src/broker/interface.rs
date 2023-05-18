@@ -1,6 +1,7 @@
 
 
 use std::collections::{HashSet, HashMap};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use anyhow::{Result, Context};
@@ -25,8 +26,9 @@ use crate::access::AccessControl;
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
 use crate::query::Query;
+use crate::types::{FileInfo, Sha256, ExpiryGroup};
 
-use super::{HouseCore, IngestStatus};
+use super::{HouseCore, IngestStatus, IngestTask};
 use super::auth::Role;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -193,11 +195,15 @@ impl IngestInterface {
 
     pub async fn ingest(&self, request: IngestRequest) -> Result<()> {
         let (send, recv) = oneshot::channel();
-        let hash = hex::decode(request.hash)?;
-        if hash.len() != 32 {
-            return Err(anyhow::anyhow!("Invalid hash: wrong number of bytes"));
-        }
-        self.core.ingest_queue.send(super::IngestMessage::IngestMessage(hash, request.access, request.expiry, send))?;
+        let hash = Sha256::from_str(&request.hash)?;
+        self.core.ingest_queue.send(super::IngestMessage::IngestMessage(IngestTask{
+            info: FileInfo{
+                hash, 
+                access: request.access, 
+                expiry: ExpiryGroup::create(&request.expiry) 
+            }, 
+            response: vec![send]
+        }))?;
         return recv.await?;
     }
 }
@@ -210,7 +216,6 @@ pub struct SearchRequest {
     pub access: HashSet<String>,
     #[serde_as(as = "DisplayFromStr")]
     pub query: Query,
-    pub group: String,
     pub yara_signature: String,
     pub start_date: Option<chrono::DateTime<chrono::Utc>>,
     pub end_date: Option<chrono::DateTime<chrono::Utc>>,

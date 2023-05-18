@@ -91,18 +91,18 @@ fn filter_table_name(name: &IndexID) -> String {
 
 #[derive(Serialize, Deserialize)]
 pub struct SearchRecord {
-    code: String,
-    group: String,
-    yara_signature: String,
-    query: Query,
-    view: AccessControl,
-    access: HashSet<String>,
-    errors: Vec<String>,
+    pub code: String,
+    pub group: String,
+    pub yara_signature: String,
+    pub query: Query,
+    pub view: AccessControl,
+    pub access: HashSet<String>,
+    pub errors: Vec<String>,
     pub start_date: ExpiryGroup,
     pub end_date: ExpiryGroup,
-    hit_files: BTreeSet<Vec<u8>>,
+    pub hit_files: BTreeSet<Vec<u8>>,
     pub finished: bool,
-    truncated: bool,
+    pub truncated: bool,
 }
 
 
