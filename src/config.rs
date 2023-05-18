@@ -1,12 +1,13 @@
 
 use serde::{Serialize, Deserialize};
+use crate::broker::auth::Role;
 use crate::size_type::{deserialize_size, serialize_size};
 
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StaticKey {
     pub key: String,
-    pub roles: Vec<crate::auth::Role>
+    pub roles: Vec<Role>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,13 +20,10 @@ impl Default for Authentication {
         Self {
             static_keys: vec![StaticKey {
                 key: hex::encode(uuid::Uuid::new_v4().as_bytes()),
-                roles: vec![crate::auth::Role::Worker]
+                roles: vec![Role::Search]
             }, StaticKey {
                 key: hex::encode(uuid::Uuid::new_v4().as_bytes()),
-                roles: vec![crate::auth::Role::Search]
-            }, StaticKey {
-                key: hex::encode(uuid::Uuid::new_v4().as_bytes()),
-                roles: vec![crate::auth::Role::Ingest]
+                roles: vec![Role::Ingest]
             }]
         }
     }

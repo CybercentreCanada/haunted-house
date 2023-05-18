@@ -1,5 +1,5 @@
 pub mod interface;
-mod auth;
+pub mod auth;
 mod database;
 mod database_sqlite;
 
@@ -452,7 +452,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                                 let (old_filter, old_task) = entry.get_mut();
                                 if old_task.info.expiry < task.info.expiry {
                                     *old_filter = filter;
-                                } 
+                                }
                                 old_task.merge(task);
                             },
                             hash_map::Entry::Vacant(entry) => { entry.insert((filter, task)); },
@@ -566,7 +566,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                 };
 
                 todo!();
-                // match message {                    
+                // match message {
                 //     // SearcherMessage::Status(status) => {
                 //     //     status.send(InternalSearchStatus {
                 //     //         view: ,
@@ -586,7 +586,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     FilterSearchResponse::Error(error) => { errors.push(error); },
                 }
             }
-            
+
         }
     }
 
@@ -620,7 +620,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                 };
 
                 todo!();
-                // match message {                    
+                // match message {
                 //     // SearcherMessage::Status(status) => {
                 //     //     status.send(InternalSearchStatus {
                 //     //         view: ,
@@ -648,9 +648,9 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                 requests.spawn(async move {
                     let permit = permit?;
                     let response = core.client.get(permit.1.clone() + "/search/yara")
-                    .json(&YaraTask{ 
-                        id, 
-                        yara_rule, 
+                    .json(&YaraTask{
+                        id,
+                        yara_rule,
                         hashes
                     }).send().await?;
                     let result: YaraSearchResponse = response.json().await?;
