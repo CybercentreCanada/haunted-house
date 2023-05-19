@@ -39,7 +39,7 @@ deadpool = "0.9"
 
 log = "*"
 env_logger = "0.9"
-bitvec = "*"
+bitvec = { version = "1", features = ["serde"]}
 hex = "*"
 sha2 = "*"
 itertools = "*"

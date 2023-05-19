@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use anyhow::{Context};
 use futures::{SinkExt, StreamExt};
-use log::error;
 use poem::web::websocket::{WebSocket, Message};
 use poem::{handler, Route, get, EndpointExt, Server, delete, post, IntoResponse};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
@@ -149,23 +148,8 @@ pub struct IngestFilesResponse {
 }
 
 #[handler]
-async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesRequest>) -> Json<IngestFilesResponse> {
-    let mut completed = vec![];
-    let mut unknown_filters = vec![];
-    for (filter, file) in &request.files {
-        match state.ingest_file(*filter, &file).await {
-            Ok(complete) => if complete {
-                completed.push(file.hash.clone());
-            },
-            Err(err) => if let crate::error::ErrorKinds::FilterUnknown = err {
-                unknown_filters.push(*filter);
-            } else {
-                error!("{err}");
-            }
-        }
-    }
-    state.notify(filters).await;
-    return Json(IngestFilesResponse { completed, unknown_filters })
+async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesRequest>) -> poem::Result<Json<IngestFilesResponse>> {
+    Ok(Json(state.ingest_file(request.0.files).await?))
 }
 
 #[handler]

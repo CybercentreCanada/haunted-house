@@ -1,9 +1,7 @@
-use std::path::{PathBuf, Path};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::sync::Arc;
 
 use crate::query::Query;
-use crate::types::{FilterID, Sha256};
+use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;
 use bitvec::vec::BitVec;
@@ -20,20 +18,20 @@ enum ReaderCommand {
 
 #[derive(Debug)]
 pub enum WriterCommand {
-    Ingest(Vec<(u64, Sha256)>, oneshot::Sender<()>)
+    Ingest(Vec<(u64, BitVec)>, oneshot::Sender<()>)
 }
 
 pub struct FilterWorker {
     readiness: watch::Receiver<bool>,
     reader_connection: mpsc::Sender<ReaderCommand>,
-    writer_connection: mpsc::Sender<WriterCommand>,
+    pub writer_connection: mpsc::Sender<WriterCommand>,
 }
 
 impl FilterWorker {
     pub fn open(config: WorkerConfig, id: FilterID) -> Result<Self> {
         let (ready_send, ready_recv) = watch::channel(false);
         let (reader_send, reader_recv) = mpsc::channel(64);
-        let (writer_send, writer_recv) = mpsc::channel(64);
+        let (writer_send, writer_recv) = mpsc::channel(2);
         std::thread::spawn(move || {
             writer_worker(writer_recv, config, id, ready_send, ready_recv, reader_recv)
         });
@@ -42,10 +40,6 @@ impl FilterWorker {
 
     pub fn is_ready(&self) -> bool {
         *self.readiness.borrow()
-    }
-
-    pub fn notify(&self) {
-        todo!();
     }
 
     pub async fn query(&self, query: Query) -> Result<Vec<u64>> {
@@ -87,7 +81,7 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
         match message {
             WriterCommand::Ingest(mut batch, finished) => {
                 // Insert the batch
-                filter.write_batch(batch)?;
+                filter.write_batch(&mut batch)?;
                 finished.send(());
             }
         }

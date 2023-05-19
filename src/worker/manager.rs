@@ -4,22 +4,24 @@ use std::path::PathBuf;
 // use std::fmt::Display;
 use std::sync::Arc;
 // use std::time::Duration;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bitvec::vec::BitVec;
+use itertools::Itertools;
 use log::{debug, info, error};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch, Notify, oneshot};
 use tokio::task::JoinSet;
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::error::ErrorKinds;
 use crate::query::Query;
+use crate::storage::BlobStorage;
 use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;
 use super::database::{IngestStatus, Database};
 use super::filter_worker::{FilterWorker, WriterCommand};
-use super::interface::{FilterSearchResponse, UpdateFileInfoResponse};
+use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
 
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -37,18 +39,20 @@ pub struct WorkerState {
     pub database: Arc<Database>,
     pub running: watch::Receiver<bool>,
     pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>)>>,
+    pub file_storage: BlobStorage,
     pub file_cache: BlobCache,
-    pub config: WorkerConfig
+    pub config: WorkerConfig,
 }
 
 impl WorkerState {
 
-    pub async fn new(database: Arc<Database>, file_cache: BlobCache, config: WorkerConfig, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
+    pub async fn new(database: Arc<Database>, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerConfig, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
         let new = Arc::new(Self {
             database,
             running,
             filters: tokio::sync::RwLock::new(Default::default()),
             file_cache,
+            file_storage,
             config,
         });
 
@@ -56,7 +60,10 @@ impl WorkerState {
         {
             let mut filters = new.filters.write().await;
             for id in new.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
-                filters.insert(id, FilterWorker::open(Arc::<WorkerState>::downgrade(&new), id)?);
+                let notify = Arc::new(tokio::sync::Notify::new());
+                let worker = FilterWorker::open(new.config.clone(), id)?;
+                tokio::spawn(new.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone()));
+                filters.insert(id, (worker, notify));
             }
         }
 
@@ -65,9 +72,11 @@ impl WorkerState {
 
     pub async fn create_index(self: &Arc<Self>, id: FilterID, expiry: ExpiryGroup) -> Result<()> {
         self.database.create_filter(id, &expiry).await?;
-        let worker = FilterWorker::open(Arc::<WorkerState>::downgrade(self), id)?;
+        let worker = FilterWorker::open(self.config.clone(), id)?;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone()));
         let mut filters = self.filters.write().await;
-        filters.insert(id, worker);
+        filters.insert(id, (worker, notify));
         return Ok(())
     }
 
@@ -113,7 +122,7 @@ impl WorkerState {
             assignments,
             storage_pressure,
             filter_sizes,
-            filter_pending: self.database.filter_pending().await?,
+            filter_pending: self.database.filter_pending_count().await,
         })
     }
 
@@ -136,17 +145,83 @@ impl WorkerState {
         return Ok(total >= self.config.data_limit - self.config.data_reserve)
     }
 
-    pub async fn ingest_file(&self, id: FilterID, info: &FileInfo) -> core::result::Result<bool, ErrorKinds> {
-        self.database.ingest_file(id, info).await
+    pub async fn ingest_file(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
+        // Filter those we already have information for quickly
+        // the ones that are currently pending can be dropped
+        let pending = self.database.filter_pending().await;
+        files.retain(|(filter, file)|!pending.get(filter).unwrap_or(&Default::default()).contains(&file.hash));
+
+        // Gather information for each file individually next
+        let mut workers: JoinSet<std::result::Result<(bool, FilterID, Sha256), ErrorKinds>> = JoinSet::new();
+        let mut completed = vec![];
+        let mut modified_filters = vec![];
+        let mut unknown_filters = vec![];
+        while !workers.is_empty() || !files.is_empty() {
+            while !files.is_empty() && workers.len() < 10 {
+                let core = self.clone();
+                if let Some((filter, file)) = files.pop() {
+                    workers.spawn(async move {
+                        // Check if the file is already inserted
+                        let status = core.database.check_insert_status(filter, &file).await?;
+                        match status {
+                            IngestStatus::Ready => return Ok((true, filter, file.hash)),
+                            IngestStatus::Pending(filter) => return Ok((false, filter, file.hash)),
+                            IngestStatus::Missing => {}
+                        }
+
+                        // Gather the file content
+                        let stream = core.file_storage.stream(&file.hash.hex()).await?;
+                        let trigrams = match build_file(stream).await {
+                            Ok(trigrams) => trigrams,
+                            Err(_) => return Err(ErrorKinds::UnableToBuildTrigrams),
+                        };
+
+                        // Ingest the file
+                        let complete = core.database.ingest_file(filter, &file, &trigrams).await?;
+                        return Ok((complete, filter, file.hash))
+                    });
+                }
+            }
+
+            let result = match workers.join_next().await {
+                Some(result) => result?,
+                None => continue,
+            };
+
+            match result {
+                Ok((complete, filter, hash)) => if complete {
+                    completed.push(hash);
+                } else {
+                    modified_filters.push(filter)
+                },
+                Err(err) => if let ErrorKinds::FilterUnknown(filter) = err {
+                    unknown_filters.push(filter);
+                } else {
+                    error!("{err}");
+                }
+            }
+        }
+
+        self.notify_ingest_feeders(modified_filters).await;
+        return Ok(IngestFilesResponse { completed, unknown_filters })
+    }
+
+    pub async fn notify_ingest_feeders(&self, ids: Vec<FilterID>) {
+        let filters = self.filters.read().await;
+        for id in ids {
+            if let Some((_, notify)) = filters.get(&id) {
+                notify.notify_waiters()
+            }
+        }
     }
 
     pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) {
-        while let Err(err) = self._ingest_feeder(id, writer, notify).await {
+        while let Err(err) = self._ingest_feeder(id, &writer, notify.clone()).await {
             error!("{err}");
         }
     }
 
-    pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {
+    pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {
         loop {
             // Get next set of incomplete files
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
@@ -155,62 +230,20 @@ impl WorkerState {
                 continue
             }
 
-            // Gather file data
-            // let files_being_ingested = new_items.len();
-            let mut data = vec![];
-            let mut files = vec![];
-            // let mut outstanding = Vec::from_iter(new_items.keys().cloned());
-            let mut active: JoinSet<(u64, Sha256, Result<BitVec>)> = JoinSet::new();
-            while !batch.is_empty() && !active.is_empty() {
-                while !batch.is_empty() && active.len() < 10 {
-                    if let Some((id, hash)) = batch.pop(){
-                        // debug!("Ingest {} requesting hash {}", index_group.as_str(), hex::encode(&hash));
-                        active.spawn(self.clone().prepare_vector(id, hash));
-                    }
-                }
-
-                let (id, hash, result) = match active.join_next().await {
-                    Some(res) => res?,
-                    None => continue,
-                };
-
-                // debug!("Ingest {} finished hash {}", index_group.as_str(), hex::encode(&hash));
-                match result {
-                    Ok(bits) => {
-                        files.push(bits);
-                        remaining_responses.extend(responses);
-                    },
-                    Err(err) => {
-                        error!("Error gathering file for {}: {err}", hex::encode(&hash));
-                        for res in responses {
-                            _ = res.send(Err(anyhow::format_err!("Error gathering file {err}")));
-                        }
-                    }
-                }
-            }
-
             // Send the files to the writer
+            let files = batch.iter().map(|row|row.0).collect_vec();
+            let batch = batch.into_iter().map(|row|(row.0, row.1)).collect_vec();
             let (finished_send, finished_recv) = oneshot::channel();
-            writer.send().await;
+            writer.send(WriterCommand::Ingest(batch, finished_send)).await;
 
             // Wait for a positive response
-            if let Some(()) = finished_recv.await {
+            if let Ok(()) = finished_recv.await {
                 // Commit those file ids
+                self.database.finished_ingest(id, files).await?;
             }
         }
     }
 
-    async fn prepare_vector(self: Arc<WorkerState>, id: u64, hash: Sha256) -> (u64, Sha256, Result<BitVec>) {
-        let stream = match self.file_storage.stream(&hash.hex()).await {
-            Ok(stream) => stream,
-            Err(err) => return (id, hash, Err(err)),
-        };
-    
-        let result = TrigramFilter::build_file(stream).await;
-    
-        return (id, hash, result)
-    }
-    
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {
         Ok(self.database.get_filters(first, last).await?)
     }
@@ -228,7 +261,7 @@ impl WorkerState {
         // Make sure they are all ready
         for id in ids {
             match filters.get(&id) {
-                Some(filter) => if !filter.is_ready() {
+                Some((filter, _)) => if !filter.is_ready() {
                     return Ok(false);
                 }
                 None => return Ok(false)
@@ -238,7 +271,7 @@ impl WorkerState {
     }
 
     pub async fn query_filter(self: Arc<Self>, id: FilterID, query: Query, access: HashSet<String>, respond: mpsc::Sender<FilterSearchResponse>) {
-        if let Some(filter) = self.filters.read().await.get(&id) {
+        if let Some((filter, _)) = self.filters.read().await.get(&id) {
             match filter.query(query).await {
                 Ok(file_indices) => {
                     match self.database.select_file_hashes(id, &file_indices, &access).await {
@@ -309,4 +342,40 @@ impl WorkerState {
 }
 
 
+pub async fn build_file(mut input: mpsc::Receiver<Result<Vec<u8>>>) -> Result<BitVec> {
+    // Prepare accumulators
+    let mut mask = BitVec::repeat(false, 1 << 24);
 
+    // Read the initial block
+    let mut buffer = vec![];
+    while buffer.len() <= 2 {
+        let sub_buffer = match input.recv().await {
+            Some(sub_buffer) => sub_buffer?,
+            None => return Ok(mask),
+        };
+
+        buffer.extend(sub_buffer);
+    }
+
+    // Initialize trigram
+    let mut trigram: u32 = (buffer[0] as u32) << 8 | (buffer[1] as u32);
+    let mut index_start = 2;
+
+    loop {
+        for byte in &buffer[index_start..] {
+            trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+            mask.set(trigram as usize, true);
+        }
+
+        buffer = match input.recv().await {
+            Some(buffer) => buffer?,
+            None => return Ok(mask),
+        };
+        if buffer.is_empty() {
+            break;
+        }
+        index_start = 0;
+    }
+
+    return Ok(mask)
+}

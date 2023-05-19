@@ -3,15 +3,13 @@ use anyhow::{Result, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, BTreeSet, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
-use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 
 use crate::query::Query;
-use crate::types::FilterID;
 
 use super::encoding::{cost_to_add, encode_into, decode_into};
 
@@ -389,7 +387,7 @@ impl ExtensibleTrigramFile {
     }
 
     // #[instrument]
-    pub fn write_batch(&mut self, files: &mut [(u64, BitVec)]) -> Result<HashSet<u64>> {
+    pub fn write_batch(&self, files: &mut [(u64, BitVec)]) -> Result<HashSet<u64>> {
         // prepare the buffer for operations
         let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
         let mut skipped = HashSet::<u64>::new();

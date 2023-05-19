@@ -2,6 +2,7 @@
 use std::collections::{HashSet, HashMap};
 
 use anyhow::Result;
+use bitvec::vec::BitVec;
 
 use super::database_sqlite::SQLiteInterface;
 use crate::error::ErrorKinds;
@@ -57,7 +58,13 @@ impl Database {
         }
     }
 
-    pub async fn filter_pending(&self) -> Result<HashMap<FilterID, u64>> {
+    pub async fn filter_pending_count(&self) -> HashMap<FilterID, u64> {
+        match self {
+            Database::SQLite(db) => db.filter_pending_count().await,
+        }
+    }
+
+    pub async fn filter_pending(&self) -> HashMap<FilterID, HashSet<Sha256>> {
         match self {
             Database::SQLite(db) => db.filter_pending().await,
         }
@@ -69,9 +76,15 @@ impl Database {
         }
     }
 
-    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo) -> core::result::Result<bool, ErrorKinds> {
+    pub async fn check_insert_status(&self, id: FilterID, file: &FileInfo) -> Result<IngestStatus, ErrorKinds> {
         match self {
-            Database::SQLite(db) => db.ingest_file(id, file).await,
+            Database::SQLite(db) => db.check_insert_status(id, file).await,
+        }
+    }
+
+    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo, body: &BitVec) -> core::result::Result<bool, ErrorKinds> {
+        match self {
+            Database::SQLite(db) => db.ingest_file(id, file, body).await,
         }
     }
 
@@ -81,8 +94,16 @@ impl Database {
         }
     }
 
-    pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, Sha256)>> {
-        todo!()
+    pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, BitVec)>> {
+        match self {
+            Database::SQLite(db) => db.get_ingest_batch(id, limit).await,
+        }
+    }
+
+    pub async fn finished_ingest(&self, id: FilterID, files: Vec<u64>) -> Result<()> {
+        match self {
+            Database::SQLite(db) => db.finished_ingest(id, files).await,
+        }
     }
 }
 

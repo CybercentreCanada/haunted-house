@@ -3,6 +3,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Result, Context};
+use bitvec::vec::BitVec;
 use sqlx::{SqlitePool, query_as, query};
 use sqlx::pool::PoolOptions;
 
@@ -17,6 +18,7 @@ pub struct SQLiteInterface {
     db: SqlitePool,
     work_notification: tokio::sync::Notify,
     filter_sizes: tokio::sync::Mutex<HashMap<FilterID, u64>>,
+    filter_pending: tokio::sync::RwLock<HashMap<FilterID, HashSet<Sha256>>>,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -53,6 +55,7 @@ impl SQLiteInterface {
             work_notification: Default::default(),
             _temp_dir: None,
             filter_sizes: tokio::sync::Mutex::new(Default::default()),
+            filter_pending: tokio::sync::RwLock::new(Default::default())
         };
 
         {
@@ -60,6 +63,20 @@ impl SQLiteInterface {
             for name in db.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
                 let (count, ): (i64, ) = sqlx::query_as(&format!("SELECT COUNT(1) FROM filter_{name}")).fetch_one(&db.db).await?;
                 sizes.insert(name, count as u64);
+            }
+        }
+
+        {
+            let mut pending = db.filter_pending.write().await;
+            for name in db.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+                let mut items = vec![];
+                let data: Vec<(Vec<u8>, )> = sqlx::query_as(&format!("SELECT hash FROM filter_{name} WHERE ingested IS FALSE")).fetch_all(&db.db).await?;
+                for (row,) in data {
+                    if let Ok(hash) = Sha256::try_from(&row[..]) {
+                        items.push(hash)
+                    }
+                }
+                pending.insert(name, HashSet::from_iter(items.into_iter()));
             }
         }
 
@@ -103,6 +120,7 @@ impl SQLiteInterface {
             number INTEGER NOT NULL UNIQUE,
             access BLOB NOT NULL,
             ingested BOOLEAN DEFAULT FALSE,
+            trigrams BLOB
         )")).execute(&mut con).await?;
         sqlx::query(&format!("create index if not exists ingested ON filter_{name}(ingested)")).execute(&mut con).await?;
         con.commit().await?;
@@ -149,14 +167,14 @@ impl SQLiteInterface {
         sizes.clone()
     }
 
-    pub async fn filter_pending(&self) -> Result<HashMap<FilterID, u64>> {
-        let mut output: HashMap<FilterID, u64> = Default::default();
-        let mut conn = self.db.acquire().await?;
-        for id in self.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
-            let (count, ): (i64, ) = query_as(&format!("SELECT COUNT(1) FROM filter_{id} WHERE ingested IS FALSE")).fetch_one(&mut conn).await?;
-            output.insert(id, count as u64);
-        }
-        Ok(output)
+    pub async fn filter_pending(&self) -> HashMap<FilterID, HashSet<Sha256>> {
+        let pending = self.filter_pending.read().await;
+        return pending.clone()
+    }
+
+    pub async fn filter_pending_count(&self) -> HashMap<FilterID, u64> {
+        let pending = self.filter_pending.read().await;
+        return pending.iter().map(|(key, values)|(*key, values.len() as u64)).collect()
     }
 
     pub async fn update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
@@ -172,9 +190,17 @@ impl SQLiteInterface {
                 };
 
                 let access = AccessControl::from_str(&access_string)?.or(&file.access).simplify();
+                let new_string = access.to_string();
+                if access_string == new_string {
+                    if ingested {
+                        return Ok(IngestStatus::Ready)
+                    } else {
+                        return Ok(IngestStatus::Pending(id))
+                    }
+                }
 
                 let result = query(&format!("UPDATE filter_{id} SET access = ? WHERE access = ?"))
-                    .bind(access.to_string())
+                    .bind(new_string)
                     .bind(access_string)
                     .execute(&mut conn).await?;
                 if result.rows_affected() > 0 {
@@ -189,12 +215,29 @@ impl SQLiteInterface {
         return Ok(IngestStatus::Missing)
     }
 
-    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo) -> Result<bool, ErrorKinds> {
+    pub async fn check_insert_status(&self, id: FilterID, file: &FileInfo) -> Result<IngestStatus, ErrorKinds> {
+        let mut filters = self.get_expiry(&file.expiry, &ExpiryGroup::max()).await?;
+        filters.sort_unstable_by(|a, b|b.1.cmp(&a.1));
+
+        let mut conn = self.db.acquire().await?;
+        let (ingested, ): (bool, ) = match query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?")).bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
+            Some(row) => row,
+            None => return Ok(IngestStatus::Missing)
+        };
+
+        if ingested {
+            return Ok(IngestStatus::Ready)
+        } else {
+            return Ok(IngestStatus::Pending(id))
+        }
+    }
+
+    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo, body: &BitVec) -> Result<bool, ErrorKinds> {
         // Hold the locked filter sizes
         let mut sizes = self.filter_sizes.lock().await;
         let size = match sizes.get_mut(&id) {
             Some(size) => size,
-            None => return Err(ErrorKinds::FilterUnknown),
+            None => return Err(ErrorKinds::FilterUnknown(id)),
         };
 
         // Try to load the file if its already in the DB
@@ -206,12 +249,19 @@ impl SQLiteInterface {
         }
 
         // Insert the new file if it is not there
-        sqlx::query(&format!("INSERT INTO filter_{id}(hash, number, access) VALUES(?, ?, ?)"))
+        sqlx::query(&format!("INSERT INTO filter_{id}(hash, number, access, trigrams) VALUES(?, ?, ?, ?)"))
             .bind(file.hash.as_bytes())
             .bind((*size + 1) as i64)
             .bind(file.access.to_string())
+            .bind(postcard::to_allocvec(body)?)
             .execute(&mut conn).await?;
         *size += 1;
+        let mut pending = self.filter_pending.write().await;
+        match pending.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(file.hash.clone()); },
+            std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([file.hash.clone()])); },
+        }
+
         return Ok(false)
     }
 
@@ -232,5 +282,36 @@ impl SQLiteInterface {
         return Ok(selected)
     }
 
+    pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, BitVec)>> {
+        let row: Vec<(i64, Vec<u8>)> = sqlx::query_as(&format!("SELECT number, trigrams FROM filter_{id} WHERE ingested IS FALSE LIMIT {limit} ORDER BY number"))
+        .fetch_all(&self.db).await?;
+
+        let mut output = vec![];
+        for (id, bytes) in row {
+            let body: BitVec = postcard::from_bytes(&bytes)?;
+            output.push((id as u64, body))
+        }
+        return Ok(output)
+    }
+
+    pub async fn finished_ingest(&self, id: FilterID, files: Vec<u64>) -> Result<()> {
+        let mut conn = self.db.acquire().await?;
+        let mut hashes = vec![];
+        for number in files {
+            let result: Option<(Vec<u8>,)>  = sqlx::query_as(&format!("UPDATE filter_{id} SET ingested = TRUE, trigrams = NULL WHERE number = ? RETURNING hash")).bind(number as i64).fetch_optional(&mut conn).await?;
+            if let Some((hash, )) = result {
+                hashes.push(hash);
+            }
+        }
+        let mut pending = self.filter_pending.write().await;
+        if let Some(pending) = pending.get_mut(&id) {
+            for hash in hashes {
+                if let Ok(hash) = Sha256::try_from(&hash[..]) {
+                    pending.remove(&hash);
+                }
+            }
+        }
+        return Ok(())
+    }
 }
 

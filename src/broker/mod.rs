@@ -67,7 +67,7 @@ impl HouseCore {
         // let (quit_trigger, quit_signal) = tokio::sync::watch::channel(false);
 
         // Prepare our http client
-        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+        let retry_policy = ExponentialBackoff::builder().build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
         let client = ClientBuilder::new(reqwest::Client::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
