@@ -1,4 +1,6 @@
 
+use std::path::PathBuf;
+
 use serde::{Serialize, Deserialize};
 use crate::broker::auth::Role;
 use crate::size_type::{deserialize_size, serialize_size};
@@ -81,10 +83,10 @@ pub enum WorkerTLSConfig {
 pub struct Config {
     pub authentication: Authentication,
     pub database: Database,
-    pub core: crate::core::CoreConfig,
+    pub core: crate::broker::CoreConfig,
     pub cache: CacheConfig,
-    pub files: crate::storage::BlobStorageConfig,
-    pub blobs: crate::storage::BlobStorageConfig,
+    // pub files: crate::storage::BlobStorageConfig,
+    // pub blobs: crate::storage::BlobStorageConfig,
 
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
@@ -95,10 +97,17 @@ impl Default for Config {
         Self {
             authentication: Default::default(),
             database: Default::default(),
-            core: Default::default(),
+            core: crate::broker::CoreConfig {
+                workers: Default::default(),
+                per_filter_pending_limit: 1000,
+                per_worker_group_duplication: 2,
+                search_hit_limit: 50000,
+                yara_jobs_per_worker: 2,
+                yara_batch_size: 100,
+            },
             cache: Default::default(),
-            files: Default::default(),
-            blobs: Default::default(),
+            // files: Default::default(),
+            // blobs: Default::default(),
             bind_address: Some("localhost:4443".to_owned()),
             tls: None
         }
@@ -107,34 +116,30 @@ impl Default for Config {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkerConfig {
-    pub api_token: String,
-    // pub authentication: Authentication,
-    // pub database: Database,
-    // pub core: crate::core::CoreConfig,
     pub file_cache: CacheConfig,
-    pub blob_cache: CacheConfig,
     pub files: crate::storage::BlobStorageConfig,
-    pub blobs: crate::storage::BlobStorageConfig,
-
+    pub settings: crate::worker::WorkerConfig,
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
-
-    pub server_address: String,
-    pub server_tls: WorkerTLSConfig
 }
+
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            api_token: "<API token with worker role>".to_owned(),
             file_cache: Default::default(),
-            blob_cache: Default::default(),
             files: Default::default(),
-            blobs: Default::default(),
+            settings: crate::worker::WorkerConfig {
+                filter_item_limit: 50_000_000,
+                data_path: PathBuf::from("/data/"),
+                data_limit: 1 << 40,
+                data_reserve: 5 << 30,
+                initial_segment_size: 128,
+                extended_segment_size: 2048,
+                ingest_batch_size: 100,
+            },
             bind_address: Some("localhost:4444".to_owned()),
             tls: None,
-            server_address: "localhost:4443".to_owned(),
-            server_tls: WorkerTLSConfig::Certificate("Server TLS cert".to_owned())
         }
     }
 }

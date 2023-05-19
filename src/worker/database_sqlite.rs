@@ -111,7 +111,7 @@ impl SQLiteInterface {
         let mut con = self.db.begin().await?;
 
         sqlx::query(&format!("INSERT INTO filters(id, expiry) VALUES(?, ?) ON CONFLICT DO NOTHING"))
-            .bind(name.to_string())
+            .bind(name.to_i64())
             .bind(expiry.as_str())
             .execute(&mut con).await?;
 
@@ -132,19 +132,19 @@ impl SQLiteInterface {
     }
 
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>, ErrorKinds> {
-        let rows : Vec<(String, )> = sqlx::query_as("SELECT id FROM filters WHERE ? <= expiry AND expiry <= ?")
+        let rows : Vec<(i64, )> = sqlx::query_as("SELECT id FROM filters WHERE ? <= expiry AND expiry <= ?")
             .bind(first.as_str())
             .bind(last.as_str())
             .fetch_all(&self.db).await?;
-        rows.into_iter().map(|(id, )|FilterID::from_str(&id)).collect()
+        Ok(rows.into_iter().map(|(id, )|FilterID::from(id)).collect())
     }
 
     pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds> {
-        let rows : Vec<(String, String)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
+        let rows : Vec<(i64, String)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
             .bind(first.as_str())
             .bind(last.as_str())
             .fetch_all(&self.db).await?;
-        rows.into_iter().map(|(id, expiry)|Ok((FilterID::from_str(&id)?, ExpiryGroup::from(&expiry)))).collect()
+        rows.into_iter().map(|(id, expiry)|Ok((FilterID::from(id), ExpiryGroup::from(&expiry)))).collect()
     }
 
     pub async fn delete_filter(&self, name: FilterID) -> Result<()> {

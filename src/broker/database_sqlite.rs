@@ -2,57 +2,16 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path};
 
 use anyhow::{Result, Context};
-use futures::{TryStreamExt};
-use log::{debug, info};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, query_as, Decode, Acquire, Row};
-use sqlx::pool::{PoolOptions, PoolConnection};
+use sqlx::{SqlitePool, query_as};
+use sqlx::pool::PoolOptions;
 
 use crate::access::AccessControl;
-use crate::core::{SearchCache, CoreConfig};
-use crate::database::{IndexGroup, BlobID, IndexID};
-use crate::interface::{SearchRequest, SearchRequestResponse, InternalSearchStatus, WorkRequest, WorkPackage, FilterTask, YaraTask, WorkError};
 use crate::query::Query;
-use crate::types::ExpiryGroup;
+use crate::types::{ExpiryGroup, Sha256, WorkerID, FilterID};
 
-impl<'r> Decode<'r, sqlx::Sqlite> for IndexGroup {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
-
-impl sqlx::Type<sqlx::Sqlite> for IndexGroup {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
-
-impl<'r> Decode<'r, sqlx::Sqlite> for IndexID {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
-
-impl sqlx::Type<sqlx::Sqlite> for IndexID {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
-
-impl<'r> Decode<'r, sqlx::Sqlite> for BlobID {
-    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'r>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
-        let value = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
-        Ok(Self::from(value))
-    }
-}
-
-impl sqlx::Type<sqlx::Sqlite> for BlobID {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
+use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestResponse};
 
 pub struct SQLiteInterface {
     db: SqlitePool,
@@ -60,39 +19,19 @@ pub struct SQLiteInterface {
     _temp_dir: Option<tempfile::TempDir>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct IndexEntry {
-    group: IndexGroup,
-    label: IndexID,
-    current_blob: BlobID,
-    size_bytes: u64,
-    size_entries: u64
-}
-
-// impl IndexEntry {
-//     fn prepare_key(group: &IndexGroup, label: &IndexID) -> String {
-//         format!("{}:{}", group.as_str(), label.as_str())
-//     }
-
-//     fn key(&self) -> String {
-//         IndexEntry::prepare_key(&self.group, &self.label)
-//     }
+// #[derive(Serialize, Deserialize)]
+// struct FileEntry {
+//     access: AccessControl,
+//     hash: Vec<u8>
 // }
 
-#[derive(Serialize, Deserialize)]
-struct FileEntry {
-    access: AccessControl,
-    hash: Vec<u8>
-}
-
-fn filter_table_name(name: &IndexID) -> String {
-    format!("filter_{name}")
-}
+// fn filter_table_name(name: &IndexID) -> String {
+//     format!("filter_{name}")
+// }
 
 #[derive(Serialize, Deserialize)]
 pub struct SearchRecord {
     pub code: String,
-    pub group: String,
     pub yara_signature: String,
     pub query: Query,
     pub view: AccessControl,
@@ -100,9 +39,9 @@ pub struct SearchRecord {
     pub errors: Vec<String>,
     pub start_date: ExpiryGroup,
     pub end_date: ExpiryGroup,
-    pub hit_files: BTreeSet<Vec<u8>>,
-    pub finished: bool,
+    pub hit_files: BTreeSet<Sha256>,
     pub truncated: bool,
+    pub finished: bool,
 }
 
 
@@ -157,32 +96,136 @@ impl SQLiteInterface {
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
 
-        sqlx::query(&format!("create table if not exists index_index (
-            label TEXT PRIMARY KEY,
+        sqlx::query(&format!("create table if not exists filters (
+            id INTEGER PRIMARY KEY,
+            worker TEXT NOT NULL,
             expiry_group TEXT NOT NULL,
-            data BLOB NOT NULL
-        )")).execute(&mut con).await.context("error creating table index_index")?;
+        )")).execute(&mut con).await.context("error creating table filters")?;
 
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
             data BLOB NOT NULL,
             finished BOOLEAN NOT NULL,
-            search_group TEXT,
             start_time TEXT
         )")).execute(&mut con).await.context("error creating table searches")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_group_start ON searches(search_group, start_time)")).execute(&mut con).await?;
-
-        // sqlx::query(&format!("create table if not exists search_results (
-        //     code TEXT PRIMARY KEY,
-        //     data BLOB NOT NULL,
-        //     FOREIGN KEY(code) REFERENCES searches(code)
-        // )")).execute(&mut con).await.context("error creating table searches")?;
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_finished ON searches(finished)")).execute(&mut con).await?;
 
         return Ok(())
     }
 
+    pub async fn list_active_searches(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = query_as("SELECT code FROM searches WHERE finished IS FALSE").fetch_all(&self.db).await?;
+        Ok(rows.into_iter().map(|(code, )|code).collect_vec())
+    }
 
 
+    pub async fn initialize_search(&self, code: &str, req: &SearchRequest) -> Result<InternalSearchStatus> {
+        // Turn the expiry dates into a group range
+        let start = match req.start_date {
+            Some(value) => ExpiryGroup::create(&Some(value)),
+            None => ExpiryGroup::min(),
+        };
+        let end = match req.end_date {
+            Some(value) => ExpiryGroup::create(&Some(value)),
+            None => ExpiryGroup::max(),
+        };
+
+        // Add operation to the search table
+        sqlx::query("INSERT INTO searches(code, data, start_time) VALUES(?, ?, ?)")
+            .bind(&code)
+            .bind(&postcard::to_allocvec(&SearchRecord{
+                code: code.to_owned(),
+                yara_signature: req.yara_signature.clone(),
+                errors: Default::default(),
+                access: req.access.clone(),
+                view: req.view.clone(),
+                query: req.query.clone(),
+                hit_files: Default::default(),
+                truncated: false,
+                finished: false,
+                start_date: start,
+                end_date: end,
+            })?)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&self.db).await?;
+
+        match self.search_status(code).await? {
+            Some(result) => Ok(result),
+            None => Err(anyhow::anyhow!("Result status could not be read.")),
+        }
+    }
+
+    pub async fn finalize_search(&self, code: &str, hits: BTreeSet<Sha256>, errors: Vec<String>, truncated: bool) -> Result<()> {
+        let mut record = match self.search_record(code).await? {
+            Some(record) => record,
+            None => return Err(anyhow::anyhow!(""))
+        };
+
+        record.hit_files = hits;
+        record.errors = errors;
+        record.truncated = truncated;
+        record.finished = true;
+
+        sqlx::query("UPDATE searches SET data = ?, finished = TRUE WHERE code = ?")
+            .bind(&postcard::to_allocvec(&record)?)
+            .bind(&code)
+            .execute(&self.db).await?;
+
+        return Ok(())
+    }
+
+    pub async fn search_record(&self, code: &str) -> Result<Option<SearchRecord>> {
+        let row: Option<(Vec<u8>, )> = sqlx::query_as("SELECT data FROM searches WHERE code = ?")
+            .bind(&code)
+            .fetch_optional(&self.db).await?;
+
+        Ok(match row {
+            Some((data, )) => Some(postcard::from_bytes(&data)?),
+            None => None,
+        })
+    }
+
+    pub async fn search_status(&self, code: &str) -> Result<Option<InternalSearchStatus>> {
+        let record = self.search_record(code).await?;
+        Ok(match record {
+            Some(record) => Some(InternalSearchStatus {
+                view: record.view,
+                resp: SearchRequestResponse {
+                    code: record.code,
+                    finished: record.finished,
+                    errors: record.errors,
+                    hits: record.hit_files.into_iter().map(|hash|hash.hex()).collect(),
+                    truncated: record.truncated,
+                }
+            }),
+            None => None,
+        })
+    }
+
+    pub async fn list_filters(&self) -> Result<Vec<(WorkerID, FilterID, ExpiryGroup)>> {
+        let data: Vec<(i64, String, String)> = query_as("SELECT id, worker, expiry_group FROM filters").fetch_all(&self.db).await?;
+        let mut output = vec![];
+        for (id, worker, expiry) in data {
+            output.push((WorkerID::from(worker), FilterID::from(id), ExpiryGroup::from(&expiry)))
+        }
+        return Ok(output)
+    }
+
+    pub async fn get_expiry(&self, filter: FilterID) -> Result<Option<ExpiryGroup>> {
+        let data: Option<(String, )> = query_as("SELECT expiry_group FROM filters WHERE id = ?").bind(filter.to_i64()).fetch_optional(&self.db).await?;
+        Ok(match data {
+            Some((data, )) => Some(ExpiryGroup::from(&data)),
+            None => None
+        })
+    }
+
+    pub async fn create_filter(&self, worker: &WorkerID, expiry: &ExpiryGroup) -> Result<FilterID> {
+        let result = sqlx::query("INSERT INTO filters(worker, expiry_group) VALUES(?, ?)")
+        .bind(worker.to_string())
+        .bind(expiry.to_string())
+        .execute(&self.db).await?;
+        Ok(FilterID::from(result.last_insert_rowid()))
+    }
 
     // pub async fn create_index_data(&self, index_group: &IndexGroup, blob_id: BlobID, meta: Vec<(Vec<u8>, AccessControl)>, new_size: u64) -> Result<()> {
     //     let index_id = IndexID::new();
@@ -363,66 +406,6 @@ impl SQLiteInterface {
     //     Ok(trans.commit().await?)
     // }
 
-    pub async fn initialize_search(&self, code: String, req: SearchRequest) -> Result<InternalSearchStatus> {
-        todo!();
-    //     // Turn the expiry dates into a group range
-    //     let start = match req.start_date {
-    //         Some(value) => IndexGroup::create(&Some(value)),
-    //         None => IndexGroup::min(),
-    //     };
-    //     let end = match req.end_date {
-    //         Some(value) => IndexGroup::create(&Some(value)),
-    //         None => IndexGroup::max(),
-    //     };
-
-    //     // Get a list of currently active blobs in the range of groups
-    //     let mut conn = self.db.acquire().await?;
-    //     let pending: Vec<(Vec<u8>, )> = query_as("
-    //         SELECT data FROM index_index
-    //         WHERE ? <= expiry_group AND expiry_group <= ?")
-    //         .bind(start.as_str()).bind(end.as_str())
-    //         .fetch_all(&mut conn).await?;
-    //     let pending: Vec<(BlobID, IndexID)> = pending.into_iter()
-    //         .filter_map(|(data, )|postcard::from_bytes::<IndexEntry>(&data).ok())
-    //         .map(|entry|(entry.current_blob, entry.label))
-    //         .collect();
-
-    //     // Add operation to the search table
-    //     sqlx::query("INSERT INTO searches(code, data, search_group, start_time) VALUES(?, ?, ?, ?)")
-    //         .bind(&code)
-    //         .bind(&postcard::to_allocvec(&SearchRecord{
-    //             code: code.clone(),
-    //             yara_signature: req.yara_signature,
-    //             errors: Default::default(),
-    //             access: req.access,
-    //             view: req.view,
-    //             group: req.group.clone(),
-    //             initial_indices: pending.len() as u64,
-    //             query: req.query.clone(),
-    //             hit_files: Default::default(),
-    //             truncated: false,
-    //         })?)
-    //         .bind(req.group)
-    //         .bind(chrono::Utc::now().to_rfc3339())
-    //         // .bind(req.description)
-    //         .execute(&mut conn).await?;
-
-    //     for (blob, index) in pending {
-    //         sqlx::query(
-    //             "INSERT INTO filter_tasks(search, query, filter_id, filter_blob) VALUES(?,?,?,?)")
-    //             .bind(&code)
-    //             .bind(&postcard::to_allocvec(&req.query)?)
-    //             .bind(index.as_str())
-    //             .bind(blob.as_str())
-    //             .execute(&mut conn).await?;
-    //     }
-
-    //     self.work_notification.notify_waiters();
-    //     match self.search_status(code).await? {
-    //         Some(result) => Ok(result),
-    //         None => Err(anyhow::anyhow!("Result status could not be read.")),
-    //     }
-    }
 
     // pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
     //     let mut conn = self.db.acquire().await?;

@@ -1,11 +1,8 @@
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
-use crate::access::AccessControl;
 use crate::types::{ExpiryGroup, FilterID, WorkerID, Sha256};
 
 use super::database_sqlite::{SQLiteInterface, SearchRecord};
@@ -38,9 +35,9 @@ impl Database {
         }
     }
 
-    pub async fn finalize_search(&self, code: &str, hits: &HashSet<Sha256>, truncated: bool) -> Result<()> {
+    pub async fn finalize_search(&self, code: &str, hits: BTreeSet<Sha256>, errors: Vec<String>, truncated: bool) -> Result<()> {
         match self {
-            Database::SQLite(local) => local.finalize_search(code, hits, truncated).await
+            Database::SQLite(local) => local.finalize_search(code, hits, errors, truncated).await
         }
     }
 
@@ -62,8 +59,16 @@ impl Database {
         }
     }
 
+    pub async fn get_expiry(&self, filter: FilterID) -> Result<Option<ExpiryGroup>> {
+        match self {
+            Database::SQLite(local) => local.get_expiry(filter).await
+        }
+    }
+
     pub async fn create_filter(&self, worker: &WorkerID, expiry: &ExpiryGroup) -> Result<FilterID> {
-        todo!()
+        match self {
+            Database::SQLite(local) => local.create_filter(worker, expiry).await
+        }
     }
 
 }

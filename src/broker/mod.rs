@@ -3,7 +3,7 @@ pub mod auth;
 mod database;
 mod database_sqlite;
 
-use std::collections::{HashSet, HashMap, hash_map};
+use std::collections::{HashSet, HashMap, hash_map, BTreeSet};
 use std::sync::Arc;
 
 use futures::{StreamExt, SinkExt};
@@ -15,10 +15,11 @@ use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
-use anyhow::Result;
+use anyhow::{Result, Context};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::broker::interface::SearchRequestResponse;
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
@@ -26,9 +27,41 @@ use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, Cr
 
 use self::auth::Authenticator;
 use self::database::Database;
-use self::interface::{InternalSearchStatus, SearchRequest};
+use self::interface::{InternalSearchStatus, SearchRequest, StatusReport};
+
+pub async fn main(config: crate::config::Config) -> Result<()> {
+    // Initialize authenticator
+    info!("Initializing Authenticator");
+    let auth = Authenticator::from_config(config.authentication)?;
+
+    // Initialize database
+    info!("Connecting to database.");
+    let database = match config.database {
+        crate::config::Database::SQLite{path} => Database::new_sqlite(&path).await?,
+        crate::config::Database::SQLiteTemp{..} => Database::new_sqlite_temp().await?,
+    };
+
+    // Start server core
+    info!("Starting server core.");
+    let core = HouseCore::new(database,auth, config.core).await
+        .context("Error launching core.")?;
+
+    // Start http interface
+    let bind_address = match config.bind_address {
+        None => "localhost:8080".to_owned(),
+        Some(address) => address,
+    };
+    info!("Starting server interface on {bind_address}");
+    let api_job = tokio::task::spawn(interface::serve(bind_address, config.tls, core.clone()));
+
+    // Wait for server to stop
+    api_job.await.context("Error in HTTP interface.")?;
+    return Ok(())
+}
 
 
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CoreConfig {
     pub workers: HashMap<WorkerID, String>,
     pub per_filter_pending_limit: u64,
@@ -46,7 +79,7 @@ pub struct HouseCore {
     pub authenticator: Authenticator,
     pub config: CoreConfig,
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
-    pub worker_ingest: HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>,
+    pub worker_ingest: RwLock<HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>>,
     pub running_searches: RwLock<HashMap<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>,
     pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)>,
 }
@@ -56,7 +89,7 @@ impl HouseCore {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         // setup pool for yara assignments
-        let mut yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)> = Default::default();
+        let yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)> = Default::default();
         for _ in 0..(config.yara_jobs_per_worker.max(1)) {
             for row in config.workers.clone() {
                 yara_permits.add(row);
@@ -80,7 +113,7 @@ impl HouseCore {
             ingest_queue: send_ingest,
             config,
             client,
-            worker_ingest: Default::default(),
+            worker_ingest: RwLock::new(Default::default()),
             running_searches: RwLock::new(Default::default()),
             yara_permits
             // search_watchers: send_search,
@@ -88,18 +121,23 @@ impl HouseCore {
         });
 
         // Revive search workers for ongoing searches
-        let mut searches = core.running_searches.write().await;
-        for code in core.database.list_active_searches().await? {
-            let (send, recv) = mpsc::channel(64);
-            let handle = tokio::task::spawn(search_worker(core.clone(), recv, code.clone()));
-            searches.insert(code, (handle, send));
+        {
+            let mut searches = core.running_searches.write().await;
+            for code in core.database.list_active_searches().await? {
+                let (send, recv) = mpsc::channel(64);
+                let handle = tokio::task::spawn(search_worker(core.clone(), recv, code.clone()));
+                searches.insert(code, (handle, send));
+            }
         }
 
         // Launch worker inget watchers.
-        for (worker, address) in core.config.workers.iter() {
-            let (send, recv) = mpsc::unbounded_channel();
-            let handle = tokio::task::spawn(ingest_watcher(core.clone(), recv, worker.clone(), address.clone()));
-            core.worker_ingest.insert(worker.clone(), send);
+        {
+            let mut worker_ingest = core.worker_ingest.write().await;
+            for (worker, address) in core.config.workers.iter() {
+                let (send, recv) = mpsc::unbounded_channel();
+                let handle = tokio::task::spawn(ingest_watcher(core.clone(), recv, worker.clone(), address.clone()));
+                worker_ingest.insert(worker.clone(), send);
+            }
         }
 
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
@@ -139,17 +177,64 @@ impl HouseCore {
     }
 
     pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
-        let channel = self.worker_ingest.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
+        let workers = self.worker_ingest.read().await;
+        let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
         channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)));
         return Ok(())
     }
 
-}
+    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
+        let channel = {
+            let searches = self.running_searches.read().await;
+            if let Some((_, search)) = searches.get(&code) {
+                let (send, recv) = oneshot::channel();
+                search.send(SearcherMessage::Status(send));
+                Some(recv)
+            } else {
+                None
+            }
+        };
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IngestStatus {
-    pub active_batch: Option<u64>,
-    pub queue_size: u64,
+        match channel {
+            Some(recv) => match recv.await {
+                Ok(status) => return Ok(Some(status)),
+                Err(err) => { error!("{err}"); },
+            },
+            None => {}
+        }
+        self.database.search_status(&code).await
+    }
+
+    pub async fn status(self: &Arc<Self>) -> Result<StatusReport> {
+        let (ingest_send, ingest_recv) = oneshot::channel();
+        self.ingest_queue.send(IngestMessage::Status(ingest_send));
+
+        let mut watchers = HashMap::<WorkerID, oneshot::Receiver<HashMap<FilterID, u32>>>::new();
+        let workers = self.worker_ingest.read().await;
+        for (id, channel) in workers.iter() {
+            let (send, recv) = oneshot::channel();
+            channel.send(WorkerIngestMessage::Status(send));
+            watchers.insert(id.clone(), recv);
+        }
+
+        let mut ingest_watchers: HashMap<WorkerID, HashMap<FilterID, u32>> = Default::default();
+        for (id, sock) in watchers.into_iter() {
+            if let Ok(value) = sock.await {
+                ingest_watchers.insert(id, value);
+            }
+        }
+
+        let active_searches = {
+            self.running_searches.read().await.len() as u32
+        };
+
+        Ok(StatusReport{
+            ingest_check_queue: ingest_recv.await?,
+            active_searches,
+            ingest_watchers
+        })
+    }
+
 }
 
 #[derive(Debug)]
@@ -169,13 +254,13 @@ impl IngestTask {
 #[derive(Debug)]
 pub enum IngestMessage {
     IngestMessage(IngestTask),
-    Status(oneshot::Sender<IngestStatus>)
+    Status(oneshot::Sender<u32>)
 }
 
 #[derive(Debug)]
 pub enum WorkerIngestMessage {
     IngestMessage((IngestTask, FilterID)),
-    Status(oneshot::Sender<IngestStatus>)
+    Status(oneshot::Sender<HashMap<FilterID, u32>>)
 }
 
 
@@ -193,15 +278,15 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 }
 
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
-    let unchecked_buffer = HashMap::<Sha256, IngestTask>::new();
-    let check_worker: Option<JoinHandle<Result<Vec<IngestTask>>>> = None;
+    let mut unchecked_buffer = HashMap::<Sha256, IngestTask>::new();
+    let mut check_worker: JoinSet<Result<Vec<IngestTask>>> = JoinSet::new();
 
     loop {
         // Restart the check worker
-        if check_worker.is_none() && !unchecked_buffer.is_empty() {
+        if check_worker.is_empty() && !unchecked_buffer.is_empty() {
             let core = core.clone();
             // let tasks = ;
-            check_worker = Some(tokio::spawn(_ingest_check(core, unchecked_buffer)));
+            check_worker.spawn(_ingest_check(core, unchecked_buffer));
             unchecked_buffer = Default::default();
         }
 
@@ -216,23 +301,29 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
                 match message {
                     IngestMessage::IngestMessage(task) => {
-                        match unchecked_buffer.entry(task.info.hash) {
-                            hash_map::Entry::Occupied(entry) => { entry.get_mut().merge(task); },
+                        match unchecked_buffer.entry(task.info.hash.clone()) {
+                            hash_map::Entry::Occupied(mut entry) => { entry.get_mut().merge(task); },
                             hash_map::Entry::Vacant(entry) => { entry.insert(task); },
                         };
                     },
-                    IngestMessage::Status(_) => todo!(),
+                    IngestMessage::Status(resp) => {
+                        resp.send(unchecked_buffer.len() as u32);
+                    },
                 }
             }
 
             // If a check worker is running watch for it
-            res = check_worker.unwrap(), if check_worker.is_some() => {
-                check_worker = None;
+            res = check_worker.join_next(), if !check_worker.is_empty() => {
+                let res = match res {
+                    Some(res) => res,
+                    None => continue
+                };
+
                 match res {
                     Ok(Ok(delayed)) => {
                         for task in delayed {
-                            match unchecked_buffer.entry(task.info.hash) {
-                                hash_map::Entry::Occupied(entry) => { entry.get_mut().merge(task); },
+                            match unchecked_buffer.entry(task.info.hash.clone()) {
+                                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().merge(task); },
                                 hash_map::Entry::Vacant(entry) => { entry.insert(task); },
                             };
                         }
@@ -458,7 +549,13 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                             hash_map::Entry::Vacant(entry) => { entry.insert((filter, task)); },
                         }
                     },
-                    WorkerIngestMessage::Status(_) => todo!(),
+                    WorkerIngestMessage::Status(resp) => {
+                        let mut count = HashMap::<FilterID, u32>::new();
+                        for (id, _) in active.values() {
+                            count.insert(*id, 1 + count.get(id).unwrap_or(&0));
+                        }
+                        resp.send(count);
+                    },
                 }
             },
 
@@ -486,7 +583,11 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
 
                 // refresh any missing filters
-                todo!();
+                for filter in response.unknown_filters {
+                    if let Some(expiry) = core.database.get_expiry(filter).await? {
+                        core.install_filter(worker.clone(), expiry, filter).await?;
+                    }
+                }
             }
         }
     }
@@ -565,15 +666,20 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     None => break
                 };
 
-                todo!();
-                // match message {
-                //     // SearcherMessage::Status(status) => {
-                //     //     status.send(InternalSearchStatus {
-                //     //         view: ,
-                //     //         resp:
-                //     //     })
-                //     // },
-                // }
+                match message {
+                    SearcherMessage::Status(response) => {
+                        response.send(InternalSearchStatus {
+                            view: status.view.clone(),
+                            resp: SearchRequestResponse {
+                                code: code.to_owned(),
+                                finished: false,
+                                errors: errors.clone(),
+                                hits: vec![],
+                                truncated: false
+                            }
+                        });
+                    },
+                }
             },
             message = result_stream.recv() => {
                 let message = match message {
@@ -591,7 +697,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
     }
 
     // Run through yara jobs
-    let mut hits: HashSet<Sha256> = Default::default();
+    let mut hits: BTreeSet<Sha256> = Default::default();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
     let mut next_batch = None;
     let truncated = loop {
@@ -619,15 +725,20 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     None => return Ok(())
                 };
 
-                todo!();
-                // match message {
-                //     // SearcherMessage::Status(status) => {
-                //     //     status.send(InternalSearchStatus {
-                //     //         view: ,
-                //     //         resp:
-                //     //     })
-                //     // },
-                // }
+                match message {
+                    SearcherMessage::Status(response) => {
+                        response.send(InternalSearchStatus {
+                            view: status.view.clone(),
+                            resp: SearchRequestResponse {
+                                code: code.to_owned(),
+                                finished: false,
+                                errors: errors.clone(),
+                                hits: hits.iter().cloned().map(|x|x.hex()).collect(),
+                                truncated: false
+                            }
+                        });
+                    },
+                }
             },
             result = requests.join_next(), if !requests.is_empty() => {
                 let result = match result {
@@ -661,6 +772,8 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
     };
 
     // Save results
-    core.database.finalize_search(&status.code, &hits, truncated).await?;
+    core.database.finalize_search(&status.code, hits, errors, truncated).await?;
+    let mut searches = core.running_searches.write().await;
+    searches.remove(code);
     return Ok(())
 }

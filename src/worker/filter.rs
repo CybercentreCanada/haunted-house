@@ -281,7 +281,7 @@ impl ExtensibleTrigramFile {
         };
 
         'next_candidate: loop {
-            'next_cursor: for cursor in &sources {
+            'next_cursor: for cursor in &mut sources {
                 loop {
                     let next = match cursor.peek() {
                         Some(next) => *next,
@@ -373,14 +373,14 @@ impl ExtensibleTrigramFile {
     }
 
     // #[instrument]
-    fn read_initial_segment(&mut self, trigram: u32) -> Result<RawSegmentInfo> {
+    fn read_initial_segment(&self, trigram: u32) -> Result<RawSegmentInfo> {
         let location = self.get_initial_segment_offset(trigram) as usize;
         let data = &self.data[location..location+self.initial_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
     // #[instrument]
-    fn read_extended_segment(&mut self, segment: u32) -> Result<RawSegmentInfo> {
+    fn read_extended_segment(&self, segment: u32) -> Result<RawSegmentInfo> {
         let location = self.get_extended_segment_offset(segment) as usize;
         let data = &self.data[location..location+self.extended_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))

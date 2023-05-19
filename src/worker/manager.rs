@@ -24,7 +24,7 @@ use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkerConfig {
     pub filter_item_limit: u64,
     pub data_path: PathBuf,
@@ -36,7 +36,7 @@ pub struct WorkerConfig {
 }
 
 pub struct WorkerState {
-    pub database: Arc<Database>,
+    pub database: Database,
     pub running: watch::Receiver<bool>,
     pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>)>>,
     pub file_storage: BlobStorage,
@@ -46,7 +46,7 @@ pub struct WorkerState {
 
 impl WorkerState {
 
-    pub async fn new(database: Arc<Database>, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerConfig, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
+    pub async fn new(database: Database, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerConfig, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
         let new = Arc::new(Self {
             database,
             running,

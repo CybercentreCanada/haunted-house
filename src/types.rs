@@ -49,9 +49,9 @@ impl std::str::FromStr for Sha256 {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.len() != 64 {
-            return Err(anyhow::anyhow!("Invalid hash: wrong number of bytes"));   
+            return Err(anyhow::anyhow!("Invalid hash: wrong number of bytes"));
         }
-        let bytes = Box::new([0u8; 32]);
+        let mut bytes = Box::new([0u8; 32]);
         hex::decode_to_slice(s, &mut *bytes)?;
         Ok(Self(bytes))
     }
@@ -110,21 +110,45 @@ impl std::fmt::Display for FilterID {
     }
 }
 
-impl std::str::FromStr for FilterID {
-    type Err = ErrorKinds;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() != 16 {
-            return Err(Self::Err::CorruptFilterID);   
-        }
-        let mut bytes = [0u8; 8];
-        if let Err(_) = hex::decode_to_slice(s, &mut bytes) {
-            return Err(Self::Err::CorruptFilterID);
-        }
-        Ok(Self(i64::from_le_bytes(bytes)))
+impl From<i64> for FilterID {
+    fn from(value: i64) -> Self {
+        FilterID(value)
     }
 }
+
+impl FilterID {
+    pub fn to_i64(&self) -> i64 {
+        self.0
+    }
+}
+
+// impl std::str::FromStr for FilterID {
+//     type Err = ErrorKinds;
+
+//     fn from_str(s: &str) -> Result<Self, Self::Err> {
+//         if s.len() != 16 {
+//             return Err(Self::Err::CorruptFilterID);
+//         }
+//         let mut bytes = [0u8; 8];
+//         if let Err(_) = hex::decode_to_slice(s, &mut bytes) {
+//             return Err(Self::Err::CorruptFilterID);
+//         }
+//         Ok(Self(i64::from_le_bytes(bytes)))
+//     }
+// }
 
 
 #[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
 pub struct WorkerID(String);
+
+impl From<String> for WorkerID {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for WorkerID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}

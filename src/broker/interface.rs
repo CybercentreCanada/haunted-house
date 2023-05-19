@@ -3,12 +3,11 @@
 use std::collections::{HashSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Instant, Duration};
 use anyhow::{Result, Context};
 
 use chrono::serde::ts_seconds_option;
 use futures::{StreamExt, SinkExt};
-use log::{error, debug, info};
+use log::{error, info};
 use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
 use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse, Response};
@@ -26,9 +25,9 @@ use crate::access::AccessControl;
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
 use crate::query::Query;
-use crate::types::{FileInfo, Sha256, ExpiryGroup};
+use crate::types::{FileInfo, Sha256, ExpiryGroup, WorkerID, FilterID};
 
-use super::{HouseCore, IngestStatus, IngestTask};
+use super::{HouseCore, IngestTask};
 use super::auth::Role;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -100,26 +99,7 @@ impl StatusInterface {
     }
 
     pub async fn get_status(&self) -> Result<StatusReport> {
-        let ingest = self.core.ingest_status().await?;
-        // let mut indices = self.core.database.list_indices().await?;
-        // indices.sort();
-
-        // let mut file_count: HashMap<IndexGroup, u64> = Default::default();
-
-        // for (group, index) in indices.iter() {
-            // let mut count = *file_count.get(group).unwrap_or(&0);
-            // count += self.core.database.count_files(index).await?;
-            // file_count.insert(group.clone(), count);
-        // }
-
-        // let mut file_counts: Vec<_> = file_count.into_iter().collect();
-        // file_counts.sort();
-
-        Ok(StatusReport {
-            ingest,
-            // active_filters: indices,
-            // file_counts
-        })
+        Ok(self.core.status().await?)
     }
 }
 
@@ -177,10 +157,6 @@ impl SearcherInterface {
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         self.core.search_status(code).await
     }
-
-    // pub async fn tag_prompt(&self, req: PromptQuery) -> Result<PromptResult> {
-    //     self.core.database.tag_prompt(req).await
-    // }
 }
 
 #[derive(Clone)]
@@ -198,10 +174,10 @@ impl IngestInterface {
         let hash = Sha256::from_str(&request.hash)?;
         self.core.ingest_queue.send(super::IngestMessage::IngestMessage(IngestTask{
             info: FileInfo{
-                hash, 
-                access: request.access, 
-                expiry: ExpiryGroup::create(&request.expiry) 
-            }, 
+                hash,
+                access: request.access,
+                expiry: ExpiryGroup::create(&request.expiry)
+            },
             response: vec![send]
         }))?;
         return recv.await?;
@@ -230,12 +206,11 @@ pub struct InternalSearchStatus {
 #[derive(Serialize)]
 pub struct SearchRequestResponse {
     pub code: String,
-    pub group: String,
     pub finished: bool,
     pub errors: Vec<String>,
-    pub total_indices: u64,
-    pub pending_indices: u64,
-    pub pending_candidates: u64,
+    // pub total_indices: u64,
+    // pub pending_indices: u64,
+    // pub pending_candidates: u64,
     pub hits: Vec<String>,
     pub truncated: bool,
 }
@@ -427,10 +402,10 @@ async fn get_status() -> Result<()> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StatusReport {
-    ingest: IngestStatus,
-    // active_filters: Vec<(IndexGroup, IndexID)>,
-    // file_counts: Vec<(IndexGroup, u64)>,
+pub struct StatusReport {
+    pub ingest_check_queue: u32,
+    pub ingest_watchers: HashMap<WorkerID, HashMap<FilterID, u32>>,
+    pub active_searches: u32,
 }
 
 #[handler]

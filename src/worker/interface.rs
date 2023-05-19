@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context};
 use futures::{SinkExt, StreamExt};
+use log::error;
 use poem::web::websocket::{WebSocket, Message};
 use poem::{handler, Route, get, EndpointExt, Server, delete, post, IntoResponse};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
@@ -72,6 +73,10 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
             } else {
                 return
             },
+            Some(Err(err)) => {
+                error!("Bad filter command: {err}");
+                return
+            }
             None => return,
         };
 
