@@ -5,9 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 // use std::time::Duration;
 use anyhow::{Context, Result};
-use log::{debug, info};
+use bitvec::vec::BitVec;
+use log::{debug, info, error};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::JoinSet;
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::error::ErrorKinds;
@@ -16,7 +18,7 @@ use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;
 use super::database::{IngestStatus, Database};
-use super::filter_worker::FilterWorker;
+use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse};
 
 
@@ -28,12 +30,13 @@ pub struct WorkerConfig {
     pub data_reserve: u64,
     pub initial_segment_size: u32,
     pub extended_segment_size: u32,
+    pub ingest_batch_size: u32,
 }
 
 pub struct WorkerState {
     pub database: Arc<Database>,
     pub running: watch::Receiver<bool>,
-    pub filters: tokio::sync::RwLock<HashMap<FilterID, FilterWorker>>,
+    pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>)>>,
     pub file_cache: BlobCache,
     pub config: WorkerConfig
 }
@@ -137,6 +140,77 @@ impl WorkerState {
         self.database.ingest_file(id, info).await
     }
 
+    pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) {
+        while let Err(err) = self._ingest_feeder(id, writer, notify).await {
+            error!("{err}");
+        }
+    }
+
+    pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {
+        loop {
+            // Get next set of incomplete files
+            let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
+            if batch.is_empty() {
+                tokio::time::timeout(tokio::time::Duration::from_secs(300), notify.notified()).await;
+                continue
+            }
+
+            // Gather file data
+            // let files_being_ingested = new_items.len();
+            let mut data = vec![];
+            let mut files = vec![];
+            // let mut outstanding = Vec::from_iter(new_items.keys().cloned());
+            let mut active: JoinSet<(u64, Sha256, Result<BitVec>)> = JoinSet::new();
+            while !batch.is_empty() && !active.is_empty() {
+                while !batch.is_empty() && active.len() < 10 {
+                    if let Some((id, hash)) = batch.pop(){
+                        // debug!("Ingest {} requesting hash {}", index_group.as_str(), hex::encode(&hash));
+                        active.spawn(self.clone().prepare_vector(id, hash));
+                    }
+                }
+
+                let (id, hash, result) = match active.join_next().await {
+                    Some(res) => res?,
+                    None => continue,
+                };
+
+                // debug!("Ingest {} finished hash {}", index_group.as_str(), hex::encode(&hash));
+                match result {
+                    Ok(bits) => {
+                        files.push(bits);
+                        remaining_responses.extend(responses);
+                    },
+                    Err(err) => {
+                        error!("Error gathering file for {}: {err}", hex::encode(&hash));
+                        for res in responses {
+                            _ = res.send(Err(anyhow::format_err!("Error gathering file {err}")));
+                        }
+                    }
+                }
+            }
+
+            // Send the files to the writer
+            let (finished_send, finished_recv) = oneshot::channel();
+            writer.send().await;
+
+            // Wait for a positive response
+            if let Some(()) = finished_recv.await {
+                // Commit those file ids
+            }
+        }
+    }
+
+    async fn prepare_vector(self: Arc<WorkerState>, id: u64, hash: Sha256) -> (u64, Sha256, Result<BitVec>) {
+        let stream = match self.file_storage.stream(&hash.hex()).await {
+            Ok(stream) => stream,
+            Err(err) => return (id, hash, Err(err)),
+        };
+    
+        let result = TrigramFilter::build_file(stream).await;
+    
+        return (id, hash, result)
+    }
+    
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {
         Ok(self.database.get_filters(first, last).await?)
     }

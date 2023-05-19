@@ -80,5 +80,9 @@ impl Database {
             Database::SQLite(db) => db.select_file_hashes(id, file_indices, access).await,
         }
     }
+
+    pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, Sha256)>> {
+        todo!()
+    }
 }
 
