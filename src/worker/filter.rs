@@ -908,11 +908,13 @@ mod test {
         {
             let timer = std::time::Instant::now();
             let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
-            println!("open new {:.2}", timer.elapsed().as_secs_f64());
+            println!("= open new {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams)?;
+            println!("= write batch {:.2}", timer.elapsed().as_secs_f64());
+            let timer = std::time::Instant::now();
             file.apply_operations(x.0, x.1)?;
-            println!("write batch {:.2}", timer.elapsed().as_secs_f64());
+            println!("= apply batch {:.2}", timer.elapsed().as_secs_f64());
         }
 
         // // Recreate the trigrams
