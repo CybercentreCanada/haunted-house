@@ -50,7 +50,7 @@ impl FilterWorker {
     }
 }
 
-pub fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerConfig, id: FilterID, ready_send: watch::Sender<bool>, ready_recv: watch::Receiver<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
+fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerConfig, id: FilterID, ready_send: watch::Sender<bool>, ready_recv: watch::Receiver<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
     // Open the file
     let directory = config.data_path.join("filters");
     std::fs::create_dir_all(&directory);
@@ -90,17 +90,17 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
                     filter.write_batch(&mut batch)?
                 };
                 {
-                    let filter = filter.blocking_write();
-                    filter.apply_batch(batch)?;
+                    let mut filter = filter.blocking_write();
+                    filter.apply_operations(batch.0, batch.1)?;
                 }
-                finished.send(());
+                _ = finished.send(());
             }
         }
     }
     return Ok(())
 }
 
-pub fn reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, mut reader_recv: mpsc::Receiver<ReaderCommand>) {
+fn reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, mut reader_recv: mpsc::Receiver<ReaderCommand>) {
     loop {
         match _reader_worker(filter.clone(), &mut reader_recv) {
             Ok(()) => break,
@@ -111,7 +111,7 @@ pub fn reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, mut reader_recv
     }
 }
 
-pub fn _reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, reader_recv: &mut mpsc::Receiver<ReaderCommand>) -> Result<()> {
+fn _reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, reader_recv: &mut mpsc::Receiver<ReaderCommand>) -> Result<()> {
     while let Some(message) = reader_recv.blocking_recv() {
         match message {
             ReaderCommand::Query(query, response) => {

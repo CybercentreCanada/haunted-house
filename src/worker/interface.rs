@@ -29,8 +29,8 @@ use super::manager::{WorkerState};
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateIndexRequest {
-    filter_id: FilterID,
-    expiry: ExpiryGroup
+    pub filter_id: FilterID,
+    pub expiry: ExpiryGroup
 }
 
 #[handler]
@@ -143,7 +143,7 @@ async fn update_file_info(state: Data<&Arc<WorkerState>>, request: Json<UpdateFi
 
 #[derive(Serialize, Deserialize)]
 pub struct IngestFilesRequest {
-    files: Vec<(FilterID, FileInfo)>
+    pub files: Vec<(FilterID, FileInfo)>
 }
 
 #[derive(Serialize, Deserialize)]

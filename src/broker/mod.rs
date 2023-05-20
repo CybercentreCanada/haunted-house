@@ -238,14 +238,14 @@ impl HouseCore {
 }
 
 #[derive(Debug)]
-struct IngestTask {
+pub struct IngestTask {
     pub info: FileInfo,
     pub response: Vec<oneshot::Sender<Result<()>>>
 }
 
 impl IngestTask {
     pub fn merge(&mut self, task: IngestTask) {
-        self.info.expiry = self.info.expiry.max(task.info.expiry);
+        self.info.expiry = self.info.expiry.clone().max(task.info.expiry);
         self.info.access = self.info.access.or(&task.info.access).simplify();
         self.response.extend(task.response.into_iter());
     }

@@ -387,7 +387,7 @@ impl ExtensibleTrigramFile {
     }
 
     // #[instrument]
-    pub fn write_batch(&self, files: &mut [(u64, BitVec)]) -> Result<HashSet<u64>> {
+    pub fn write_batch(&self, files: &mut [(u64, BitVec)]) -> Result<(File, u32)> {
         // prepare the buffer for operations
         let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
         let mut skipped = HashSet::<u64>::new();
@@ -565,9 +565,9 @@ impl ExtensibleTrigramFile {
         let stamp = std::time::Instant::now();
 
         // Apply operation set
-        self.apply_operations(write_buffer, self.extended_segments + added_segments).context("apply operations")?;
-        println!("Operation file applied {:.2}", stamp.elapsed().as_secs_f64());
-        return Ok(skipped)
+        // self.apply_operations(write_buffer, self.extended_segments + added_segments).context("apply operations")?;
+        // println!("Operation file applied {:.2}", stamp.elapsed().as_secs_f64());
+        return Ok((write_buffer, self.extended_segments + added_segments))
     }
 
     fn check_and_apply_operations(&mut self, mut buffer: File) -> Result<()> {
@@ -592,7 +592,7 @@ impl ExtensibleTrigramFile {
     }
 
     // #[instrument]
-    fn apply_operations(&mut self, mut source: File, extended_segments: u32) -> Result<()> {
+    pub fn apply_operations(&mut self, mut source: File, extended_segments: u32) -> Result<()> {
         let stamp = std::time::Instant::now();
         source.seek(SeekFrom::Start(0)).context("reseting the operation source")?;
 
@@ -695,7 +695,8 @@ mod test {
         let location = tempdir.path().join("test");
         {
             let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
-            file.write_batch(&mut trigrams).context("write batch")?;
+            let x = file.write_batch(&mut trigrams).context("write batch")?;
+            file.apply_operations(x.0, x.1);
             assert_eq!(file.extended_segments, 0)
         }
 
@@ -738,7 +739,8 @@ mod test {
         let location = tempdir.path().join("test");
         {
             let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
-            file.write_batch(&mut trigrams)?;
+            let x = file.write_batch(&mut trigrams)?;
+            file.apply_operations(x.0, x.1);
             assert!(file.extended_segments > 0)
         }
 
@@ -787,10 +789,12 @@ mod test {
             let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
             println!("open new {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
-            file.write_batch(&mut trigrams[0..10])?;
+            let x = file.write_batch(&mut trigrams[0..10])?;
+            file.apply_operations(x.0, x.1);
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
-            file.write_batch(&mut trigrams[10..20])?;
+            let x = file.write_batch(&mut trigrams[10..20])?;
+            file.apply_operations(x.0, x.1);
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
         }
 
@@ -848,7 +852,8 @@ mod test {
             let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
             println!("open new {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
-            file.write_batch(&mut trigrams)?;
+            let x = file.write_batch(&mut trigrams)?;
+            file.apply_operations(x.0, x.1)?;
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
         }
 
