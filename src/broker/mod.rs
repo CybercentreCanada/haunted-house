@@ -92,7 +92,9 @@ impl HouseCore {
         let yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)> = Default::default();
         for _ in 0..(config.yara_jobs_per_worker.max(1)) {
             for row in config.workers.clone() {
-                yara_permits.add(row);
+                if let Err((_, err)) = yara_permits.add(row).await {
+                    return Err(err.into())
+                }
             }
         }
 
@@ -135,7 +137,7 @@ impl HouseCore {
             let mut worker_ingest = core.worker_ingest.write().await;
             for (worker, address) in core.config.workers.iter() {
                 let (send, recv) = mpsc::unbounded_channel();
-                let handle = tokio::task::spawn(ingest_watcher(core.clone(), recv, worker.clone(), address.clone()));
+                tokio::task::spawn(ingest_watcher(core.clone(), recv, worker.clone(), address.clone()));
                 worker_ingest.insert(worker.clone(), send);
             }
         }
@@ -179,7 +181,7 @@ impl HouseCore {
     pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
         let workers = self.worker_ingest.read().await;
         let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
-        channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)));
+        channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)))?;
         return Ok(())
     }
 
@@ -188,7 +190,7 @@ impl HouseCore {
             let searches = self.running_searches.read().await;
             if let Some((_, search)) = searches.get(&code) {
                 let (send, recv) = oneshot::channel();
-                search.send(SearcherMessage::Status(send));
+                _ = search.send(SearcherMessage::Status(send)).await;
                 Some(recv)
             } else {
                 None
@@ -207,13 +209,13 @@ impl HouseCore {
 
     pub async fn status(self: &Arc<Self>) -> Result<StatusReport> {
         let (ingest_send, ingest_recv) = oneshot::channel();
-        self.ingest_queue.send(IngestMessage::Status(ingest_send));
+        self.ingest_queue.send(IngestMessage::Status(ingest_send))?;
 
         let mut watchers = HashMap::<WorkerID, oneshot::Receiver<HashMap<FilterID, u32>>>::new();
         let workers = self.worker_ingest.read().await;
         for (id, channel) in workers.iter() {
             let (send, recv) = oneshot::channel();
-            channel.send(WorkerIngestMessage::Status(send));
+            channel.send(WorkerIngestMessage::Status(send))?;
             watchers.insert(id.clone(), recv);
         }
 
@@ -307,7 +309,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         };
                     },
                     IngestMessage::Status(resp) => {
-                        resp.send(unchecked_buffer.len() as u32);
+                        _ = resp.send(unchecked_buffer.len() as u32);
                     },
                 }
             }
@@ -385,7 +387,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         for sha in res.processed {
             if let Some(task) = tasks.remove(&sha) {
                 for response in task.response {
-                    response.send(Ok(()));
+                    _ = response.send(Ok(()));
                 }
             }
         }
@@ -412,7 +414,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
 
     // Accept assignments from workers that are uncontroversial
     for sha in tasks.keys().cloned().collect_vec() {
-        let task = tasks.get(&sha).unwrap();
+        // let task = tasks.get(&sha).unwrap();
         let mut best = None;
         let mut best_pending = u64::MAX;
 
@@ -465,8 +467,8 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         let mut filter_count = HashMap::<WorkerID, u32>::new();
         for worker in &workers_without_pressure {
             let mut count = 0;
-            for filter_set in filter_assignment.get(&task.info.expiry) {
-                for (ww, ff) in filter_set {
+            if let Some(filter_set) = filter_assignment.get(&task.info.expiry){
+                for (ww, _ff) in filter_set {
                     if ww == worker {
                         count += 1;
                     }
@@ -554,7 +556,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         for (id, _) in active.values() {
                             count.insert(*id, 1 + count.get(id).unwrap_or(&0));
                         }
-                        resp.send(count);
+                        _ = resp.send(count);
                     },
                 }
             },
@@ -577,7 +579,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 for hash in response.completed {
                     if let Some((_, task)) = active.remove(&hash) {
                         for response in task.response {
-                            response.send(Ok(()));
+                            _ = response.send(Ok(()));
                         }
                     }
                 }
@@ -629,13 +631,15 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
     })?;
 
     let (client_sender, mut result_stream) = mpsc::channel(128);
-    for (worker, address) in &core.config.workers {
+    for (_worker, address) in &core.config.workers {
         let address = websocket_address(address);
         let (mut socket, _) = tokio_tungstenite::connect_async(address + "/search/filter").await?;
         let client_sender = client_sender.clone();
         let request_body = request_body.clone();
         tokio::spawn(async move {
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await;
+            if let Err(err) = socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await {
+                _ = client_sender.send(FilterSearchResponse::Error(format!("connection error: {err}")));
+            }
 
             while let Some(message) = socket.next().await {
                 let message: FilterSearchResponse = match message {
@@ -649,7 +653,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     },
                     Err(err) => FilterSearchResponse::Error(format!("message error: {err}")),
                 };
-                client_sender.send(message);
+                _ = client_sender.send(message);
             }
         });
     }
@@ -668,7 +672,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
                 match message {
                     SearcherMessage::Status(response) => {
-                        response.send(InternalSearchStatus {
+                        _ = response.send(InternalSearchStatus {
                             view: status.view.clone(),
                             resp: SearchRequestResponse {
                                 code: code.to_owned(),
@@ -727,7 +731,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
                 match message {
                     SearcherMessage::Status(response) => {
-                        response.send(InternalSearchStatus {
+                        _ = response.send(InternalSearchStatus {
                             view: status.view.clone(),
                             resp: SearchRequestResponse {
                                 code: code.to_owned(),

@@ -226,7 +226,7 @@ impl WorkerState {
             // Get next set of incomplete files
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
             if batch.is_empty() {
-                tokio::time::timeout(tokio::time::Duration::from_secs(300), notify.notified()).await;
+                _ = tokio::time::timeout(tokio::time::Duration::from_secs(300), notify.notified()).await;
                 continue
             }
 
@@ -234,7 +234,7 @@ impl WorkerState {
             let files = batch.iter().map(|row|row.0).collect_vec();
             let batch = batch.into_iter().map(|row|(row.0, row.1)).collect_vec();
             let (finished_send, finished_recv) = oneshot::channel();
-            writer.send(WriterCommand::Ingest(batch, finished_send)).await;
+            writer.send(WriterCommand::Ingest(batch, finished_send)).await?;
 
             // Wait for a positive response
             if let Ok(()) = finished_recv.await {
@@ -275,12 +275,11 @@ impl WorkerState {
             match filter.query(query).await {
                 Ok(file_indices) => {
                     match self.database.select_file_hashes(id, &file_indices, &access).await {
-                        Ok(files) => respond.send(FilterSearchResponse::Candidates(files)),
-                        Err(err) => respond.send(FilterSearchResponse::Error(err.to_string()))
-
+                        Ok(files) => { _ = respond.send(FilterSearchResponse::Candidates(files)).await; },
+                        Err(err) => { _ = respond.send(FilterSearchResponse::Error(err.to_string())).await; }
                     };
                 }
-                Err(err) => { respond.send(FilterSearchResponse::Error(err.to_string())); },
+                Err(err) => { _ = respond.send(FilterSearchResponse::Error(err.to_string())); },
             };
         }
     }

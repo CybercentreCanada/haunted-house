@@ -147,9 +147,9 @@ mod test {
         assert_eq!(HashSet::<i64>::from_iter(collection.pop_batch(10).await?.into_iter()), HashSet::from_iter([10, 11]));
         assert!(collection.pop_batch(10).await?.is_empty());
 
-        collection.insert(&10);
-        collection.insert(&11);
-        collection.insert(&12);
+        collection.insert(&10).await?;
+        collection.insert(&11).await?;
+        collection.insert(&12).await?;
 
         let mut values = collection.pop_batch(2).await?;
         assert_eq!(values.len(), 2);

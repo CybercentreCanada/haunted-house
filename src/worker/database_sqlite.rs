@@ -16,7 +16,7 @@ use super::database::IngestStatus;
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    work_notification: tokio::sync::Notify,
+    // work_notification: tokio::sync::Notify,
     filter_sizes: tokio::sync::Mutex<HashMap<FilterID, u64>>,
     filter_pending: tokio::sync::RwLock<HashMap<FilterID, HashSet<Sha256>>>,
     _temp_dir: Option<tempfile::TempDir>,
@@ -52,7 +52,7 @@ impl SQLiteInterface {
 
         let db = Self {
             db: pool,
-            work_notification: Default::default(),
+            // work_notification: Default::default(),
             _temp_dir: None,
             filter_sizes: tokio::sync::Mutex::new(Default::default()),
             filter_pending: tokio::sync::RwLock::new(Default::default())

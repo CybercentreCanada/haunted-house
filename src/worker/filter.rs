@@ -668,7 +668,7 @@ mod test {
     use anyhow::{Result, Context};
     use bitvec::vec::BitVec;
     use itertools::Itertools;
-    use rand::{Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, thread_rng};
 
     use crate::worker::filter::ExtensibleTrigramFile;
 
@@ -740,13 +740,13 @@ mod test {
         {
             let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
             let x = file.write_batch(&mut trigrams)?;
-            file.apply_operations(x.0, x.1);
+            file.apply_operations(x.0, x.1)?;
             assert!(file.extended_segments > 0)
         }
 
         // Read it again
         {
-            let mut file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(&location)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 if trigram == 0 {
@@ -774,9 +774,13 @@ mod test {
 
         for ii in (1..21).rev() {
             let mut data = BitVec::repeat(false, 1 << 24);
-            for jj in 0..(1 << 24) {
-                data.set(jj, prng.gen_bool(0.2));
+            let raw = data.as_raw_mut_slice();
+            for part in raw {
+                *part = prng.gen::<usize>() & prng.gen::<usize>() & prng.gen::<usize>();
             }
+            // for jj in 0..(1 << 24) {
+            //     data.set(jj, prng.gen_bool(0.2));
+            // }
             trigrams.push((ii, data));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
@@ -790,11 +794,11 @@ mod test {
             println!("open new {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams[0..10])?;
-            file.apply_operations(x.0, x.1);
+            file.apply_operations(x.0, x.1)?;
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams[10..20])?;
-            file.apply_operations(x.0, x.1);
+            file.apply_operations(x.0, x.1)?;
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
         }
 
@@ -806,7 +810,7 @@ mod test {
                 recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
             }
 
-            let mut file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(&location)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 for index in values {
@@ -817,7 +821,7 @@ mod test {
             let trigrams: HashMap<u64, BitVec> = trigrams.into_iter().collect();
 
             for (index, values) in recreated.into_iter().enumerate() {
-                assert_eq!(*trigrams.get(&(index as u64+1)).unwrap(), values)
+                assert!(*trigrams.get(&(index as u64+1)).unwrap() == values)
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
@@ -826,7 +830,49 @@ mod test {
 
     #[test]
     fn duplicate_batch() -> Result<()> {
-        todo!()
+        let mut data = BitVec::repeat(false, 1 << 24);
+        let raw = data.as_raw_mut_slice();
+        let mut prng = thread_rng();
+        for part in raw {
+            *part = prng.gen::<usize>() & prng.gen::<usize>() & prng.gen::<usize>();
+        }
+
+        let tempdir = tempfile::tempdir()?;
+        let location = tempdir.path().join("test");
+        {
+            println!("### First");
+            let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
+            let mut trigrams = vec![(1, data.clone())];
+            let x = file.write_batch(&mut trigrams)?;
+            file.apply_operations(x.0, x.1)?;
+        }
+
+        {
+            println!("### Duplicate");
+            let size = std::fs::metadata(&location)?.len();
+            let mut file = ExtensibleTrigramFile::open(&location)?;
+            let mut trigrams = vec![(1, data.clone())];
+            let x = file.write_batch(&mut trigrams)?;
+            file.apply_operations(x.0, x.1)?;
+            assert_eq!(size, std::fs::metadata(&location)?.len());
+        }
+
+        {
+            let mut recreated: BitVec<usize> = BitVec::repeat(false, TRIGRAM_RANGE as usize);
+
+            let file = ExtensibleTrigramFile::open(&location)?;
+            for trigram in 0..(1<<24) {
+                let values = file.read_trigram(trigram)?;
+                if values.contains(&1) {
+                    recreated.set(trigram as usize, true);
+                }
+            }
+
+            assert!(data == recreated);
+        }
+
+
+        return Ok(())
     }
 
     #[test]
@@ -837,9 +883,12 @@ mod test {
         let mut prng = rand::rngs::StdRng::seed_from_u64(0);
         for ii in 1..500 {
             let mut data = BitVec::repeat(false, 1 << 24);
-            for jj in 0..(1 << 24) {
-                data.set(jj, prng.gen_bool(0.2));
+            for part in data.as_raw_mut_slice() {
+                *part = prng.gen::<usize>() & prng.gen::<usize>() & prng.gen::<usize>();
             }
+                // for jj in 0..(1 << 24) {
+            //     data.set(jj, prng.gen_bool(0.2));
+            // }
             trigrams.push((ii, data));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());

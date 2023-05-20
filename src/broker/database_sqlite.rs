@@ -15,7 +15,7 @@ use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestRespons
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    work_notification: tokio::sync::Notify,
+    // work_notification: tokio::sync::Notify,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -75,7 +75,7 @@ impl SQLiteInterface {
 
         Ok(Self {
             db: pool,
-            work_notification: Default::default(),
+            // work_notification: Default::default(),
             _temp_dir: None,
         })
     }
