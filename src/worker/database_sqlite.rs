@@ -83,15 +83,16 @@ impl SQLiteInterface {
         Ok(db)
     }
 
-    pub async fn new_temp() -> Result<Self> {
-        let tempdir = tempfile::tempdir()?;
-        let path = tempdir.path().join("house.db");
+    // #[cfg(test)]
+    // pub async fn new_temp() -> Result<Self> {
+    //     let tempdir = tempfile::tempdir()?;
+    //     let path = tempdir.path().join("house.db");
 
-        let mut obj = Self::new(path.to_str().unwrap()).await?;
-        obj._temp_dir = Some(tempdir);
+    //     let mut obj = Self::new(path.to_str().unwrap()).await?;
+    //     obj._temp_dir = Some(tempdir);
 
-        Ok(obj)
-    }
+    //     Ok(obj)
+    // }
 
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;

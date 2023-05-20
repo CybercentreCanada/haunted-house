@@ -83,7 +83,7 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
         // Gather the filters related to this query
         let filter_ids = match state.get_filters(&request.expiry_group_range.0, &request.expiry_group_range.1).await {
             Ok(filter_ids) => filter_ids,
-            Err(err) => {
+            Err(_err) => {
                 return
             }
         };

@@ -65,37 +65,38 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists dataset (
-            data BLOB NOT NULL PRIMARY KEY,
+            data BLOB NOT NULL PRIMARY KEY
         )")).execute(&mut con).await.context("error creating table for set")?;
 
         return Ok(())
     }
 
-    pub async fn insert(&self, item: &Item) -> Result<bool> {
-        // Insert file entry
-        let result = sqlx::query(&format!("INSERT INTO dataset(data) VALUES(?)"))
-        .bind(postcard::to_allocvec(&item)?)
-        .execute(&self.db).await;
-        match result {
-            Ok(_) => return Ok(true),
-            Err(err) => {
-                let constraint_failed = err.to_string().contains("UNIQUE constraint failed")
-                    || err.to_string().contains("1062 (23000)");
+    // #[cfg(test)]
+    // pub async fn insert(&self, item: &Item) -> Result<bool> {
+    //     // Insert file entry
+    //     let result = sqlx::query(&format!("INSERT INTO dataset(data) VALUES(?)"))
+    //     .bind(postcard::to_allocvec(&item)?)
+    //     .execute(&self.db).await;
+    //     match result {
+    //         Ok(_) => return Ok(true),
+    //         Err(err) => {
+    //             let constraint_failed = err.to_string().contains("UNIQUE constraint failed")
+    //                 || err.to_string().contains("1062 (23000)");
 
-                if constraint_failed {
-                    return Ok(false)
-                }
-                return Err(err.into())
-            },
-        };
-    }
+    //             if constraint_failed {
+    //                 return Ok(false)
+    //             }
+    //             return Err(err.into())
+    //         },
+    //     };
+    // }
 
-    pub async fn insert_batch(&self, items: &Vec<Item>) -> Result<()> {
+    pub async fn insert_batch(&self, items: &[Item]) -> Result<()> {
         let mut trans = self.db.begin().await?;
 
         for item in items {
             // Insert file entry
-            let result = sqlx::query(&format!("INSERT INTO dataset(data) VALUES(?)"))
+            let result = sqlx::query("INSERT INTO dataset(data) VALUES(?)")
             .bind(postcard::to_allocvec(&item)?)
             .execute(&mut trans).await;
             match result {
@@ -117,8 +118,8 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
     }
 
     pub async fn pop_batch(&self, limit: u32) -> Result<Vec<Item>> {
-        let data: Vec<(Vec<u8>, )> = sqlx::query_as(&format!("DELETE FROM dataset LIMIT {limit} RETURNING data"))
-            .fetch_all(&self.db).await?;
+        let query_str = format!("DELETE FROM dataset WHERE data IN (SELECT data FROM dataset LIMIT {limit}) RETURNING data");
+        let data: Vec<(Vec<u8>, )> = sqlx::query_as(&query_str).fetch_all(&self.db).await?;
         let mut output = vec![];
         for (data, ) in data {
             output.push(postcard::from_bytes(&data)?);
@@ -138,18 +139,24 @@ mod test {
     async fn deduplicate() -> Result<()> {
         let collection = SqliteSet::<i64>::new_temp().await?;
 
-        collection.insert(&10).await?;
-        collection.insert(&11).await?;
-        collection.insert(&10).await?;
-        collection.insert(&10).await?;
-        collection.insert(&11).await?;
+        collection.insert_batch(&[10, 11, 10]).await?;
+        collection.insert_batch(&[11]).await?;
+        collection.insert_batch(&[10]).await?;
+        collection.insert_batch(&[10, 11]).await?;
+        collection.insert_batch(&[11, 11]).await?;
 
-        assert_eq!(HashSet::<i64>::from_iter(collection.pop_batch(10).await?.into_iter()), HashSet::from_iter([10, 11]));
-        assert!(collection.pop_batch(10).await?.is_empty());
 
-        collection.insert(&10).await?;
-        collection.insert(&11).await?;
-        collection.insert(&12).await?;
+        let mut aa = collection.pop_batch(10).await?;
+        let mut bb = collection.pop_batch(10).await?;
+        aa.sort();
+        bb.sort();
+        println!("{aa:?} {bb:?}");
+
+        assert_eq!(aa, vec![10, 11]);
+        assert!(bb.is_empty());
+
+        collection.insert_batch(&[10]).await?;
+        collection.insert_batch(&[12, 11]).await?;
 
         let mut values = collection.pop_batch(2).await?;
         assert_eq!(values.len(), 2);

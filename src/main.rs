@@ -5,7 +5,6 @@ mod size_type;
 mod query;
 mod error;
 mod access;
-mod varint;
 mod types;
 mod logging;
 mod sqlite_set;
@@ -16,15 +15,10 @@ mod worker_watcher;
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use itertools::Itertools;
-use log::{info, error};
-use tokio::sync::mpsc;
-
-use crate::blob_cache::BlobCache;
+use log::info;
 
 
 #[derive(Parser, Debug)]

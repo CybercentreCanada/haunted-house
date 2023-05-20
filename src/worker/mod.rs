@@ -72,7 +72,7 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
         async move {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => {
-                    set_running.send(false);
+                    _ = set_running.send(false);
                     exit_notice.notify_waiters();
                 },
                 Err(err) => {

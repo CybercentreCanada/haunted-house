@@ -24,9 +24,9 @@ impl Database {
         Ok(Database::SQLite(SQLiteInterface::new(path).await?))
     }
 
-    pub async fn new_sqlite_temp() -> Result<Self> {
-        Ok(Database::SQLite(SQLiteInterface::new_temp().await?))
-    }
+    // pub async fn new_sqlite_temp() -> Result<Self> {
+    //     Ok(Database::SQLite(SQLiteInterface::new_temp().await?))
+    // }
 
     pub async fn create_filter(&self, id: FilterID, expiry: &ExpiryGroup) -> Result<()> {
         match self {

@@ -7,14 +7,14 @@ pub enum ErrorKinds {
     BlobTooLargeForCache,
     BlobNotFound,
     // InvalidHashProduced,
-    IndexHasInvalidMagic,
-    IndexHasUnsupportedVersion,
-    IndexHasUnsupportedType,
-    IndexCorruptTable,
-    VarintIncomplete,
+    // IndexHasInvalidMagic,
+    // IndexHasUnsupportedVersion,
+    // IndexHasUnsupportedType,
+    // IndexCorruptTable,
+    // VarintIncomplete,
     FilterUnknown(FilterID),
     OtherS3Error(String),
-    CorruptFilterID,
+    // CorruptFilterID,
     DatabaseError,
     Sha256Corrupt,
     UnableToBuildTrigrams,
@@ -32,7 +32,7 @@ impl std::error::Error for ErrorKinds {
 }
 
 impl From<sqlx::Error> for ErrorKinds {
-    fn from(value: sqlx::Error) -> Self {
+    fn from(_value: sqlx::Error) -> Self {
         Self::DatabaseError
     }
 }

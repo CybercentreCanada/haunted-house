@@ -503,7 +503,8 @@ impl std::io::Read for PythonStream {
 #[derive(Clone)]
 pub struct AzureBlobStore {
     // config: AzureBlobConfig,
-    http_client: ClientWithMiddleware,
+    // http_client: ClientWithMiddleware,
+    http_client: reqwest::Client,
     client: ContainerClient,
 }
 
@@ -553,10 +554,11 @@ impl AzureBlobStore {
             };
         }
 
-        let retry_policy = ExponentialBackoff::builder().build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
-        let http_client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        // let retry_policy = ExponentialBackoff::builder().build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
+        // let http_client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        //     .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        //     .build();
+        let http_client = reqwest::Client::new();
 
         Ok(Self{ http_client, client })
     }

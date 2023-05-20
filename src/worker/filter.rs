@@ -562,7 +562,7 @@ impl ExtensibleTrigramFile {
         write_buffer.sync_all()?;
 
         println!("Operation file synced {:.2}", stamp.elapsed().as_secs_f64());
-        let stamp = std::time::Instant::now();
+        // let stamp = std::time::Instant::now();
 
         // Apply operation set
         // self.apply_operations(write_buffer, self.extended_segments + added_segments).context("apply operations")?;
@@ -696,13 +696,13 @@ mod test {
         {
             let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
             let x = file.write_batch(&mut trigrams).context("write batch")?;
-            file.apply_operations(x.0, x.1);
+            file.apply_operations(x.0, x.1)?;
             assert_eq!(file.extended_segments, 0)
         }
 
         // Read it again
         {
-            let mut file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(&location)?;
             for trigram in 0..TRIGRAM_RANGE as u32 {
                 let values = file.read_trigram(trigram)?;
                 if trigram == 0 {
@@ -785,6 +785,11 @@ mod test {
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
+        trigrams.sort();
+        for (x, _) in &trigrams {
+            println!("{x}");
+        }
+
         // write it
         let tempdir = tempfile::tempdir()?;
         let location = tempdir.path().join("test");
@@ -800,6 +805,10 @@ mod test {
             let x = file.write_batch(&mut trigrams[10..20])?;
             file.apply_operations(x.0, x.1)?;
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
+        }
+
+        for (x, _) in &trigrams {
+            println!("{x}");
         }
 
         // Recreate the trigrams
@@ -821,7 +830,7 @@ mod test {
             let trigrams: HashMap<u64, BitVec> = trigrams.into_iter().collect();
 
             for (index, values) in recreated.into_iter().enumerate() {
-                assert!(*trigrams.get(&(index as u64+1)).unwrap() == values)
+                assert!(*trigrams.get(&(index as u64+1)).unwrap() == values, "{index}")
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
