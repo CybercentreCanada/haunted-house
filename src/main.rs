@@ -1,5 +1,4 @@
 mod config;
-mod core;
 mod storage;
 mod size_type;
 mod query;
@@ -11,7 +10,6 @@ mod sqlite_set;
 mod broker;
 mod blob_cache;
 mod worker;
-mod worker_watcher;
 
 use std::path::PathBuf;
 use std::str::FromStr;

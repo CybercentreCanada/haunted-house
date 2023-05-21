@@ -14,8 +14,6 @@
 
 ## Nice to have/performance
 - add config flag to tune filter memory use
-- Finish encoded_size calculation
-- more efficent way to monitor search progress
 - add tracing
 - use more single value structs for better build time error detection
 - join query and of literals into block ands
