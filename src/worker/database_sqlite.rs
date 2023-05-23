@@ -238,36 +238,38 @@ impl SQLiteInterface {
 
     pub async fn ingest_file(&self, id: FilterID, file: &FileInfo, body: &BitVec) -> Result<bool, ErrorKinds> {
         // Hold the locked filter sizes
-        let mut sizes = self.filter_sizes.lock().await;
-        let size = match sizes.get_mut(&id) {
-            Some(size) => size,
-            None => return Err(ErrorKinds::FilterUnknown(id)),
-        };
+        {
+            let mut sizes = self.filter_sizes.lock().await;
+            let size = match sizes.get_mut(&id) {
+                Some(size) => size,
+                None => return Err(ErrorKinds::FilterUnknown(id)),
+            };
 
-        // Try to load the file if its already in the DB
-        let mut conn = self.db.acquire().await?;
-        let row: Result<Option<(bool, )>, sqlx::Error> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
-            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await;
-        match row {
-            Ok(Some((ingested, ))) => return Ok(ingested),
-            Ok(None) => {},
-            Err(err) => {
-                if let Some(err) = err.as_database_error() {
-                    if err.message().contains("no such table") {
-                        return Err(ErrorKinds::FilterUnknown(id))
+            // Try to load the file if its already in the DB
+            let mut conn = self.db.acquire().await?;
+            let row: Result<Option<(bool, )>, sqlx::Error> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
+                .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await;
+            match row {
+                Ok(Some((ingested, ))) => return Ok(ingested),
+                Ok(None) => {},
+                Err(err) => {
+                    if let Some(err) = err.as_database_error() {
+                        if err.message().contains("no such table") {
+                            return Err(ErrorKinds::FilterUnknown(id))
+                        }
                     }
                 }
             }
-        }
 
-        // Insert the new file if it is not there
-        sqlx::query(&format!("INSERT INTO filter_{id}(hash, number, access, trigrams) VALUES(?, ?, ?, ?)"))
-            .bind(file.hash.as_bytes())
-            .bind((*size + 1) as i64)
-            .bind(file.access.to_string())
-            .bind(postcard::to_allocvec(body)?)
-            .execute(&mut conn).await?;
-        *size += 1;
+            // Insert the new file if it is not there
+            sqlx::query(&format!("INSERT INTO filter_{id}(hash, number, access, trigrams) VALUES(?, ?, ?, ?)"))
+                .bind(file.hash.as_bytes())
+                .bind((*size + 1) as i64)
+                .bind(file.access.to_string())
+                .bind(postcard::to_allocvec(body)?)
+                .execute(&mut conn).await?;
+            *size += 1;
+        }
         let mut pending = self.filter_pending.write().await;
         match pending.entry(id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(file.hash.clone()); },
