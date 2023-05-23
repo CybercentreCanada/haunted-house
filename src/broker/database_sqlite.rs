@@ -95,11 +95,12 @@ impl SQLiteInterface {
 
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
+        sqlx::query("PRAGMA busy_timeout=600000").execute(&mut *con).await?;
 
         sqlx::query(&format!("create table if not exists filters (
             id INTEGER PRIMARY KEY,
             worker TEXT NOT NULL,
-            expiry_group TEXT NOT NULL,
+            expiry_group TEXT NOT NULL
         )")).execute(&mut con).await.context("error creating table filters")?;
 
         sqlx::query(&format!("create table if not exists searches (

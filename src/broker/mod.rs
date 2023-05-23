@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, SinkExt};
 use itertools::Itertools;
-use log::{error, info};
+use log::{error, info, debug};
 use rand::{thread_rng, Rng};
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
@@ -20,6 +20,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::broker::interface::SearchRequestResponse;
+use crate::config::{CoreConfig, WorkerAddress, WorkerTLSConfig};
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
@@ -61,16 +62,6 @@ pub async fn main(config: crate::config::Config) -> Result<()> {
 
 
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CoreConfig {
-    pub workers: HashMap<WorkerID, String>,
-    pub per_filter_pending_limit: u64,
-    pub per_worker_group_duplication: u32,
-    pub search_hit_limit: usize,
-    pub yara_jobs_per_worker: usize,
-    pub yara_batch_size: u32,
-}
-
 pub struct HouseCore {
     pub database: Database,
     pub client: ClientWithMiddleware,
@@ -81,7 +72,7 @@ pub struct HouseCore {
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     pub worker_ingest: RwLock<HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>>,
     pub running_searches: RwLock<HashMap<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>,
-    pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)>,
+    pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, WorkerAddress)>,
 }
 
 impl HouseCore {
@@ -89,7 +80,7 @@ impl HouseCore {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         // setup pool for yara assignments
-        let yara_permits: deadpool::unmanaged::Pool<(WorkerID, String)> = Default::default();
+        let yara_permits: deadpool::unmanaged::Pool<(WorkerID, WorkerAddress)> = Default::default();
         for _ in 0..(config.yara_jobs_per_worker.max(1)) {
             for row in config.workers.clone() {
                 if let Err((_, err)) = yara_permits.add(row).await {
@@ -103,9 +94,21 @@ impl HouseCore {
 
         // Prepare our http client
         let retry_policy = ExponentialBackoff::builder().build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
-        let client = ClientBuilder::new(reqwest::Client::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        let client = match &config.worker_certificate {
+            WorkerTLSConfig::AllowAll => {
+                reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()?
+            },
+            WorkerTLSConfig::Certificate(cert) => {
+                reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes())?)
+                .build()?
+            }
+        };
+        let client = ClientBuilder::new(client)
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build();
 
         let core = Arc::new(Self {
             database,
@@ -163,13 +166,15 @@ impl HouseCore {
     }
 
     pub async fn create_new_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup) -> Result<FilterID> {
+        info!("Create new filter for worker {worker} in expiry group {expiry}");
         let filter_id = self.database.create_filter(&worker, &expiry).await?;
         self.install_filter(worker, expiry, filter_id).await?;
         return Ok(filter_id)
     }
 
     pub async fn install_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup, filter_id: FilterID) -> Result<()> {
-        self.client.put(self.config.workers.get(&worker).unwrap().clone() + "/index/create")
+        info!("Installing filter {filter_id} into worker {worker}");
+        self.client.put(self.config.workers.get(&worker).unwrap().http("/index/create")?)
         .json(&CreateIndexRequest {
             filter_id,
             expiry,
@@ -231,7 +236,7 @@ impl HouseCore {
         };
 
         Ok(StatusReport{
-            ingest_check_queue: ingest_recv.await?,
+            ingest_check: ingest_recv.await?,
             active_searches,
             ingest_watchers
         })
@@ -253,10 +258,17 @@ impl IngestTask {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestCheckStatus {
+    queue: usize,
+    active: usize,
+    last_minute: usize
+}
+
 #[derive(Debug)]
 pub enum IngestMessage {
     IngestMessage(IngestTask),
-    Status(oneshot::Sender<u32>)
+    Status(oneshot::Sender<IngestCheckStatus>)
 }
 
 #[derive(Debug)]
@@ -282,14 +294,24 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
     let mut unchecked_buffer = HashMap::<Sha256, IngestTask>::new();
     let mut check_worker: JoinSet<Result<Vec<IngestTask>>> = JoinSet::new();
+    let mut active_batch_size = 0;
+    let mut counter = crate::counters::RateCounter::new(60);
 
     loop {
         // Restart the check worker
         if check_worker.is_empty() && !unchecked_buffer.is_empty() {
             let core = core.clone();
-            // let tasks = ;
-            check_worker.spawn(_ingest_check(core, unchecked_buffer));
-            unchecked_buffer = Default::default();
+            let mut tasks: HashMap<_, _> = Default::default();
+            for key in unchecked_buffer.keys().cloned().collect_vec() {
+                if tasks.len() >= 200 {
+                    break;
+                }
+                if let Some(row) = unchecked_buffer.remove(&key) {
+                    tasks.insert(key, row);
+                }
+            }
+            active_batch_size = tasks.len();
+            check_worker.spawn(_ingest_check(core, tasks));
         }
 
         //
@@ -309,7 +331,11 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         };
                     },
                     IngestMessage::Status(resp) => {
-                        _ = resp.send(unchecked_buffer.len() as u32);
+                        _ = resp.send(IngestCheckStatus {
+                            queue: unchecked_buffer.len(),
+                            active: active_batch_size,
+                            last_minute: counter.average()
+                        });
                     },
                 }
             }
@@ -320,6 +346,8 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     Some(res) => res,
                     None => continue
                 };
+
+                let before = unchecked_buffer.len();
 
                 match res {
                     Ok(Ok(delayed)) => {
@@ -337,12 +365,16 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         error!("ingest checker error: {err}");
                     },
                 }
+
+                counter.increment(active_batch_size - (unchecked_buffer.len() - before));
+                active_batch_size = 0;
             }
         }
     }
 }
 
 async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTask>) -> Result<Vec<IngestTask>> {
+    debug!("Ingest Check batch {}", tasks.len());
     // Turn the update tasks into a format for the worker
     let files: Vec<FileInfo> = tasks.values().map(|f|f.info.clone()).collect();
     let payload = UpdateFileInfoRequest {files};
@@ -355,7 +387,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         let payload = payload.clone();
         requests.spawn(async move {
             // Ask the worker to update information for this batch of files
-            let resp = core.client.post(worker_address + "/files/update")
+            let resp = core.client.post(worker_address.http("/files/update")?)
             .header("Content-Type", "application/json")
             .body(payload)
             .send().await?;
@@ -382,6 +414,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
                 continue
             },
         };
+        debug!("Ingest Check result from {worker}, {} processed, {} pending", res.processed.len(), res.pending.len());
 
         // If an ingestion is totally processed by the worker, we can respond to the caller
         for sha in res.processed {
@@ -412,6 +445,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         }
     }
 
+    debug!("Ingest Check simple assignments, {} task remaining, {} nodes without pressure.", tasks.len(), workers_without_pressure.len());
     // Accept assignments from workers that are uncontroversial
     for sha in tasks.keys().cloned().collect_vec() {
         // let task = tasks.get(&sha).unwrap();
@@ -438,18 +472,17 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
 
     // Check if we need to do more work or not
     if tasks.is_empty() {
+        debug!("Ingest Check all tasks handled by simple assignments.");
         return Ok(vec![])
     }
 
     // Pull down the list of all filters
     let mut filter_assignment: HashMap<ExpiryGroup, Vec<(WorkerID, FilterID)>> = Default::default();
     for (worker, filter, expiry) in core.database.list_filters().await? {
-        // if !storage_pressure.get(&worker).unwrap_or(&true) {
-            match filter_assignment.entry(expiry) {
-                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push((worker, filter)); },
-                hash_map::Entry::Vacant(entry) => { entry.insert(vec![(worker, filter)]); },
-            };
-        // }
+        match filter_assignment.entry(expiry) {
+            hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push((worker, filter)); },
+            hash_map::Entry::Vacant(entry) => { entry.insert(vec![(worker, filter)]); },
+        };
     }
 
     // Since none of the workers recommended an OK filter for this we need to
@@ -476,6 +509,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
             }
             filter_count.insert(worker.clone(), count);
         }
+        // debug!("No filter found for task in {}, worker loads {:?}", task.info.expiry, filter_count);
 
         // try to find a worker without a related filter to create one on
         // Then start doubling up filters until the limit
@@ -494,11 +528,12 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         delayed.push(task);
     }
 
+    debug!("Ingest Check delaying {} tasks.", delayed.len());
     Ok(delayed)
 }
 
 //
-async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: WorkerID, address: String) {
+async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: WorkerID, address: WorkerAddress) {
     loop {
         match _ingest_watcher(core.clone(), &mut input, &worker, &address).await {
             Err(err) => error!("Crash in ingestion system: {err}"),
@@ -510,23 +545,23 @@ async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver
     }
 }
 
-async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: &WorkerID, address: &String) -> Result<()> {
+async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: &WorkerID, address: &WorkerAddress) -> Result<()> {
     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
-    let mut query: Option<JoinHandle<Result<reqwest::Response>>> = None;
+    let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
 
     loop {
         //
-        if query.is_none() && !active.is_empty() {
-            let request = core.client.post(address.clone() + "/files/ingest")
+        if query.is_empty() && !active.is_empty() {
+            let request = core.client.post(address.http("/files/ingest")?)
             .json(&IngestFilesRequest{
                 files: active.values().map(|(filter, task)|{
                     (*filter, task.info.clone())
                 }).collect_vec()
             });
-            query = Some(tokio::spawn(async move {
+            query.spawn(async move {
                 let result = request.send().await?;
                 anyhow::Ok(result)
-            }))
+            });
         }
 
         // Wait until something changes
@@ -561,8 +596,12 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
             },
 
-            response = query.as_mut().unwrap(), if query.is_some() => {
-                query = None;
+            response = query.join_next(), if !query.is_empty() => {
+                let response = match response {
+                    Some(response) => response,
+                    None => continue,
+                };
+
                 let response: IngestFilesResponse = match response {
                     Ok(Ok(resp)) => resp.json().await?,
                     Ok(Err(err)) => {
@@ -609,9 +648,9 @@ async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherM
     }
 }
 
-fn websocket_address(address: &str) -> String {
-    address.replace("https://", "wss://").replace("http://", "ws://")
-}
+// fn websocket_address(address: &str) -> String {
+//     address.replace("https://", "wss://").replace("http://", "ws://")
+// }
 
 async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<SearcherMessage>, code: &str) -> Result<()> {
     // Load the search status
@@ -632,8 +671,8 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
     let (client_sender, mut result_stream) = mpsc::channel(128);
     for (_worker, address) in &core.config.workers {
-        let address = websocket_address(address);
-        let (mut socket, _) = tokio_tungstenite::connect_async(address + "/search/filter").await?;
+        let address = address.websocket("/search/filter")?;
+        let (mut socket, _) = tokio_tungstenite::connect_async(address).await?;
         let client_sender = client_sender.clone();
         let request_body = request_body.clone();
         tokio::spawn(async move {
@@ -762,7 +801,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                 let hashes = next_batch.take().unwrap();
                 requests.spawn(async move {
                     let permit = permit?;
-                    let response = core.client.get(permit.1.clone() + "/search/yara")
+                    let response = core.client.get(permit.1.http("/search/yara")?)
                     .json(&YaraTask{
                         id,
                         yara_rule,

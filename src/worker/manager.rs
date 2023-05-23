@@ -1,18 +1,14 @@
 use std::collections::{HashSet, HashMap};
-use std::path::PathBuf;
-// use std::collections::HashMap;
-// use std::fmt::Display;
 use std::sync::Arc;
-// use std::time::Duration;
-use anyhow::Result;
+use anyhow::{Result, Context};
 use bitvec::vec::BitVec;
 use itertools::Itertools;
 use log::{debug, info, error};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Notify, oneshot};
 use tokio::task::JoinSet;
 
 use crate::blob_cache::{BlobHandle, BlobCache};
+use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
 use crate::query::Query;
 use crate::storage::BlobStorage;
@@ -23,30 +19,18 @@ use super::database::{IngestStatus, Database};
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
 
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct WorkerConfig {
-    pub filter_item_limit: u64,
-    pub data_path: PathBuf,
-    pub data_limit: u64,
-    pub data_reserve: u64,
-    pub initial_segment_size: u32,
-    pub extended_segment_size: u32,
-    pub ingest_batch_size: u32,
-}
-
 pub struct WorkerState {
     pub database: Database,
     pub running: watch::Receiver<bool>,
     pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>)>>,
     pub file_storage: BlobStorage,
     pub file_cache: BlobCache,
-    pub config: WorkerConfig,
+    pub config: WorkerSettings,
 }
 
 impl WorkerState {
 
-    pub async fn new(database: Database, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerConfig, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
+    pub async fn new(database: Database, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerSettings, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
         let new = Arc::new(Self {
             database,
             running,
@@ -90,7 +74,7 @@ impl WorkerState {
         let mut pending: HashMap<Sha256, FilterID> = Default::default();
         let mut missing = vec![];
         for file in files {
-            match self.database.update_file_access(&file).await? {
+            match self.database.update_file_access(&file).await.context("update_file_access")? {
                 IngestStatus::Ready => processed.push(file.hash),
                 IngestStatus::Pending(filter) => { pending.insert(file.hash, filter); },
                 IngestStatus::Missing => missing.push(file),
@@ -197,7 +181,7 @@ impl WorkerState {
                 Err(err) => if let ErrorKinds::FilterUnknown(filter) = err {
                     unknown_filters.push(filter);
                 } else {
-                    error!("{err}");
+                    error!("ingest error {err:?}");
                 }
             }
         }
@@ -217,7 +201,7 @@ impl WorkerState {
 
     pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) {
         while let Err(err) = self._ingest_feeder(id, &writer, notify.clone()).await {
-            error!("{err}");
+            error!("ingest feeder crash {err:?}");
         }
     }
 

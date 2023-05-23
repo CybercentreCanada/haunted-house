@@ -18,7 +18,6 @@ mod manager;
 mod filter;
 mod filter_worker;
 
-pub use manager::WorkerConfig;
 
 #[derive(Serialize, Deserialize)]
 pub struct YaraTask {

@@ -6,7 +6,7 @@ use anyhow::{Context};
 use futures::{SinkExt, StreamExt};
 use log::error;
 use poem::web::websocket::{WebSocket, Message};
-use poem::{handler, Route, get, EndpointExt, Server, delete, post, IntoResponse};
+use poem::{handler, Route, get, EndpointExt, Server, delete, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
 use poem::web::{Data, Json, Path};
 use serde::{Serialize, Deserialize};
@@ -176,7 +176,7 @@ async fn get_ready_status(state: Data<&Arc<WorkerState>>) -> poem::http::StatusC
 
 pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<WorkerState>, exit: Arc<tokio::sync::Notify>) -> anyhow::Result<()> {
     let app = Route::new()
-        .at("/index/create", get(create_index))
+        .at("/index/create", put(create_index))
         .at("/index/:id", delete(delete_index))
         .at("/search/filter", get(run_filter_search))
         .at("/search/yara", get(run_yara_search))

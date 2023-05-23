@@ -15,7 +15,7 @@ pub enum ErrorKinds {
     FilterUnknown(FilterID),
     OtherS3Error(String),
     // CorruptFilterID,
-    DatabaseError,
+    DatabaseError(String),
     Sha256Corrupt,
     UnableToBuildTrigrams,
     Serialization(String),
@@ -32,8 +32,8 @@ impl std::error::Error for ErrorKinds {
 }
 
 impl From<sqlx::Error> for ErrorKinds {
-    fn from(_value: sqlx::Error) -> Self {
-        Self::DatabaseError
+    fn from(value: sqlx::Error) -> Self {
+        Self::DatabaseError(format!("{value:?}"))
     }
 }
 

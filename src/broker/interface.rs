@@ -27,7 +27,7 @@ use crate::logging::LoggerMiddleware;
 use crate::query::Query;
 use crate::types::{FileInfo, Sha256, ExpiryGroup, WorkerID, FilterID};
 
-use super::{HouseCore, IngestTask};
+use super::{HouseCore, IngestTask, IngestCheckStatus};
 use super::auth::Role;
 
 type BearerToken = TypedHeader<Authorization<Bearer>>;
@@ -403,7 +403,7 @@ async fn get_status() -> Result<()> {
 
 #[derive(Serialize, Deserialize)]
 pub struct StatusReport {
-    pub ingest_check_queue: u32,
+    pub ingest_check: IngestCheckStatus,
     pub ingest_watchers: HashMap<WorkerID, HashMap<FilterID, u32>>,
     pub active_searches: u32,
 }

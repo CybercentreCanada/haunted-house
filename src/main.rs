@@ -7,6 +7,7 @@ mod access;
 mod types;
 mod logging;
 mod sqlite_set;
+mod counters;
 mod broker;
 mod blob_cache;
 mod worker;

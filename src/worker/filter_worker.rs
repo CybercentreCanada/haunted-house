@@ -8,7 +8,7 @@ use bitvec::vec::BitVec;
 use log::error;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
-use super::manager::WorkerConfig;
+use crate::config::WorkerSettings;
 
 const FILTER_SUBDIR: &str = "filters";
 
@@ -29,7 +29,7 @@ pub struct FilterWorker {
 }
 
 impl FilterWorker {
-    pub fn open(config: WorkerConfig, id: FilterID) -> Result<Self> {
+    pub fn open(config: WorkerSettings, id: FilterID) -> Result<Self> {
         {
             let directory = config.data_path.join(FILTER_SUBDIR);
             std::fs::create_dir_all(&directory)?;
@@ -56,7 +56,7 @@ impl FilterWorker {
     }
 }
 
-fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerConfig, id: FilterID, ready_send: watch::Sender<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
+fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerSettings, id: FilterID, ready_send: watch::Sender<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
     // Open the file
     let directory = config.data_path.join(FILTER_SUBDIR);
     let path = directory.join(id.to_string());
@@ -68,7 +68,7 @@ fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerC
     let filter = match filter {
         Ok(filter) => Arc::new(RwLock::new(filter)),
         Err(err) => {
-            error!("Could not load filter: {err}");
+            error!("Could not load filter {}: {err}", path.to_string_lossy());
             return;
         },
     };

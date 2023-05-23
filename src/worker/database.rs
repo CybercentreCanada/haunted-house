@@ -1,7 +1,7 @@
 
 use std::collections::{HashSet, HashMap};
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use bitvec::vec::BitVec;
 
 use super::database_sqlite::SQLiteInterface;
@@ -30,7 +30,7 @@ impl Database {
 
     pub async fn create_filter(&self, id: FilterID, expiry: &ExpiryGroup) -> Result<()> {
         match self {
-            Database::SQLite(db) => db.create_filter(id, expiry).await,
+            Database::SQLite(db) => db.create_filter(id, expiry).await.context("create_filter"),
         }
     }
 
@@ -48,7 +48,7 @@ impl Database {
 
     pub async fn delete_filter(&self, id: FilterID) -> Result<()> {
         match self {
-            Database::SQLite(db) => db.delete_filter(id).await,
+            Database::SQLite(db) => db.delete_filter(id).await.context("delete_filter"),
         }
     }
 
@@ -72,7 +72,7 @@ impl Database {
 
     pub async fn update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
         match self {
-            Database::SQLite(db) => db.update_file_access(file).await,
+            Database::SQLite(db) => db.update_file_access(file).await.context("update_file_access"),
         }
     }
 
@@ -90,19 +90,19 @@ impl Database {
 
     pub async fn select_file_hashes(&self, id: FilterID, file_indices: &Vec<u64>, access: &HashSet<String>) -> Result<Vec<Sha256>> {
         match self {
-            Database::SQLite(db) => db.select_file_hashes(id, file_indices, access).await,
+            Database::SQLite(db) => db.select_file_hashes(id, file_indices, access).await.context("select_file_hashes"),
         }
     }
 
     pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, BitVec)>> {
         match self {
-            Database::SQLite(db) => db.get_ingest_batch(id, limit).await,
+            Database::SQLite(db) => db.get_ingest_batch(id, limit).await.context("get_ingest_batch"),
         }
     }
 
     pub async fn finished_ingest(&self, id: FilterID, files: Vec<u64>) -> Result<()> {
         match self {
-            Database::SQLite(db) => db.finished_ingest(id, files).await,
+            Database::SQLite(db) => db.finished_ingest(id, files).await.context("finished_ingest"),
         }
     }
 }

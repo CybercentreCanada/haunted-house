@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use anyhow::{Result, Context};
 use bitvec::vec::BitVec;
+use log::info;
 use sqlx::{SqlitePool, query_as, query};
 use sqlx::pool::PoolOptions;
 
@@ -45,7 +46,7 @@ impl SQLiteInterface {
 
         let pool = PoolOptions::new()
             .max_connections(200)
-            .acquire_timeout(std::time::Duration::from_secs(30))
+            .acquire_timeout(std::time::Duration::from_secs(600))
             .connect(&url).await?;
 
         Self::initialize(&pool).await?;
@@ -99,17 +100,20 @@ impl SQLiteInterface {
 
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
+        sqlx::query("PRAGMA busy_timeout=600000").execute(&mut *con).await?;
 
         sqlx::query(&format!("create table if not exists filters (
             id INTEGER PRIMARY KEY,
-            expiry CHAR(8) NOT NULL,
+            expiry CHAR(8) NOT NULL
         )")).execute(&mut con).await.context("error creating table filters")?;
 
         return Ok(())
     }
 
     pub async fn create_filter(&self, name: FilterID, expiry: &ExpiryGroup) -> Result<()> {
+        let mut sizes = self.filter_sizes.lock().await;
         let mut con = self.db.begin().await?;
+        info!("Creating filter {name} ({})", name.to_i64());
 
         sqlx::query(&format!("INSERT INTO filters(id, expiry) VALUES(?, ?) ON CONFLICT DO NOTHING"))
             .bind(name.to_i64())
@@ -126,7 +130,6 @@ impl SQLiteInterface {
         sqlx::query(&format!("create index if not exists ingested ON filter_{name}(ingested)")).execute(&mut con).await?;
         con.commit().await?;
 
-        let mut sizes = self.filter_sizes.lock().await;
         sizes.insert(name, 0);
 
         return Ok(())
@@ -149,6 +152,7 @@ impl SQLiteInterface {
     }
 
     pub async fn delete_filter(&self, name: FilterID) -> Result<()> {
+        let mut sizes = self.filter_sizes.lock().await;
         let mut con = self.db.begin().await?;
 
         sqlx::query(&format!("DELETE FROM filters WHERE name = ?"))
@@ -157,7 +161,6 @@ impl SQLiteInterface {
         sqlx::query(&format!("DROP TABLE filter_{name}")).execute(&mut con).await?;
         con.commit().await?;
 
-        let mut sizes = self.filter_sizes.lock().await;
         sizes.remove(&name);
 
         return Ok(())
@@ -243,10 +246,18 @@ impl SQLiteInterface {
 
         // Try to load the file if its already in the DB
         let mut conn = self.db.acquire().await?;
-        let row: Option<(bool, )> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
-            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await?;
-        if let Some((ingested, )) = row {
-            return Ok(ingested)
+        let row: Result<Option<(bool, )>, sqlx::Error> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
+            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await;
+        match row {
+            Ok(Some((ingested, ))) => return Ok(ingested),
+            Ok(None) => {},
+            Err(err) => {
+                if let Some(err) = err.as_database_error() {
+                    if err.message().contains("no such table") {
+                        return Err(ErrorKinds::FilterUnknown(id))
+                    }
+                }
+            }
         }
 
         // Insert the new file if it is not there
@@ -284,7 +295,7 @@ impl SQLiteInterface {
     }
 
     pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, BitVec)>> {
-        let row: Vec<(i64, Vec<u8>)> = sqlx::query_as(&format!("SELECT number, trigrams FROM filter_{id} WHERE ingested IS FALSE LIMIT {limit} ORDER BY number"))
+        let row: Vec<(i64, Vec<u8>)> = sqlx::query_as(&format!("SELECT number, trigrams FROM filter_{id} WHERE ingested IS FALSE ORDER BY number LIMIT {limit}"))
         .fetch_all(&self.db).await?;
 
         let mut output = vec![];
@@ -296,10 +307,10 @@ impl SQLiteInterface {
     }
 
     pub async fn finished_ingest(&self, id: FilterID, files: Vec<u64>) -> Result<()> {
-        let mut conn = self.db.acquire().await?;
+        let mut conn = self.db.acquire().await.context("aquire")?;
         let mut hashes = vec![];
         for number in files {
-            let result: Option<(Vec<u8>,)>  = sqlx::query_as(&format!("UPDATE filter_{id} SET ingested = TRUE, trigrams = NULL WHERE number = ? RETURNING hash")).bind(number as i64).fetch_optional(&mut conn).await?;
+            let result: Option<(Vec<u8>,)>  = sqlx::query_as(&format!("UPDATE filter_{id} SET ingested = TRUE, trigrams = NULL WHERE number = ? RETURNING hash")).bind(number as i64).fetch_optional(&mut conn).await.context("update")?;
             if let Some((hash, )) = result {
                 hashes.push(hash);
             }
