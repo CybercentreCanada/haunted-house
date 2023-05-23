@@ -571,6 +571,12 @@ impl ExtensibleTrigramFile {
     }
 
     fn check_and_apply_operations(&mut self, mut buffer: File) -> Result<()> {
+        // Check file is above minimum size
+        if buffer.metadata()?.len() < 16 {
+            std::fs::remove_file(&self.edit_buffer_location)?;
+            return Ok(())
+        }
+
         // Read the length
         let offset = buffer.read_u64::<LittleEndian>()?;
         if offset == 0 {
