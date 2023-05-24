@@ -21,6 +21,7 @@ pub enum ErrorKinds {
     Serialization(String),
     JoinError,
     IOError(String),
+    ChannelError(String),
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -71,5 +72,17 @@ impl From<std::io::Error> for ErrorKinds {
 impl From<tempfile::PersistError> for ErrorKinds {
     fn from(value: tempfile::PersistError) -> Self {
         Self::IOError(value.to_string())
+    }
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for ErrorKinds {
+    fn from(value: tokio::sync::oneshot::error::RecvError) -> Self {
+        Self::ChannelError(value.to_string())
+    }
+}
+
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ErrorKinds {
+    fn from(value: tokio::sync::mpsc::error::SendError<T>) -> Self {
+        Self::ChannelError(value.to_string())
     }
 }

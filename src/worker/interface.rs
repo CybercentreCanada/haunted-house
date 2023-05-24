@@ -166,7 +166,7 @@ async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
     let expiries: HashMap<FilterID, ExpiryGroup> = expiries.into_iter().collect();
 
     let mut result = HashMap::new();
-    for (filter, hashes) in state.database.filter_pending().await {
+    for (filter, hashes) in state.database.filter_pending().await? {
         let mut files = vec![];
         if let Some(expiry) = expiries.get(&filter) {
             for hash in hashes {

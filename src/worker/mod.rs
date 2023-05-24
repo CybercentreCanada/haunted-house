@@ -11,6 +11,7 @@ use crate::worker::database::Database;
 use crate::worker::manager::WorkerState;
 
 pub mod interface;
+mod database_buffered_sqlite;
 mod database;
 mod database_sqlite;
 mod encoding;

@@ -93,7 +93,7 @@ impl WorkerState {
         }
 
         //
-        let filter_sizes = self.database.filter_sizes().await;
+        let filter_sizes = self.database.filter_sizes().await?;
         let filters = self.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
         let mut assignments: HashMap<Sha256, Vec<FilterID>> = Default::default();
         let storage_pressure = self.check_storage_pressure().await.context("check_storage_pressure")?;
@@ -117,7 +117,7 @@ impl WorkerState {
             assignments,
             storage_pressure,
             filter_sizes,
-            filter_pending: self.database.filter_pending().await,
+            filter_pending: self.database.filter_pending().await?,
         })
     }
 
@@ -146,7 +146,7 @@ impl WorkerState {
     pub async fn ingest_file(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
         // Filter those we already have information for quickly
         // the ones that are currently pending can be dropped
-        let pending = self.database.filter_pending().await;
+        let pending = self.database.filter_pending().await?;
         files.retain(|(filter, file)|!pending.get(filter).unwrap_or(&Default::default()).contains(&file.hash));
 
         // Gather information for each file individually next
