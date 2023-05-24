@@ -1,6 +1,7 @@
 use std::sync::{Arc};
 
 use crate::query::Query;
+use crate::timing::NullCapture;
 use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;
@@ -92,11 +93,11 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, _id: Filt
                 // Insert the batch
                 let batch = {
                     let filter = filter.blocking_read();
-                    filter.write_batch(&mut batch)?
+                    filter.write_batch(&mut batch, NullCapture::new())?
                 };
                 {
                     let mut filter = filter.blocking_write();
-                    filter.apply_operations(batch.0, batch.1)?;
+                    filter.apply_operations(batch.0, batch.1, NullCapture::new())?;
                 }
                 _ = finished.send(());
             }
