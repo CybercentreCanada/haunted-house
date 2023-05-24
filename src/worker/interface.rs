@@ -133,7 +133,7 @@ pub struct UpdateFileInfoResponse {
     // pub free_bytes: u64,
     pub storage_pressure: bool,
     pub filter_sizes: HashMap<FilterID, u64>,
-    pub filter_pending: HashMap<FilterID, u64>,
+    pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
 }
 
 #[handler]
@@ -155,6 +155,33 @@ pub struct IngestFilesResponse {
 #[handler]
 async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesRequest>) -> poem::Result<Json<IngestFilesResponse>> {
     Ok(Json(state.ingest_file(request.0.files).await?))
+}
+
+#[handler]
+async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<HashMap<FilterID, Vec<FileInfo>>>> {
+    let expiries = match state.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await {
+        Ok(result) => result,
+        Err(err) => return Err(poem::http::StatusCode::INTERNAL_SERVER_ERROR.into())
+    };
+    let expiries: HashMap<FilterID, ExpiryGroup> = expiries.into_iter().collect();
+
+    let mut result = HashMap::new();
+    for (filter, hashes) in state.database.filter_pending().await {
+        let mut files = vec![];
+        if let Some(expiry) = expiries.get(&filter) {
+            for hash in hashes {
+                match state.database.get_file_access(filter, &hash).await {
+                    Ok(Some(access)) => {files.push(FileInfo { hash, access, expiry: expiry.clone() });}
+                    Ok(None) => {},
+                    Err(err) => {
+                        error!("{err}");
+                    }
+                }
+            }
+        }
+        result.insert(filter, files);
+    }
+    Ok(Json(result))
 }
 
 #[handler]
@@ -182,6 +209,7 @@ pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<
         .at("/search/yara", get(run_yara_search))
         .at("/files/update", post(update_file_info))
         .at("/files/ingest", post(ingest_files))
+        .at("/files/ingest-queues", get(list_ingest_files))
         .at("/status/online", get(get_online_status))
         .at("/status/ready", get(get_ready_status))
         .data(state)

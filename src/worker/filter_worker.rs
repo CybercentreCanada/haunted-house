@@ -6,7 +6,7 @@ use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;
 use bitvec::vec::BitVec;
-use log::error;
+use log::{error, debug};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
@@ -86,11 +86,12 @@ fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerS
     }
 }
 
-pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, _id: FilterID, filter: Arc<RwLock<ExtensibleTrigramFile>>) -> Result<()> {
+pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: FilterID, filter: Arc<RwLock<ExtensibleTrigramFile>>) -> Result<()> {
     while let Some(message) = writer_recv.blocking_recv() {
         match message {
             WriterCommand::Ingest(mut batch, finished) => {
                 // Insert the batch
+                let size = batch.len();
                 let batch = {
                     let filter = filter.blocking_read();
                     filter.write_batch(&mut batch, NullCapture::new())?
@@ -100,6 +101,7 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, _id: Filt
                     filter.apply_operations(batch.0, batch.1, NullCapture::new())?;
                 }
                 _ = finished.send(());
+                debug!("Ingested {} files into {}", size, id);
             }
         }
     }

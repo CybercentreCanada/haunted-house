@@ -3,7 +3,6 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Result, Context};
-use bitvec::vec::BitVec;
 use log::info;
 use sqlx::{SqlitePool, query_as, query};
 use sqlx::pool::PoolOptions;
@@ -106,12 +105,12 @@ impl SQLiteInterface {
             id INTEGER PRIMARY KEY,
             expiry CHAR(8) NOT NULL
         )")).execute(&mut con).await.context("error creating table filters")?;
+        sqlx::query(&format!("create index if not exists expiry ON filters(expiry)")).execute(&mut con).await?;
 
         return Ok(())
     }
 
     pub async fn create_filter(&self, name: FilterID, expiry: &ExpiryGroup) -> Result<()> {
-        let mut sizes = self.filter_sizes.lock().await;
         let mut con = self.db.begin().await?;
         info!("Creating filter {name} ({})", name.to_i64());
 
@@ -121,15 +120,16 @@ impl SQLiteInterface {
             .execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists filter_{name} (
-            hash BLOB PRIMARY KEY,
-            number INTEGER NOT NULL UNIQUE,
+            number INTEGER PRIMARY KEY AUTOINCREMENT,
+            hash BLOB NOT NULL UNIQUE,
             access BLOB NOT NULL,
-            ingested BOOLEAN DEFAULT FALSE,
-            trigrams BLOB
+            ingested BOOLEAN DEFAULT FALSE
         )")).execute(&mut con).await?;
         sqlx::query(&format!("create index if not exists ingested ON filter_{name}(ingested)")).execute(&mut con).await?;
+        sqlx::query(&format!("create index if not exists hash ON filter_{name}(hash)")).execute(&mut con).await?;
         con.commit().await?;
 
+        let mut sizes = self.filter_sizes.lock().await;
         sizes.insert(name, 0);
 
         return Ok(())
@@ -152,7 +152,6 @@ impl SQLiteInterface {
     }
 
     pub async fn delete_filter(&self, name: FilterID) -> Result<()> {
-        let mut sizes = self.filter_sizes.lock().await;
         let mut con = self.db.begin().await?;
 
         sqlx::query(&format!("DELETE FROM filters WHERE name = ?"))
@@ -161,9 +160,19 @@ impl SQLiteInterface {
         sqlx::query(&format!("DROP TABLE filter_{name}")).execute(&mut con).await?;
         con.commit().await?;
 
+        let mut sizes = self.filter_sizes.lock().await;
         sizes.remove(&name);
 
         return Ok(())
+    }
+
+    pub async fn get_file_access(&self, id: FilterID, hash: &Sha256) -> Result<Option<AccessControl>> {
+        let row: Option<(String, )> = query_as(&format!("SELECT access FROM filter_{id} WHERE hash = ?")).bind(hash.as_bytes()).fetch_optional(&self.db).await?;
+
+        match row {
+            Some((row, )) => Ok(Some(AccessControl::from_str(&row)?)),
+            None => Ok(None)
+        }
     }
 
     pub async fn filter_sizes(&self) -> HashMap<FilterID, u64> {
@@ -203,9 +212,10 @@ impl SQLiteInterface {
                     }
                 }
 
-                let result = query(&format!("UPDATE filter_{id} SET access = ? WHERE access = ?"))
+                let result = query(&format!("UPDATE filter_{id} SET access = ? WHERE access = ? AND hash = ?"))
                     .bind(new_string)
                     .bind(access_string)
+                    .bind(file.hash.as_bytes())
                     .execute(&mut conn).await?;
                 if result.rows_affected() > 0 {
                     if ingested {
@@ -236,40 +246,34 @@ impl SQLiteInterface {
         }
     }
 
-    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo, body: &BitVec) -> Result<bool, ErrorKinds> {
-        // Hold the locked filter sizes
-        {
-            let mut sizes = self.filter_sizes.lock().await;
-            let size = match sizes.get_mut(&id) {
-                Some(size) => size,
-                None => return Err(ErrorKinds::FilterUnknown(id)),
-            };
-
-            // Try to load the file if its already in the DB
-            let mut conn = self.db.acquire().await?;
-            let row: Result<Option<(bool, )>, sqlx::Error> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
-                .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await;
-            match row {
-                Ok(Some((ingested, ))) => return Ok(ingested),
-                Ok(None) => {},
-                Err(err) => {
-                    if let Some(err) = err.as_database_error() {
-                        if err.message().contains("no such table") {
-                            return Err(ErrorKinds::FilterUnknown(id))
-                        }
+    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo) -> Result<bool, ErrorKinds> {
+        // Try to load the file if its already in the DB
+        let mut conn = self.db.acquire().await?;
+        let row: Result<Option<(bool, )>, sqlx::Error> = sqlx::query_as(&format!("SELECT ingested FROM filter_{id} WHERE hash = ?"))
+            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await;
+        match row {
+            Ok(Some((ingested, ))) => return Ok(ingested),
+            Ok(None) => {},
+            Err(err) => {
+                if let Some(err) = err.as_database_error() {
+                    if err.message().contains("no such table") {
+                        return Err(ErrorKinds::FilterUnknown(id))
                     }
                 }
             }
-
-            // Insert the new file if it is not there
-            sqlx::query(&format!("INSERT INTO filter_{id}(hash, number, access, trigrams) VALUES(?, ?, ?, ?)"))
-                .bind(file.hash.as_bytes())
-                .bind((*size + 1) as i64)
-                .bind(file.access.to_string())
-                .bind(postcard::to_allocvec(body)?)
-                .execute(&mut conn).await?;
-            *size += 1;
         }
+
+        // Insert the new file if it is not there
+        sqlx::query(&format!("INSERT INTO filter_{id}(hash, access) VALUES(?, ?)"))
+            .bind(file.hash.as_bytes())
+            .bind(file.access.to_string())
+            .execute(&mut conn).await?;
+
+        match self.filter_sizes.lock().await.get_mut(&id) {
+            Some(size) => { *size += 1; },
+            None => {},
+        };
+
         let mut pending = self.filter_pending.write().await;
         match pending.entry(id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(file.hash.clone()); },
@@ -296,33 +300,27 @@ impl SQLiteInterface {
         return Ok(selected)
     }
 
-    pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, BitVec)>> {
-        let row: Vec<(i64, Vec<u8>)> = sqlx::query_as(&format!("SELECT number, trigrams FROM filter_{id} WHERE ingested IS FALSE ORDER BY number LIMIT {limit}"))
+    pub async fn get_ingest_batch(&self, id: FilterID, limit: u32) -> Result<Vec<(u64, Sha256)>> {
+        let row: Vec<(i64, Vec<u8>)> = sqlx::query_as(&format!("SELECT number, hash FROM filter_{id} WHERE ingested = FALSE ORDER BY number LIMIT {limit}"))
         .fetch_all(&self.db).await?;
 
         let mut output = vec![];
-        for (id, bytes) in row {
-            let body: BitVec = postcard::from_bytes(&bytes)?;
-            output.push((id as u64, body))
+        for (id, hash) in row {
+            output.push((id as u64, Sha256::try_from(&hash[..])?));
         }
         return Ok(output)
     }
 
-    pub async fn finished_ingest(&self, id: FilterID, files: Vec<u64>) -> Result<()> {
+    pub async fn finished_ingest(&self, id: FilterID, files: Vec<(u64, Sha256)>) -> Result<()> {
         let mut conn = self.db.acquire().await.context("aquire")?;
-        let mut hashes = vec![];
-        for number in files {
-            let result: Option<(Vec<u8>,)>  = sqlx::query_as(&format!("UPDATE filter_{id} SET ingested = TRUE, trigrams = NULL WHERE number = ? RETURNING hash")).bind(number as i64).fetch_optional(&mut conn).await.context("update")?;
-            if let Some((hash, )) = result {
-                hashes.push(hash);
-            }
+        for (number, _) in &files {
+            sqlx::query(&format!("UPDATE filter_{id} SET ingested = TRUE WHERE number = ?")).bind(*number as i64)
+            .execute(&mut conn).await.context("update")?;
         }
         let mut pending = self.filter_pending.write().await;
         if let Some(pending) = pending.get_mut(&id) {
-            for hash in hashes {
-                if let Ok(hash) = Sha256::try_from(&hash[..]) {
-                    pending.remove(&hash);
-                }
+            for (_, hash) in files {
+                pending.remove(&hash);
             }
         }
         return Ok(())

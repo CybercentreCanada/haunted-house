@@ -19,6 +19,8 @@ pub enum ErrorKinds {
     Sha256Corrupt,
     UnableToBuildTrigrams,
     Serialization(String),
+    JoinError,
+    IOError(String),
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -51,5 +53,23 @@ impl From<aws_smithy_client::SdkError<aws_sdk_s3::error::GetObjectError>> for Er
 impl From<postcard::Error> for ErrorKinds {
     fn from(value: postcard::Error) -> Self {
         ErrorKinds::Serialization(value.to_string())
+    }
+}
+
+impl From<tokio::task::JoinError> for ErrorKinds {
+    fn from(value: tokio::task::JoinError) -> Self {
+        Self::JoinError
+    }
+}
+
+impl From<std::io::Error> for ErrorKinds {
+    fn from(value: std::io::Error) -> Self {
+        Self::IOError(value.to_string())
+    }
+}
+
+impl From<tempfile::PersistError> for ErrorKinds {
+    fn from(value: tempfile::PersistError) -> Self {
+        Self::IOError(value.to_string())
     }
 }

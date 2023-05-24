@@ -1,4 +1,5 @@
 use std::collections::{HashSet, HashMap};
+use std::io::Write;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use bitvec::vec::BitVec;
@@ -28,6 +29,8 @@ pub struct WorkerState {
     pub config: WorkerSettings,
 }
 
+const TRIGRAM_DIRECTORY: &str = "trigram-cache";
+
 impl WorkerState {
 
     pub async fn new(database: Database, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerSettings, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
@@ -40,10 +43,17 @@ impl WorkerState {
             config,
         });
 
+        // Prepare cache directory
+        tokio::fs::create_dir_all(new.config.data_path.clone().join(TRIGRAM_DIRECTORY)).await?;
+
         // Start workers for every filter
         {
             let mut filters = new.filters.write().await;
             for id in new.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+                if filters.contains_key(&id) {
+                    error!("Duplicate filter?");
+                    continue
+                }
                 let notify = Arc::new(tokio::sync::Notify::new());
                 let worker = FilterWorker::open(new.config.clone(), id)?;
                 tokio::spawn(new.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone()));
@@ -56,10 +66,11 @@ impl WorkerState {
 
     pub async fn create_index(self: &Arc<Self>, id: FilterID, expiry: ExpiryGroup) -> Result<()> {
         self.database.create_filter(id, &expiry).await?;
+        let mut filters = self.filters.write().await;
+        if filters.contains_key(&id) { return Ok(()); }
         let worker = FilterWorker::open(self.config.clone(), id)?;
         let notify = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone()));
-        let mut filters = self.filters.write().await;
         filters.insert(id, (worker, notify));
         return Ok(())
     }
@@ -85,7 +96,7 @@ impl WorkerState {
         let filter_sizes = self.database.filter_sizes().await;
         let filters = self.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
         let mut assignments: HashMap<Sha256, Vec<FilterID>> = Default::default();
-        let storage_pressure = self.check_storage_pressure().await?;
+        let storage_pressure = self.check_storage_pressure().await.context("check_storage_pressure")?;
         if !storage_pressure {
             for file in missing {
                 let mut selected = vec![];
@@ -106,7 +117,7 @@ impl WorkerState {
             assignments,
             storage_pressure,
             filter_sizes,
-            filter_pending: self.database.filter_pending_count().await,
+            filter_pending: self.database.filter_pending().await,
         })
     }
 
@@ -116,12 +127,15 @@ impl WorkerState {
         while let Some(dir) = dirs.pop() {
             let mut listing = tokio::fs::read_dir(&dir).await?;
             while let Some(file) = listing.next_entry().await? {
-                let file_type = file.file_type().await?;
-                if file_type.is_dir() {
-                    dirs.push(file.path())
-                }
-                else if file_type.is_file() {
-                    total += file.metadata().await?.len();
+                if let Ok(file_type) =  file.file_type().await {
+                    if file_type.is_dir() {
+                        dirs.push(file.path())
+                    }
+                    else if file_type.is_file() {
+                        if let Ok(meta) = file.metadata().await {
+                            total += meta.len();
+                        }
+                    }
                 }
             }
         }
@@ -160,8 +174,19 @@ impl WorkerState {
                             Err(_) => return Err(ErrorKinds::UnableToBuildTrigrams),
                         };
 
+                        // Store the trigrams
+                        let trigram_cache_dir = core.config.data_path.join(TRIGRAM_DIRECTORY);
+                        let cache_path = trigram_cache_dir.join(format!("{filter}-{}", file.hash));
+                        tokio::task::spawn_blocking(move ||{
+                            let mut temp = tempfile::NamedTempFile::new_in(&trigram_cache_dir)?;
+                            temp.write_all(&postcard::to_allocvec(&trigrams)?)?;
+                            temp.flush()?;
+                            temp.persist(cache_path)?;
+                            Result::<(), ErrorKinds>::Ok(())
+                        }).await??;
+
                         // Ingest the file
-                        let complete = core.database.ingest_file(filter, &file, &trigrams).await?;
+                        let complete = core.database.ingest_file(filter, &file).await?;
                         return Ok((complete, filter, file.hash))
                     });
                 }
@@ -202,10 +227,12 @@ impl WorkerState {
     pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) {
         while let Err(err) = self._ingest_feeder(id, &writer, notify.clone()).await {
             error!("ingest feeder crash {err:?}");
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     }
 
     pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {
+        info!("Starting ingest feeder for {id}");
         loop {
             // Get next set of incomplete files
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
@@ -214,16 +241,37 @@ impl WorkerState {
                 continue
             }
 
+            let mut min = u64::MAX;
+            let mut max = u64::MIN;
+            for (number, _) in &batch {
+                min = min.min(*number);
+                max = max.max(*number);
+            }
+            info!("Ingesting batch to {id} ({min} to {max})");
+
+            // Load the file trigrams
+            let mut trigrams = vec![];
+            let mut paths = vec![];
+            for (number, hash) in &batch {
+                let trigram_cache_dir = self.config.data_path.join(TRIGRAM_DIRECTORY);
+                let cache_path = trigram_cache_dir.join(format!("{id}-{}", hash));
+                let data: BitVec = postcard::from_bytes(&tokio::fs::read(&cache_path).await.context(cache_path.to_str().unwrap().to_owned())?)?;
+                paths.push(cache_path);
+                trigrams.push((*number, data));
+            }
+
             // Send the files to the writer
-            let files = batch.iter().map(|row|row.0).collect_vec();
-            let batch = batch.into_iter().map(|row|(row.0, row.1)).collect_vec();
             let (finished_send, finished_recv) = oneshot::channel();
-            writer.send(WriterCommand::Ingest(batch, finished_send)).await?;
+            writer.send(WriterCommand::Ingest(trigrams, finished_send)).await?;
 
             // Wait for a positive response
-            if let Ok(()) = finished_recv.await {
-                // Commit those file ids
-                self.database.finished_ingest(id, files).await?;
+            finished_recv.await?;
+            // Commit those file ids
+            self.database.finished_ingest(id, batch).await?;
+            for file in paths {
+                if let Err(err) = tokio::fs::remove_file(file).await {
+                    error!("{err}");
+                }
             }
         }
     }

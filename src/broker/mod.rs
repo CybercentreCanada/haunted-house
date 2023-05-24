@@ -3,7 +3,7 @@ pub mod auth;
 mod database;
 mod database_sqlite;
 
-use std::collections::{HashSet, HashMap, hash_map, BTreeSet};
+use std::collections::{HashSet, HashMap, hash_map, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use futures::{StreamExt, SinkExt};
@@ -190,6 +190,25 @@ impl HouseCore {
         return Ok(())
     }
 
+    pub async fn get_ingest_pending(self: &Arc<Self>) -> HashMap<FilterID, Vec<Sha256>> {
+        let mut requests = vec![];
+        {
+            let workers = self.worker_ingest.read().await;
+            for (worker, channel) in workers.iter() {
+                let (send, recv) = oneshot::channel();
+                channel.send(WorkerIngestMessage::ListPending(send));
+                requests.push(recv);
+            }
+        }
+        let mut output = HashMap::<FilterID, Vec<Sha256>>::new();
+        for resp in requests {
+            if let Ok(resp) = resp.await {
+                output.extend(resp);
+            }
+        }
+        return output
+    }
+
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         let channel = {
             let searches = self.running_searches.read().await;
@@ -274,7 +293,8 @@ pub enum IngestMessage {
 #[derive(Debug)]
 pub enum WorkerIngestMessage {
     IngestMessage((IngestTask, FilterID)),
-    Status(oneshot::Sender<HashMap<FilterID, u32>>)
+    Status(oneshot::Sender<HashMap<FilterID, u32>>),
+    ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
 }
 
 
@@ -292,7 +312,8 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 }
 
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
-    let mut unchecked_buffer = HashMap::<Sha256, IngestTask>::new();
+    let mut buffer_hashes: HashSet<Sha256> = Default::default();
+    let mut unchecked_buffer = VecDeque::<IngestTask>::new();
     let mut check_worker: JoinSet<Result<Vec<IngestTask>>> = JoinSet::new();
     let mut active_batch_size = 0;
     let mut counter = crate::counters::RateCounter::new(60);
@@ -302,12 +323,11 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
         if check_worker.is_empty() && !unchecked_buffer.is_empty() {
             let core = core.clone();
             let mut tasks: HashMap<_, _> = Default::default();
-            for key in unchecked_buffer.keys().cloned().collect_vec() {
+            while let Some(task) = unchecked_buffer.pop_front() {
+                buffer_hashes.remove(&task.info.hash);
+                tasks.insert(task.info.hash.clone(), task);
                 if tasks.len() >= 200 {
                     break;
-                }
-                if let Some(row) = unchecked_buffer.remove(&key) {
-                    tasks.insert(key, row);
                 }
             }
             active_batch_size = tasks.len();
@@ -325,10 +345,17 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
                 match message {
                     IngestMessage::IngestMessage(task) => {
-                        match unchecked_buffer.entry(task.info.hash.clone()) {
-                            hash_map::Entry::Occupied(mut entry) => { entry.get_mut().merge(task); },
-                            hash_map::Entry::Vacant(entry) => { entry.insert(task); },
-                        };
+                        if buffer_hashes.contains(&task.info.hash) {
+                            for other in &mut unchecked_buffer {
+                                if other.info.hash == task.info.hash {
+                                    other.merge(task);
+                                    break
+                                }
+                            }
+                        } else {
+                            buffer_hashes.insert(task.info.hash.clone());
+                            unchecked_buffer.push_back(task);
+                        }
                     },
                     IngestMessage::Status(resp) => {
                         _ = resp.send(IngestCheckStatus {
@@ -352,10 +379,17 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 match res {
                     Ok(Ok(delayed)) => {
                         for task in delayed {
-                            match unchecked_buffer.entry(task.info.hash.clone()) {
-                                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().merge(task); },
-                                hash_map::Entry::Vacant(entry) => { entry.insert(task); },
-                            };
+                            if buffer_hashes.contains(&task.info.hash) {
+                                for other in &mut unchecked_buffer {
+                                    if other.info.hash == task.info.hash {
+                                        other.merge(task);
+                                        break
+                                    }
+                                }
+                            } else {
+                                buffer_hashes.insert(task.info.hash.clone());
+                                unchecked_buffer.push_back(task);
+                            }
                         }
                     },
                     Ok(Err(err)) => {
@@ -445,7 +479,15 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         }
     }
 
+    for (filter, files) in core.get_ingest_pending().await {
+        match filter_pending.entry(filter) {
+            hash_map::Entry::Occupied(mut entry) => { entry.get_mut().extend(files);},
+            hash_map::Entry::Vacant(entry) => {entry.insert(files.into_iter().collect());},
+        }
+    }
+
     debug!("Ingest Check simple assignments, {} task remaining, {} nodes without pressure.", tasks.len(), workers_without_pressure.len());
+    // debug!("Pending {filter_pending:?}");
     // Accept assignments from workers that are uncontroversial
     for sha in tasks.keys().cloned().collect_vec() {
         // let task = tasks.get(&sha).unwrap();
@@ -453,7 +495,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         let mut best_pending = u64::MAX;
 
         for (worker, suggested) in suggestions.get(&sha).unwrap_or(&vec![]) {
-            let pending = *filter_pending.get(suggested).unwrap_or(&0);
+            let pending = filter_pending.get(suggested).unwrap_or(&[].into()).len() as u64;
             if pending >= core.config.per_filter_pending_limit {
                 continue
             }
@@ -548,22 +590,21 @@ async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver
 async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: &WorkerID, address: &WorkerAddress) -> Result<()> {
     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
     let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
+    let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+    query_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    {
+        let request = core.client.get(address.http("/files/ingest-queues")?);
+        let result = request.send().await?;
+        let response: HashMap<FilterID, Vec<FileInfo>> = result.json().await?;
+        for (filter, files) in response {
+            for file in files {
+                active.insert(file.hash.clone(), (filter, IngestTask{info: file, response:vec![]}));
+            }
+        }
+    }
 
     loop {
-        //
-        if query.is_empty() && !active.is_empty() {
-            let request = core.client.post(address.http("/files/ingest")?)
-            .json(&IngestFilesRequest{
-                files: active.values().map(|(filter, task)|{
-                    (*filter, task.info.clone())
-                }).collect_vec()
-            });
-            query.spawn(async move {
-                let result = request.send().await?;
-                anyhow::Ok(result)
-            });
-        }
-
         // Wait until something changes
         tokio::select!{
             // Watch for command messages
@@ -590,6 +631,16 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         let mut count = HashMap::<FilterID, u32>::new();
                         for (id, _) in active.values() {
                             count.insert(*id, 1 + count.get(id).unwrap_or(&0));
+                        }
+                        _ = resp.send(count);
+                    },
+                    WorkerIngestMessage::ListPending(resp) => {
+                        let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
+                        for (id, task) in active.values() {
+                            match count.entry(*id) {
+                                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push(task.info.hash.clone()); },
+                                hash_map::Entry::Vacant(entry) => { entry.insert(vec![task.info.hash.clone()]); },
+                            }
                         }
                         _ = resp.send(count);
                     },
@@ -628,6 +679,22 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                     if let Some(expiry) = core.database.get_expiry(filter).await? {
                         core.install_filter(worker.clone(), expiry, filter).await?;
                     }
+                }
+            }
+
+            _ = query_interval.tick() => {
+                //
+                if query.is_empty() && !active.is_empty() {
+                    let request = core.client.post(address.http("/files/ingest")?)
+                    .json(&IngestFilesRequest{
+                        files: active.values().map(|(filter, task)|{
+                            (*filter, task.info.clone())
+                        }).collect_vec()
+                    });
+                    query.spawn(async move {
+                        let result = request.send().await?;
+                        anyhow::Ok(result)
+                    });
                 }
             }
         }
