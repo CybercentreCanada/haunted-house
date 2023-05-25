@@ -32,6 +32,7 @@ uuid = { version = "*", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde", "std"] }
 time = { version = "0.3" }
 parse_duration = "2"
+num-format = "0.4"
 
 tempfile = "3"
 rand = "0.8"
