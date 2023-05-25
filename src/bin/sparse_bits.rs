@@ -45,7 +45,7 @@ impl Chunk {
                 items.sort_unstable();
                 items.dedup();
 
-                if items.len() > 4096 {
+                if items.len() >= 4096 {
                     let count = items.len() as u16;
                     let mut mask = Box::new(bitarr!(u64, bitvec::prelude::Lsb0; 1024; 1 << 16));
                     for item in items {
@@ -55,7 +55,7 @@ impl Chunk {
                 }
             },
             Chunk::Mask(count, mask) => {
-                if *count >= (u16::MAX - 4096) {
+                if *count > (u16::MAX - 4096) {
                     let mut items = vec![];
                     for index in mask.iter_zeros() {
                         items.push(index as u16);
@@ -123,8 +123,9 @@ fn main() -> Result<()> {
     for (count, index) in mask.iter_ones().enumerate() {
         sparse.insert(index as u32);
         if count % (1 << 16) == 0 {
-            println!("size: {}", sparse.memory().to_formatted_string(&Locale::en));
+            let mem = sparse.memory();
             sparse.compact();
+            println!("size: {} -> {}", mem.to_formatted_string(&Locale::en), sparse.memory().to_formatted_string(&Locale::en));
         }
     }
     println!("size: {}", sparse.memory().to_formatted_string(&Locale::en));
