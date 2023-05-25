@@ -38,7 +38,7 @@ impl Database {
             Database::SQLite(db) => db.create_filter(id, expiry).await.context("create_filter"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::CreateFilter { id, expiry: expiry.clone(), response: send }).await;
+                chan.send(BSQLCommand::CreateFilter { id, expiry: expiry.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -49,7 +49,7 @@ impl Database {
             Database::SQLite(db) => db.get_filters(first, last).await,
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetFilters { first: first.clone(), last: last.clone(), response: send }).await;
+                chan.send(BSQLCommand::GetFilters { first: first.clone(), last: last.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -60,7 +60,7 @@ impl Database {
             Database::SQLite(db) => db.get_expiry(first, last).await,
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetExpiry { first: first.clone(), last: last.clone(), response: send }).await;
+                chan.send(BSQLCommand::GetExpiry { first: first.clone(), last: last.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -71,7 +71,7 @@ impl Database {
             Database::SQLite(db) => db.delete_filter(id).await.context("delete_filter"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::DeleteFilter { id, response: send }).await;
+                chan.send(BSQLCommand::DeleteFilter { id, response: send }).await?;
                 resp.await?
             }
         }
@@ -82,7 +82,7 @@ impl Database {
             Database::SQLite(db) => db.get_file_access(id, hash).await.context("get_fileinfo"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetFileAccess { id, hash: hash.clone(), response: send }).await;
+                chan.send(BSQLCommand::GetFileAccess { id, hash: hash.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -126,7 +126,7 @@ impl Database {
             Database::SQLite(db) => db.update_file_access(file).await.context("update_file_access"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::UpdateFileAccess { file: file.clone(), response: send }).await;
+                chan.send(BSQLCommand::UpdateFileAccess { file: file.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -137,7 +137,7 @@ impl Database {
             Database::SQLite(db) => db.check_insert_status(id, file).await,
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::CheckInsertStatus { id, file: file.clone(), response: send }).await;
+                chan.send(BSQLCommand::CheckInsertStatus { id, file: file.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -148,7 +148,7 @@ impl Database {
             Database::SQLite(db) => db.ingest_file(id, file).await,
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::IngestFile { id, file: file.clone(), response: send }).await;
+                chan.send(BSQLCommand::IngestFile { id, file: file.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -159,7 +159,7 @@ impl Database {
             Database::SQLite(db) => db.select_file_hashes(id, file_indices, access).await.context("select_file_hashes"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::SelectFileHashes { id, file_indices: file_indices.clone(), access: access.clone(), response: send }).await;
+                chan.send(BSQLCommand::SelectFileHashes { id, file_indices: file_indices.clone(), access: access.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -170,7 +170,7 @@ impl Database {
             Database::SQLite(db) => db.get_ingest_batch(id, limit).await.context("get_ingest_batch"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetIngestBatch { id, limit, response: send }).await;
+                chan.send(BSQLCommand::GetIngestBatch { id, limit, response: send }).await?;
                 resp.await?
             }
         }
@@ -181,7 +181,7 @@ impl Database {
             Database::SQLite(db) => db.finished_ingest(id, files).await.context("finished_ingest"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::FinishedIngest { id, files, response: send }).await;
+                chan.send(BSQLCommand::FinishedIngest { id, files, response: send }).await?;
                 resp.await?
             }
         }

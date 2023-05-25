@@ -3,7 +3,6 @@ use std::io::Write;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use bitvec::vec::BitVec;
-use itertools::Itertools;
 use log::{debug, info, error};
 use tokio::sync::{mpsc, watch, Notify, oneshot};
 use tokio::task::JoinSet;

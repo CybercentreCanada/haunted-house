@@ -161,7 +161,7 @@ async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesR
 async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<HashMap<FilterID, Vec<FileInfo>>>> {
     let expiries = match state.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await {
         Ok(result) => result,
-        Err(err) => return Err(poem::http::StatusCode::INTERNAL_SERVER_ERROR.into())
+        Err(_err) => return Err(poem::http::StatusCode::INTERNAL_SERVER_ERROR.into())
     };
     let expiries: HashMap<FilterID, ExpiryGroup> = expiries.into_iter().collect();
 

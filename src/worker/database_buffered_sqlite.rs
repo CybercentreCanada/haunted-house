@@ -140,20 +140,20 @@ impl BufferedSQLite {
 
     async fn handle_message(&mut self, message: BSQLCommand) -> Result<()> {
         match message {
-            BSQLCommand::CreateFilter { id, expiry, response } => { response.send(self.create_filter(id, &expiry).await); },
-            BSQLCommand::GetFilters { first, last, response } => { response.send(self.get_filters(&first, &last).await); },
-            BSQLCommand::GetExpiry { first, last, response } => { response.send(self.get_expiry(&first, &last).await); },
-            BSQLCommand::DeleteFilter { id, response } => { response.send(self.delete_filter(id).await); },
-            BSQLCommand::GetFileAccess { id, hash, response } => { response.send(self.get_file_access(id, &hash).await); },
-            BSQLCommand::FilterSizes { response } => { response.send(self.filter_sizes().await); },
-            BSQLCommand::FilterPendingCount { response } => { response.send(self.filter_pending_count().await); },
-            BSQLCommand::FilterPending { response } => { response.send(self.filter_pending().await); },
-            BSQLCommand::UpdateFileAccess { file, response } => { response.send(self.update_file_access(&file).await); },
-            BSQLCommand::CheckInsertStatus { id, file, response } => { response.send(self.check_insert_status(id, &file).await); },
-            BSQLCommand::IngestFile { id, file, response } => { response.send(self.ingest_file(id, &file).await); },
-            BSQLCommand::SelectFileHashes { id, file_indices, access, response } => { response.send(self.select_file_hashes(id, &file_indices, &access).await); },
-            BSQLCommand::GetIngestBatch { id, limit, response } => { response.send(self.get_ingest_batch(id, limit).await); },
-            BSQLCommand::FinishedIngest { id, files, response } => { response.send(self.finished_ingest(id, files).await); },
+            BSQLCommand::CreateFilter { id, expiry, response } => { _ = response.send(self.create_filter(id, &expiry).await); },
+            BSQLCommand::GetFilters { first, last, response } => { _ = response.send(self.get_filters(&first, &last).await); },
+            BSQLCommand::GetExpiry { first, last, response } => { _ = response.send(self.get_expiry(&first, &last).await); },
+            BSQLCommand::DeleteFilter { id, response } => { _ = response.send(self.delete_filter(id).await); },
+            BSQLCommand::GetFileAccess { id, hash, response } => { _ = response.send(self.get_file_access(id, &hash).await); },
+            BSQLCommand::FilterSizes { response } => { _ = response.send(self.filter_sizes().await); },
+            BSQLCommand::FilterPendingCount { response } => { _ = response.send(self.filter_pending_count().await); },
+            BSQLCommand::FilterPending { response } => { _ = response.send(self.filter_pending().await); },
+            BSQLCommand::UpdateFileAccess { file, response } => { _ = response.send(self.update_file_access(&file).await); },
+            BSQLCommand::CheckInsertStatus { id, file, response } => { _ = response.send(self.check_insert_status(id, &file).await); },
+            BSQLCommand::IngestFile { id, file, response } => { _ = response.send(self.ingest_file(id, &file).await); },
+            BSQLCommand::SelectFileHashes { id, file_indices, access, response } => { _ = response.send(self.select_file_hashes(id, &file_indices, &access).await); },
+            BSQLCommand::GetIngestBatch { id, limit, response } => { _ = response.send(self.get_ingest_batch(id, limit).await); },
+            BSQLCommand::FinishedIngest { id, files, response } => { _ = response.send(self.finished_ingest(id, files).await); },
         };
         Ok(())
     }

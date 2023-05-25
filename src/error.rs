@@ -58,7 +58,7 @@ impl From<postcard::Error> for ErrorKinds {
 }
 
 impl From<tokio::task::JoinError> for ErrorKinds {
-    fn from(value: tokio::task::JoinError) -> Self {
+    fn from(_value: tokio::task::JoinError) -> Self {
         Self::JoinError
     }
 }
