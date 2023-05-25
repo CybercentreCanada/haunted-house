@@ -12,7 +12,6 @@ use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
 use crate::query::Query;
 use crate::storage::BlobStorage;
-use crate::timing::{mark, TimingCapture, Mark};
 use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;

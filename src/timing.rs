@@ -1,8 +1,5 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-// use std::sync::Once;
-// use std::time::Duration;
 
 use lazy_static::lazy_static;
 
@@ -48,6 +45,7 @@ impl Capture {
         new_index
     }
 
+    #[cfg(test)]
     pub fn print(&self) {
         println!("{}", self.format())
     }
