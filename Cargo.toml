@@ -14,7 +14,7 @@ required-features = ["operator"]
 #tracing-flame = "*"
 #tracing-subscriber = "*"
 memmap2 = "*"
-
+lazy_static = "1"
 
 serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0"

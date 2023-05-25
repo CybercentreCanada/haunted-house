@@ -12,6 +12,7 @@ use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
 use crate::query::Query;
 use crate::storage::BlobStorage;
+use crate::timing::{mark, TimingCapture, Mark};
 use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;
@@ -234,7 +235,9 @@ impl WorkerState {
         info!("Starting ingest feeder for {id}");
         loop {
             // Get next set of incomplete files
+            let stamp = std::time::Instant::now();
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
+            let time_get_batch = stamp.elapsed().as_secs_f64();
             if batch.is_empty() {
                 _ = tokio::time::timeout(tokio::time::Duration::from_secs(300), notify.notified()).await;
                 continue
@@ -248,6 +251,7 @@ impl WorkerState {
             }
             info!("Ingesting batch to {id} ({min} to {max})");
 
+            let stamp = std::time::Instant::now();
             // Load the file trigrams
             let mut trigrams = vec![];
             let mut paths = vec![];
@@ -258,20 +262,30 @@ impl WorkerState {
                 paths.push(cache_path);
                 trigrams.push((*number, data));
             }
+            let time_load_trigrams = stamp.elapsed().as_secs_f64();
 
+            let stamp = std::time::Instant::now();
             // Send the files to the writer
             let (finished_send, finished_recv) = oneshot::channel();
             writer.send(WriterCommand::Ingest(trigrams, finished_send)).await?;
 
             // Wait for a positive response
             finished_recv.await?;
+            let time_install = stamp.elapsed().as_secs_f64();
+
             // Commit those file ids
+            let stamp = std::time::Instant::now();
             self.database.finished_ingest(id, batch).await?;
+            let time_finish = stamp.elapsed().as_secs_f64();
+
+            let stamp = std::time::Instant::now();
             for file in paths {
                 if let Err(err) = tokio::fs::remove_file(file).await {
                     error!("{err}");
                 }
             }
+            let time_cleanup = stamp.elapsed().as_secs_f64();
+            info!("Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish}; cleanup {time_cleanup}");
         }
     }
 

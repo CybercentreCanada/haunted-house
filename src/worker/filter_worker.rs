@@ -1,12 +1,12 @@
 use std::sync::{Arc};
 
 use crate::query::Query;
-use crate::timing::NullCapture;
+use crate::timing::{NullCapture, Capture};
 use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;
 use bitvec::vec::BitVec;
-use log::{error, debug};
+use log::{error, debug, info};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
@@ -91,17 +91,19 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
         match message {
             WriterCommand::Ingest(mut batch, finished) => {
                 // Insert the batch
+                let capture = Capture::new();
                 let size = batch.len();
                 let batch = {
                     let filter = filter.blocking_read();
-                    filter.write_batch(&mut batch, NullCapture::new())?
+                    filter.write_batch(&mut batch, &capture)?
                 };
                 {
                     let mut filter = filter.blocking_write();
-                    filter.apply_operations(batch.0, batch.1, NullCapture::new())?;
+                    filter.apply_operations(batch.0, batch.1, &capture)?;
                 }
                 _ = finished.send(());
                 debug!("Ingested {} files into {}", size, id);
+                info!("Ingest install time: \n{}", capture.format());
             }
         }
     }
