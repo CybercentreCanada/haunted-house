@@ -235,7 +235,7 @@ impl HouseCore {
         let (ingest_send, ingest_recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::Status(ingest_send))?;
 
-        let mut watchers = HashMap::<WorkerID, oneshot::Receiver<HashMap<FilterID, u32>>>::new();
+        let mut watchers = HashMap::<WorkerID, oneshot::Receiver<HashMap<FilterID, IngestWatchStatus>>>::new();
         let workers = self.worker_ingest.read().await;
         for (id, channel) in workers.iter() {
             let (send, recv) = oneshot::channel();
@@ -243,7 +243,7 @@ impl HouseCore {
             watchers.insert(id.clone(), recv);
         }
 
-        let mut ingest_watchers: HashMap<WorkerID, HashMap<FilterID, u32>> = Default::default();
+        let mut ingest_watchers: HashMap<WorkerID, HashMap<FilterID, IngestWatchStatus>> = Default::default();
         for (id, sock) in watchers.into_iter() {
             if let Ok(value) = sock.await {
                 ingest_watchers.insert(id, value);
@@ -279,6 +279,7 @@ impl IngestTask {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestCheckStatus {
+    delayed: usize,
     queue: usize,
     active: usize,
     last_minute: usize
@@ -290,10 +291,16 @@ pub enum IngestMessage {
     Status(oneshot::Sender<IngestCheckStatus>)
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestWatchStatus {
+    queue: usize,
+    per_minute: f64
+}
+
 #[derive(Debug)]
 pub enum WorkerIngestMessage {
     IngestMessage((IngestTask, FilterID)),
-    Status(oneshot::Sender<HashMap<FilterID, u32>>),
+    Status(oneshot::Sender<HashMap<FilterID, IngestWatchStatus>>),
     ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
 }
 
@@ -314,6 +321,7 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
     let mut buffer_hashes: HashSet<Sha256> = Default::default();
     let mut unchecked_buffer = VecDeque::<IngestTask>::new();
+    let mut delay_buffer = tokio_util::time::DelayQueue::new();
     let mut check_worker: JoinSet<Result<Vec<IngestTask>>> = JoinSet::new();
     let mut active_batch_size = 0;
     let mut counter = crate::counters::RateCounter::new(60);
@@ -359,6 +367,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     },
                     IngestMessage::Status(resp) => {
                         _ = resp.send(IngestCheckStatus {
+                            delayed: delay_buffer.len(),
                             queue: unchecked_buffer.len(),
                             active: active_batch_size,
                             last_minute: counter.average()
@@ -379,17 +388,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 match res {
                     Ok(Ok(delayed)) => {
                         for task in delayed {
-                            if buffer_hashes.contains(&task.info.hash) {
-                                for other in &mut unchecked_buffer {
-                                    if other.info.hash == task.info.hash {
-                                        other.merge(task);
-                                        break
-                                    }
-                                }
-                            } else {
-                                buffer_hashes.insert(task.info.hash.clone());
-                                unchecked_buffer.push_back(task);
-                            }
+                            delay_buffer.insert(task, tokio::time::Duration::from_secs(60));
                         }
                     },
                     Ok(Err(err)) => {
@@ -402,6 +401,26 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
                 counter.increment(active_batch_size - (unchecked_buffer.len() - before));
                 active_batch_size = 0;
+            }
+
+            //
+            task = delay_buffer.next(), if !delay_buffer.is_empty() => {
+                let task = match task {
+                    Some(x) => x.into_inner(),
+                    None => continue,
+                };
+
+                if buffer_hashes.contains(&task.info.hash) {
+                    for other in &mut unchecked_buffer {
+                        if other.info.hash == task.info.hash {
+                            other.merge(task);
+                            break
+                        }
+                    }
+                } else {
+                    buffer_hashes.insert(task.info.hash.clone());
+                    unchecked_buffer.push_back(task);
+                }
             }
         }
     }
@@ -592,6 +611,8 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
     let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
     let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
     query_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut counters = HashMap::<FilterID, crate::counters::RateCounter>::new();
+    let start = std::time::Instant::now();
 
     {
         let request = core.client.get(address.http("/files/ingest-queues")?);
@@ -628,11 +649,21 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         }
                     },
                     WorkerIngestMessage::Status(resp) => {
-                        let mut count = HashMap::<FilterID, u32>::new();
+                        let mut count = HashMap::<FilterID, usize>::new();
                         for (id, _) in active.values() {
                             count.insert(*id, 1 + count.get(id).unwrap_or(&0));
                         }
-                        _ = resp.send(count);
+                        let mut status = HashMap::<FilterID, IngestWatchStatus>::new();
+                        for (id, num) in count {
+                            status.insert(id, IngestWatchStatus {
+                                queue: num,
+                                per_minute: match counters.get_mut(&id){
+                                    Some(count) => count.average() as f64/((start.elapsed().as_secs_f64()/60.0).clamp(1.0, 60.0)),
+                                    None => 0.0,
+                                }
+                            });
+                        }
+                        _ = resp.send(status);
                     },
                     WorkerIngestMessage::ListPending(resp) => {
                         let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
@@ -667,9 +698,17 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
 
                 // Pull out the tasks that have been finished
                 for hash in response.completed {
-                    if let Some((_, task)) = active.remove(&hash) {
+                    if let Some((filter, task)) = active.remove(&hash) {
                         for response in task.response {
                             _ = response.send(Ok(()));
+                        }
+                        match counters.entry(filter) {
+                            hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
+                            hash_map::Entry::Vacant(entry) => {
+                                let mut counter = crate::counters::RateCounter::new(60 * 60);
+                                counter.increment(1);
+                                entry.insert(counter);
+                            },
                         }
                     }
                 }
