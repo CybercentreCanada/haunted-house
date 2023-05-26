@@ -232,13 +232,15 @@ impl WorkerState {
 
     pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {
         info!("Starting ingest feeder for {id}");
-        loop {
+        while *self.running.borrow() {
             // Get next set of incomplete files
             let stamp = std::time::Instant::now();
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
             let time_get_batch = stamp.elapsed().as_secs_f64();
             if batch.is_empty() {
-                _ = tokio::time::timeout(tokio::time::Duration::from_secs(300), notify.notified()).await;
+                if let Err(_) = tokio::time::timeout(tokio::time::Duration::from_secs(600), notify.notified()).await {
+                    writer.send(WriterCommand::Flush).await?;
+                }
                 continue
             }
 
@@ -286,6 +288,7 @@ impl WorkerState {
             let time_cleanup = stamp.elapsed().as_secs_f64();
             info!("Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish}; cleanup {time_cleanup}");
         }
+        return Ok(())
     }
 
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {

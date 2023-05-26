@@ -20,7 +20,8 @@ enum ReaderCommand {
 
 #[derive(Debug)]
 pub enum WriterCommand {
-    Ingest(Vec<(u64, BitVec)>, oneshot::Sender<()>)
+    Ingest(Vec<(u64, BitVec)>, oneshot::Sender<()>),
+    Flush
 }
 
 pub struct FilterWorker {
@@ -62,14 +63,14 @@ fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerS
     let directory = config.data_path.join(FILTER_SUBDIR);
     let path = directory.join(id.to_string());
     let filter = if path.exists() {
-        ExtensibleTrigramFile::open(&path)
+        ExtensibleTrigramFile::open(directory, id)
     } else {
-        ExtensibleTrigramFile::new(&path, config.initial_segment_size, config.extended_segment_size)
+        ExtensibleTrigramFile::new(directory, id, config.initial_segment_size, config.extended_segment_size)
     };
     let filter = match filter {
         Ok(filter) => Arc::new(RwLock::new(filter)),
         Err(err) => {
-            error!("Could not load filter {}: {err}", path.to_string_lossy());
+            error!("Could not load filter {}: {err:?}", path.to_string_lossy());
             return;
         },
     };
@@ -99,13 +100,23 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
                 };
                 {
                     let mut filter = filter.blocking_write();
-                    filter.apply_operations(batch.0, batch.1, &capture)?;
+                    filter.apply_operations(batch.0, batch.1, batch.2, &capture)?;
                 }
                 _ = finished.send(());
                 debug!("Ingested {} files into {}", size, id);
                 info!("Ingest install time: \n{}", capture.format());
+            },
+            WriterCommand::Flush => {
+                let filter = filter.blocking_read();
+                if filter.outstanding_journals()? > 0 {
+                    filter.flush_threaded(None, None);
+                }
             }
         }
+    }
+    {
+        let filter = filter.blocking_read();
+        filter.flush_blocking();
     }
     return Ok(())
 }

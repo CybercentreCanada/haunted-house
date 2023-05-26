@@ -2,16 +2,22 @@ use bitvec::vec::BitVec;
 use anyhow::{Result, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
+use log::error;
+use memmap2::MmapMut;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use tokio::sync::RwLock;
 
 // use crate::mark;
 use crate::query::Query;
 use crate::timing::{TimingCapture, mark, NullCapture};
+use crate::types::FilterID;
 
 use super::encoding::{cost_to_add, encode_into, decode_into};
 
@@ -118,14 +124,87 @@ fn intersection(base: &mut Vec<u64>, other: &Vec<u64>) {
     base.truncate(base_write_index);
 }
 
+fn get_next_journal(directory: &Path, id: FilterID) -> (File, PathBuf, u64) {
+    loop {
+        let next_id = match get_operation_journals(directory, id) {
+            Ok(journals) => match journals.last() {
+                Some((num, _)) => *num,
+                None => 0,
+            },
+            Err(err) => {
+                error!("{err}");
+                continue;
+            },
+        };
+        let name = format!("{id}.{next_id:08}");
+        let location = directory.join(name);
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&location);
+        match file {
+            Ok(file) => return (file, location, next_id),
+            Err(_) => continue,
+        }
+    }
+}
+
+fn get_operation_journals(directory: &Path, id: FilterID) -> Result<Vec<(u64, PathBuf)>> {
+    let id_str = format!("{id}");
+    let mut listing = std::fs::read_dir(directory)?;
+    let mut found = vec![];
+    while let Some(file) = listing.next() {
+        let file = match file {
+            Ok(file) => file,
+            _ => continue
+        };
+
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            _ => continue
+        };
+
+        if !metadata.is_file() {
+            continue
+        }
+
+        let name = file.file_name();
+        let name = match name.to_str() {
+            Some(name) => name,
+            _ => continue
+        };
+
+        let mut parts = name.split(".");
+        let owner = match parts.next() {
+            Some(owner) => owner,
+            None => continue,
+        };
+        if owner != &id_str {
+            continue
+        }
+
+        let code = match parts.next() {
+            Some(owner) => owner,
+            None => continue,
+        };
+
+        let counter: u64 = match code.parse() {
+            Ok(counter) => counter,
+            Err(_) => continue,
+        };
+
+        found.push((counter, file.path()));
+    }
+
+    found.sort_unstable();
+    return Ok(found)
+}
+
 pub struct ExtensibleTrigramFile {
     initial_segment_size: u32,
     extended_segment_size: u32,
-    data_location: PathBuf,
-    // data: std::fs::File,
-    data: memmap2::MmapMut,
-    edit_buffer_location: PathBuf,
+    data: Arc<RwLock<memmap2::MmapMut>>,
     extended_segments: u32,
+    directory: PathBuf,
+    location: PathBuf,
+    id: FilterID,
 }
 
 // impl std::fmt::Debug for ExtensibleTrigramFile {
@@ -160,12 +239,12 @@ enum UpdateOperations<'a> {
 //     }
 // }
 
-struct RawSegmentInfo<'a> {
-    data: &'a[u8],
+struct RawSegmentInfo {
+    data: Vec<u8>,
 }
 
-impl<'a> RawSegmentInfo<'a> {
-    fn new(data: &'a[u8]) -> Self {
+impl RawSegmentInfo {
+    fn new(data: Vec<u8>) -> Self {
         RawSegmentInfo { data }
     }
 
@@ -190,9 +269,10 @@ impl<'a> RawSegmentInfo<'a> {
 
 impl ExtensibleTrigramFile {
 
-    pub fn new(location: &Path, initial_segment_size: u32, extended_segment_size: u32) -> Result<Self> {
+    pub fn new(directory: PathBuf, id: FilterID, initial_segment_size: u32, extended_segment_size: u32) -> Result<Self> {
         // prepare file
-        let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(location).context("Creating data file")?;
+        let location = directory.join(format!("{id}"));
+        let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&location).context("Creating data file")?;
         data.set_len(HEADER_SIZE + TRIGRAM_RANGE * initial_segment_size as u64).context("Adjusting file size")?;
 
         // write header
@@ -202,23 +282,21 @@ impl ExtensibleTrigramFile {
         data.write_u32::<LittleEndian>(extended_segment_size).context("Writing header")?;
         data.sync_all()?;
 
-        //
-        let mut edit_buffer_location = location.to_owned();
-        edit_buffer_location.set_extension("wb");
-
         // return object
         let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         data.advise(memmap2::Advice::Random)?;
-        Ok(Self { initial_segment_size, extended_segment_size, data_location: location.to_owned(), data, edit_buffer_location, extended_segments: 0 })
+        let data = Arc::new(RwLock::new(data));
+        Ok(Self { initial_segment_size, extended_segment_size, data, extended_segments: 0, directory, location, id })
     }
 
-    pub fn open(location: &Path) -> Result<Self> {
+    pub fn open(directory: PathBuf, id: FilterID) -> Result<Self> {
         // Open the file
-        let mut data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(location).context("Creating data file")?;
+        let location = directory.join(format!("{id}"));
+        let mut data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&location).context("Creating data file")?;
 
         // Read the header
         let mut header_buffer = vec![0; HEADER_SIZE as usize];
-        data.read_exact(&mut header_buffer)?;
+        data.read_exact(&mut header_buffer).context("Could not read header")?;
 
         // parse the header
         let mut header = std::io::Cursor::new(header_buffer);
@@ -238,15 +316,16 @@ impl ExtensibleTrigramFile {
         }
         let extended_size = metadata.len() - HEADER_SIZE - initial_segment_size as u64 * TRIGRAM_RANGE;
         let extended_segments = (extended_size/extended_segment_size as u64) as u32;
-        let mut edit_buffer_location = location.to_owned();
-        edit_buffer_location.set_extension("wb");
+
         let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         data.advise(memmap2::Advice::Random)?;
-        let mut filter = Self{ initial_segment_size, extended_segment_size, data_location: location.to_owned(), data, edit_buffer_location: edit_buffer_location.clone(), extended_segments };
+        let data = Arc::new(RwLock::new(data));
+        let edit_buffers = get_operation_journals(&directory, id)?;
+        let mut filter = Self{ initial_segment_size, extended_segment_size, data, extended_segments, directory, location, id };
 
         // Check for a edit buffer
-        if edit_buffer_location.exists() {
-            filter.check_and_apply_operations(File::open(edit_buffer_location).context("could not open edit buffer")?)?;
+        for (num, buffer) in edit_buffers {
+            filter.check_and_apply_operations(buffer, num)?;
         }
         return Ok(filter);
     }
@@ -377,22 +456,25 @@ impl ExtensibleTrigramFile {
     // #[instrument]
     fn read_initial_segment(&self, trigram: u32) -> Result<RawSegmentInfo> {
         let location = self.get_initial_segment_offset(trigram) as usize;
-        let data = &self.data[location..location+self.initial_segment_size as usize];
+        let data = self.data.blocking_read();
+        let data = data[location..location+self.initial_segment_size as usize].to_vec();
         return Ok(RawSegmentInfo::new(data))
     }
 
     // #[instrument]
     fn read_extended_segment(&self, segment: u32) -> Result<RawSegmentInfo> {
         let location = self.get_extended_segment_offset(segment) as usize;
-        let data = &self.data[location..location+self.extended_segment_size as usize];
+        let data = self.data.blocking_read();
+        let data = data[location..location+self.extended_segment_size as usize].to_vec();
         return Ok(RawSegmentInfo::new(data))
     }
 
     // #[instrument]
-    pub fn write_batch(&self, files: &mut [(u64, BitVec)], timing: impl TimingCapture) -> Result<(File, u32)> {
+    pub fn write_batch(&self, files: &mut [(u64, BitVec)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations
-        let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
+        let (write_buffer, buffer_location, buffer_counter) = get_next_journal(&self.directory, self.id);
+        // let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
         let mut skipped = HashSet::<u64>::new();
 
         // Leave room for the end offset at the start
@@ -568,20 +650,21 @@ impl ExtensibleTrigramFile {
         // Apply operation set
         // self.apply_operations(write_buffer, self.extended_segments + added_segments).context("apply operations")?;
         // println!("Operation file applied {:.2}", stamp.elapsed().as_secs_f64());
-        return Ok((write_buffer, self.extended_segments + added_segments))
+        return Ok((write_buffer, buffer_counter, self.extended_segments + added_segments))
     }
 
-    fn check_and_apply_operations(&mut self, mut buffer: File) -> Result<()> {
+    fn check_and_apply_operations(&mut self, location: PathBuf, buffer_counter: u64) -> Result<()> {
         // Check file is above minimum size
+        let mut buffer = File::open(&location).context("could not open edit buffer")?;
         if buffer.metadata()?.len() < 16 {
-            std::fs::remove_file(&self.edit_buffer_location)?;
+            std::fs::remove_file(&location)?;
             return Ok(())
         }
 
         // Read the length
         let offset = buffer.read_u64::<LittleEndian>()?;
         if offset == 0 {
-            std::fs::remove_file(&self.edit_buffer_location)?;
+            std::fs::remove_file(&location)?;
             return Ok(())
         }
 
@@ -590,83 +673,139 @@ impl ExtensibleTrigramFile {
         let added_segments = buffer.read_u32::<LittleEndian>()?;
         let commit = buffer.read_u8()?;
         if commit != 1 {
-            std::fs::remove_file(&self.edit_buffer_location)?;
+            std::fs::remove_file(&location)?;
             return Ok(())
         }
 
         // apply
-        self.apply_operations(buffer, self.extended_segments + added_segments, NullCapture::new())
+        self.apply_operations(buffer, buffer_counter, self.extended_segments + added_segments, NullCapture::new())
     }
 
     // #[instrument]
-    pub fn apply_operations(&mut self, mut source: File, extended_segments: u32, timing: impl TimingCapture) -> Result<()> {
+    pub fn apply_operations(&mut self, mut source: File, counter: u64, extended_segments: u32, timing: impl TimingCapture) -> Result<()> {
         let capture = mark!(timing, "apply_operations");
-        {
-            let _mark = mark!(capture, "resize");
-            source.seek(SeekFrom::Start(0)).context("reseting the operation source")?;
 
-            // resize first
+        // Resize the mapping, but only if we need to
+        if extended_segments > self.extended_segments {
+            let _mark = mark!(capture, "resize");
+
             let new_size = HEADER_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + extended_segments as u64 * self.extended_segment_size as u64;
-            let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.data_location)?;
+            let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.location)?;
             data.set_len(new_size).context("Resizing data file")?;
-            self.data = unsafe { memmap2::MmapMut::map_mut(&data)? };
-            self.data.advise(memmap2::Advice::Random)?;
+            let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
+            data.advise(memmap2::Advice::Random)?;
+            let old_data = self.data.clone();
+            self.data = Arc::new(RwLock::new(data));
             self.extended_segments = extended_segments;
 
+            // If we have a duplicate mapping, use the old one for an opertunistic flush
+            self.flush_threaded(Some(old_data), Some(counter - 1));
         }
 
+        // Apply new operations
         {
+            // Capture time for this section
             let _mark = mark!(capture, "apply");
-            // apply operations
+
+            // Read how much data to expect
+            source.seek(SeekFrom::Start(0)).context("reseting the operation source")?;
             let mut reader = std::io::BufReader::new(source);
             let offset = reader.read_u64::<LittleEndian>().context("reading change offset value")?;
+
+            // Start the read count ahead by the length
             let mut bytes_read = 8;
+
             let mut buffer = vec![];
+            let mut mmap = self.data.blocking_write();
             while bytes_read < offset {
                 buffer.clear();
                 bytes_read += reader.read_until(0, &mut buffer)? as u64;
                 if !buffer.is_empty() {
                     let operation: UpdateOperations = postcard::from_bytes_cobs(&mut buffer).context("parsing operation")?;
-                    self.apply_operation(operation).context("applying operation")?;
+                    match operation {
+                        UpdateOperations::WriteSegment { segment, data } => {
+                            let segment_offset = self.get_segment_offset(segment) as usize;
+                            mmap[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
+                            // self.data.seek(SeekFrom::Start(segment_offset))?;
+                            // self.data.write(&data)?;
+                        },
+                        UpdateOperations::ExtendSegment { segment, new_segment } => {
+                            let segment_offset = self.get_segment_offset(segment);
+                            let segment_length = match segment {
+                                SegmentAddress::Trigram(_) => self.initial_segment_size as u64,
+                                SegmentAddress::Segment(_) => self.extended_segment_size as u64,
+                            };
+                            let write_location = segment_offset + segment_length - POINTER_SIZE;
+                            // self.data.seek(SeekFrom::Start(write_location))?;
+                            // self.data.write(&new_segment.to_le_bytes())?;
+                            mmap[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
+                        },
+                    }
                 }
             }
         }
 
-        // Commit operations
-        {
-            let _mark = mark!(capture, "flush");
-            self.data.flush()?;
-        }
-
-        // Clear edit buffer
-        std::fs::remove_file(&self.edit_buffer_location)?;
         return Ok(())
     }
 
-    // #[instrument]
-    fn apply_operation(&mut self, operation: UpdateOperations) -> Result<()> {
-        match operation {
-            UpdateOperations::WriteSegment { segment, data } => {
-                let segment_offset = self.get_segment_offset(segment) as usize;
-                self.data[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
-                // self.data.seek(SeekFrom::Start(segment_offset))?;
-                // self.data.write(&data)?;
-            },
-            UpdateOperations::ExtendSegment { segment, new_segment } => {
-                let segment_offset = self.get_segment_offset(segment);
-                let segment_length = match segment {
-                    SegmentAddress::Trigram(_) => self.initial_segment_size as u64,
-                    SegmentAddress::Segment(_) => self.extended_segment_size as u64,
-                };
-                let write_location = segment_offset + segment_length - POINTER_SIZE;
-                // self.data.seek(SeekFrom::Start(write_location))?;
-                // self.data.write(&new_segment.to_le_bytes())?;
-                self.data[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
-            },
-        }
-        Ok(())
+    pub fn outstanding_journals(&self) -> Result<usize> {
+        Ok(get_operation_journals(&self.directory, self.id)?.len())
     }
 
+    pub fn flush_threaded(&self, map: Option<Arc<RwLock<MmapMut>>>, counter: Option<u64>) -> JoinHandle<()> {
+        // get a memory mapping
+        let data = match map {
+            Some(data) => data,
+            None => self.data.clone(),
+        };
+
+        // Commit operations
+        std::thread::spawn({
+            let directory = self.directory.clone();
+            let id = self.id.clone();
+            move || {
+                // Wait until all outstanding data has flushed
+                {
+                    let data = data.blocking_read();
+                    if let Err(err) = data.flush() {
+                        error!("Flush error: {err}");
+                        return
+                    };
+                }
+
+                // Get journals still on disk
+                let buffers = match get_operation_journals(&directory, id) {
+                    Ok(buffers) => buffers,
+                    Err(err) => {
+                        error!("Post Flush error: {err}");
+                        return
+                    },
+                };
+
+                // delete journals before the counter we were given
+                for (number, location) in buffers {
+                    if let Some(counter) = counter {
+                        if number > counter {
+                            continue
+                        }
+                    }
+
+                    if let Err(err) = std::fs::remove_file(&location) {
+                        if location.exists() {
+                            error!("Cleanup error: {err}");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn flush_blocking(&self) {
+        let handle = self.flush_threaded(None, None);
+        if let Err(err) = handle.join() {
+            error!("Flush error {err:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +818,7 @@ mod test {
     use rand::{Rng, SeedableRng, thread_rng};
 
     use crate::timing::{NullCapture, Capture};
+    use crate::types::FilterID;
     use crate::worker::filter::ExtensibleTrigramFile;
 
     use super::TRIGRAM_RANGE;
@@ -698,20 +838,20 @@ mod test {
             trigrams.push((ii, data));
         }
 
-
         // write it
         let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
         {
-            let mut file = ExtensibleTrigramFile::new(&location, 128, 128)?;
+            let mut file = ExtensibleTrigramFile::new(location.clone(), id, 128, 128)?;
             let x = file.write_batch(&mut trigrams, NullCapture::new()).context("write batch")?;
-            file.apply_operations(x.0, x.1, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
             assert_eq!(file.extended_segments, 0)
         }
 
         // Read it again
         {
-            let file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..TRIGRAM_RANGE as u32 {
                 let values = file.read_trigram(trigram)?;
                 if trigram == 0 {
@@ -745,17 +885,18 @@ mod test {
 
         // write it
         let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
         {
-            let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
+            let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
             let x = file.write_batch(&mut trigrams, NullCapture::new())?;
-            file.apply_operations(x.0, x.1, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
             assert!(file.extended_segments > 0)
         }
 
         // Read it again
         {
-            let file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 if trigram == 0 {
@@ -801,19 +942,20 @@ mod test {
 
         // write it
         let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
+        let location = tempdir.path().to_path_buf();
+        let id = FilterID::from(1);
         let capture = Capture::new();
         {
             let timer = std::time::Instant::now();
-            let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
+            let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
             println!("open new {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams[0..10], &capture)?;
-            file.apply_operations(x.0, x.1, &capture)?;
+            file.apply_operations(x.0, x.1, x.2, &capture)?;
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams[10..20], &capture)?;
-            file.apply_operations(x.0, x.1, &capture)?;
+            file.apply_operations(x.0, x.1, x.2, &capture)?;
             println!("write batch {:.2}", timer.elapsed().as_secs_f64());
         }
 
@@ -827,7 +969,7 @@ mod test {
                 recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
             }
 
-            let file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(location.clone(), id)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 for index in values {
@@ -855,29 +997,30 @@ mod test {
         }
 
         let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
         {
             println!("### First");
-            let mut file = ExtensibleTrigramFile::new(&location, 16, 16)?;
+            let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
             let mut trigrams = vec![(1, data.clone())];
             let x = file.write_batch(&mut trigrams, NullCapture::new())?;
-            file.apply_operations(x.0, x.1, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
         }
 
         {
             println!("### Duplicate");
             let size = std::fs::metadata(&location)?.len();
-            let mut file = ExtensibleTrigramFile::open(&location)?;
+            let mut file = ExtensibleTrigramFile::open(location.clone(), id)?;
             let mut trigrams = vec![(1, data.clone())];
             let x = file.write_batch(&mut trigrams, NullCapture::new())?;
-            file.apply_operations(x.0, x.1, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
             assert_eq!(size, std::fs::metadata(&location)?.len());
         }
 
         {
             let mut recreated: BitVec<usize> = BitVec::repeat(false, TRIGRAM_RANGE as usize);
 
-            let file = ExtensibleTrigramFile::open(&location)?;
+            let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 if values.contains(&1) {
@@ -910,12 +1053,13 @@ mod test {
 
         // write it
         let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().join("test");
+        let location = tempdir.path().to_path_buf();
+        let id = FilterID::from(1);
         let capture = Capture::new();
         {
-            let mut file = ExtensibleTrigramFile::new(&location, 256, 1024)?;
+            let mut file = ExtensibleTrigramFile::new(location, id, 256, 1024)?;
             let x = file.write_batch(&mut trigrams, &capture)?;
-            file.apply_operations(x.0, x.1, &capture)?;
+            file.apply_operations(x.0, x.1, x.2, &capture)?;
         }
 
         capture.print();

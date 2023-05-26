@@ -57,9 +57,16 @@ impl Capture {
         let heritage = HERITAGE.lock().unwrap().clone();
         let labels = LABELS.lock().unwrap().clone();
 
-        for (parent, child) in heritage.iter() {
-            parents.insert(*parent);
-            children.insert(*child);
+        {
+            let mut data = self.data.borrow_mut();
+            for (parent, child) in heritage.iter() {
+                parents.insert(*parent);
+                children.insert(*child);
+                if *child >= data.times.len() {
+                    data.times.resize(*child + 1, 0.0);
+                    data.calls.resize(*child + 1, 0);
+                }
+            }
         }
         for index in parents {
             if children.contains(&index) {

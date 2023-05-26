@@ -93,7 +93,9 @@ impl HouseCore {
         // let (quit_trigger, quit_signal) = tokio::sync::watch::channel(false);
 
         // Prepare our http client
-        let retry_policy = ExponentialBackoff::builder().build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(std::time::Duration::from_millis(50), std::time::Duration::from_secs(30))
+            .build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
         let client = match &config.worker_certificate {
             WorkerTLSConfig::AllowAll => {
                 reqwest::Client::builder()
@@ -194,9 +196,9 @@ impl HouseCore {
         let mut requests = vec![];
         {
             let workers = self.worker_ingest.read().await;
-            for (worker, channel) in workers.iter() {
+            for (_worker, channel) in workers.iter() {
                 let (send, recv) = oneshot::channel();
-                channel.send(WorkerIngestMessage::ListPending(send));
+                _ = channel.send(WorkerIngestMessage::ListPending(send));
                 requests.push(recv);
             }
         }
