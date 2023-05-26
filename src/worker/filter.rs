@@ -128,7 +128,7 @@ fn get_next_journal(directory: &Path, id: FilterID) -> (File, PathBuf, u64) {
     loop {
         let next_id = match get_operation_journals(directory, id) {
             Ok(journals) => match journals.last() {
-                Some((num, _)) => *num,
+                Some((num, _)) => *num + 1,
                 None => 0,
             },
             Err(err) => {
