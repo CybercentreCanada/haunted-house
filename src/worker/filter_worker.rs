@@ -28,6 +28,7 @@ pub struct FilterWorker {
     readiness: watch::Receiver<bool>,
     reader_connection: mpsc::Sender<ReaderCommand>,
     pub writer_connection: mpsc::Sender<WriterCommand>,
+    writer_thread: std::thread::JoinHandle<()>,
 }
 
 impl FilterWorker {
@@ -40,11 +41,19 @@ impl FilterWorker {
         let (ready_send, ready_recv) = watch::channel(false);
         let (reader_send, reader_recv) = mpsc::channel(64);
         let (writer_send, writer_recv) = mpsc::channel(2);
-        std::thread::spawn({
+        let writer_thread = std::thread::spawn({
             // let ready_recv = ready_recv.clone();
             move || { writer_worker(writer_recv, config, id, ready_send, reader_recv) }
         });
-        Ok(Self { readiness: ready_recv, reader_connection: reader_send, writer_connection: writer_send })
+        Ok(Self { readiness: ready_recv, reader_connection: reader_send, writer_connection: writer_send, writer_thread })
+    }
+
+    pub async fn join(self) {
+        tokio::task::spawn_blocking(|| {
+            if let Err(err) = self.writer_thread.join() {
+                error!("{err:?}");
+            }
+        });
     }
 
     pub fn is_ready(&self) -> bool {

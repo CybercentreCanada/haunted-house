@@ -83,7 +83,7 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
     });
 
     // Run the worker
-    let api = tokio::spawn(interface::serve(bind_address, config.tls, data, exit_notice.clone()));
+    let api = tokio::spawn(interface::serve(bind_address, config.tls, data.clone(), exit_notice.clone()));
     // let manager = tokio::spawn(worker_manager(data.clone(), recv));
 
     // Run the worker
@@ -92,6 +92,9 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
         Ok(Err(err)) => error!("Server crashed: {err}"),
         Err(err) => error!("Server crashed: {err}")
     }
+
+    info!("Waiting for data flush...");
+    data.stop().await;
     // let result = tokio::select! {
     //     res = api => res,
     //     res = manager => res,

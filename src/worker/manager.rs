@@ -63,6 +63,16 @@ impl WorkerState {
         Ok(new)
     }
 
+    pub async fn stop(&self) {
+        let mut filters = self.filters.write().await;
+        for (_, (_, notify)) in filters.iter() {
+            notify.notify_waiters();
+        }
+        for (_, (worker, _)) in filters.drain() {
+            worker.join().await;
+        }
+    }
+
     pub async fn create_index(self: &Arc<Self>, id: FilterID, expiry: ExpiryGroup) -> Result<()> {
         self.database.create_filter(id, &expiry).await?;
         let mut filters = self.filters.write().await;
@@ -228,6 +238,7 @@ impl WorkerState {
             error!("ingest feeder crash {err:?}");
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
+        info!("Stopping ingest feeder for {id}");
     }
 
     pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {

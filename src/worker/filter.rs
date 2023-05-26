@@ -2,7 +2,7 @@ use bitvec::vec::BitVec;
 use anyhow::{Result, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
-use log::error;
+use log::{error, info};
 use memmap2::MmapMut;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
@@ -323,10 +323,16 @@ impl ExtensibleTrigramFile {
         let edit_buffers = get_operation_journals(&directory, id)?;
         let mut filter = Self{ initial_segment_size, extended_segment_size, data, extended_segments, directory, location, id };
 
+        if !edit_buffers.is_empty() {
+            info!("Filter {id} found {} unfinished write buffers. Applying...", edit_buffers.len());
+        }
+
         // Check for a edit buffer
         for (num, buffer) in edit_buffers {
+            info!("Filter {id} applying edit buffer {num}.");
             filter.check_and_apply_operations(buffer, num)?;
         }
+        info!("Filter {id} ready.");
         return Ok(filter);
     }
 
@@ -473,7 +479,7 @@ impl ExtensibleTrigramFile {
     pub fn write_batch(&self, files: &mut [(u64, BitVec)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations
-        let (write_buffer, buffer_location, buffer_counter) = get_next_journal(&self.directory, self.id);
+        let (write_buffer, _buffer_location, buffer_counter) = get_next_journal(&self.directory, self.id);
         // let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
         let mut skipped = HashSet::<u64>::new();
 
@@ -699,7 +705,9 @@ impl ExtensibleTrigramFile {
             self.extended_segments = extended_segments;
 
             // If we have a duplicate mapping, use the old one for an opertunistic flush
-            self.flush_threaded(Some(old_data), Some(counter - 1));
+            if counter > 0 {
+                self.flush_threaded(Some(old_data), Some(counter - 1));
+            }
         }
 
         // Apply new operations
@@ -936,9 +944,6 @@ mod test {
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
         trigrams.sort();
-        for (x, _) in &trigrams {
-            println!("{x}");
-        }
 
         // write it
         let tempdir = tempfile::tempdir()?;
@@ -948,15 +953,17 @@ mod test {
         {
             let timer = std::time::Instant::now();
             let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
-            println!("open new {:.2}", timer.elapsed().as_secs_f64());
+            println!("open finished {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams[0..10], &capture)?;
+            println!("write_batch 1 finished");
             file.apply_operations(x.0, x.1, x.2, &capture)?;
-            println!("write batch {:.2}", timer.elapsed().as_secs_f64());
+            println!("apply_operations 1 finished {:.2}", timer.elapsed().as_secs_f64());
             let timer = std::time::Instant::now();
             let x = file.write_batch(&mut trigrams[10..20], &capture)?;
+            println!("write_batch 2 finished");
             file.apply_operations(x.0, x.1, x.2, &capture)?;
-            println!("write batch {:.2}", timer.elapsed().as_secs_f64());
+            println!("apply_operations 2 finished {:.2}", timer.elapsed().as_secs_f64());
         }
 
         capture.print();
