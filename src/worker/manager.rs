@@ -2,7 +2,6 @@ use std::collections::{HashSet, HashMap};
 use std::io::Write;
 use std::sync::Arc;
 use anyhow::{Result, Context};
-use bitvec::vec::BitVec;
 use log::{debug, info, error};
 use tokio::sync::{mpsc, watch, Notify, oneshot};
 use tokio::task::JoinSet;
@@ -18,6 +17,7 @@ use super::YaraTask;
 use super::database::{IngestStatus, Database, IngestStatusBundle};
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
+use super::sparse::SparseBits;
 
 pub struct WorkerState {
     pub database: Database,
@@ -264,7 +264,7 @@ impl WorkerState {
             for (number, hash) in &batch {
                 let trigram_cache_dir = self.config.data_path.join(TRIGRAM_DIRECTORY);
                 let cache_path = trigram_cache_dir.join(format!("{id}-{}", hash));
-                let data: BitVec = postcard::from_bytes(&tokio::fs::read(&cache_path).await.context(cache_path.to_str().unwrap().to_owned())?)?;
+                let data: SparseBits = postcard::from_bytes(&tokio::fs::read(&cache_path).await.context(cache_path.to_str().unwrap().to_owned())?)?;
                 paths.push(cache_path);
                 trigrams.push((*number, data));
             }
@@ -393,16 +393,16 @@ impl WorkerState {
 }
 
 
-pub async fn build_file(mut input: mpsc::Receiver<Result<Vec<u8>>>) -> Result<BitVec> {
+pub async fn build_file(mut input: mpsc::Receiver<Result<Vec<u8>>>) -> Result<SparseBits> {
     // Prepare accumulators
-    let mut mask = BitVec::repeat(false, 1 << 24);
+    let mut output = SparseBits::new();
 
     // Read the initial block
     let mut buffer = vec![];
     while buffer.len() <= 2 {
         let sub_buffer = match input.recv().await {
             Some(sub_buffer) => sub_buffer?,
-            None => return Ok(mask),
+            None => return Ok(output),
         };
 
         buffer.extend(sub_buffer);
@@ -412,21 +412,25 @@ pub async fn build_file(mut input: mpsc::Receiver<Result<Vec<u8>>>) -> Result<Bi
     let mut trigram: u32 = (buffer[0] as u32) << 8 | (buffer[1] as u32);
     let mut index_start = 2;
 
-    loop {
-        for byte in &buffer[index_start..] {
-            trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
-            mask.set(trigram as usize, true);
-        }
+    'outer: loop {
+        for _ in 0..1<<16 {
+            for byte in &buffer[index_start..] {
+                trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+                output.insert(trigram);
+            }
 
-        buffer = match input.recv().await {
-            Some(buffer) => buffer?,
-            None => return Ok(mask),
-        };
-        if buffer.is_empty() {
-            break;
+            buffer = match input.recv().await {
+                Some(buffer) => buffer?,
+                None => break 'outer,
+            };
+            if buffer.is_empty() {
+                break 'outer;
+            }
+            index_start = 0;
         }
-        index_start = 0;
+        output.compact();
     }
+    output.compact();
 
-    return Ok(mask)
+    return Ok(output)
 }

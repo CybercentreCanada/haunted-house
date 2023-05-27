@@ -14,6 +14,7 @@ pub mod interface;
 mod database_buffered_sqlite;
 mod database;
 mod database_sqlite;
+mod sparse;
 mod encoding;
 mod manager;
 mod filter;

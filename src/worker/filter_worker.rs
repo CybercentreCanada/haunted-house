@@ -5,11 +5,12 @@ use crate::timing::{Capture};
 use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;
-use bitvec::vec::BitVec;
 use log::{error, debug, info};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
+
+use super::sparse::SparseBits;
 
 const FILTER_SUBDIR: &str = "filters";
 
@@ -20,7 +21,7 @@ enum ReaderCommand {
 
 #[derive(Debug)]
 pub enum WriterCommand {
-    Ingest(Vec<(u64, BitVec)>, oneshot::Sender<()>),
+    Ingest(Vec<(u64, SparseBits)>, oneshot::Sender<()>),
     Flush
 }
 
