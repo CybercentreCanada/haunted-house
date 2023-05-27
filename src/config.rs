@@ -1,6 +1,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use anyhow::Result;
 
 use serde::{Serialize, Deserialize};
 use crate::broker::auth::Role;
@@ -177,6 +178,32 @@ pub struct WorkerSettings {
     #[serde(default="default_ingest_batch_size")]
     pub ingest_batch_size: u32,
 }
+
+const TRIGRAM_DIRECTORY: &str = "trigram-cache";
+const FILTER_DIRETORY: &str = "filters";
+const DATABASE_DIRETORY: &str = "sql-data";
+
+impl WorkerSettings {
+    pub fn get_trigram_cache_directory(&self) -> Result<PathBuf> {
+        let directory = self.data_path.join(TRIGRAM_DIRECTORY);
+        std::fs::create_dir_all(&directory)?;    
+        return Ok(directory);
+    }
+
+    pub fn get_filter_directory(&self) -> Result<PathBuf> {
+        let directory = self.data_path.join(FILTER_DIRETORY);
+        std::fs::create_dir_all(&directory)?;    
+        return Ok(directory)
+    }
+
+    pub fn get_database_directory(&self) -> Result<PathBuf> {
+        let directory = self.data_path.join(DATABASE_DIRETORY);
+        std::fs::create_dir_all(&directory)?;    
+        return Ok(directory)
+    }
+}
+
+
 
 fn default_filter_item_limit() -> u64 { 50_000_000 }
 fn default_data_path() -> PathBuf { PathBuf::from("/data/") }

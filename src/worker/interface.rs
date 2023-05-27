@@ -6,9 +6,9 @@ use anyhow::{Context};
 use futures::{SinkExt, StreamExt};
 use log::error;
 use poem::web::websocket::{WebSocket, Message};
-use poem::{handler, Route, get, EndpointExt, Server, delete, post, IntoResponse, put};
+use poem::{handler, Route, get, EndpointExt, Server, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
-use poem::web::{Data, Json, Path};
+use poem::web::{Data, Json};
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc;
 
@@ -36,12 +36,6 @@ pub struct CreateIndexRequest {
 #[handler]
 async fn create_index(state: Data<&Arc<WorkerState>>, request: Json<CreateIndexRequest>) -> poem::Result<()> {
     state.create_index(request.filter_id, request.expiry.clone()).await?;
-    Ok(())
-}
-
-#[handler]
-async fn delete_index(state: Data<&Arc<WorkerState>>, Path(id): Path<FilterID>) -> poem::Result<()> {
-    state.delete_index(id).await?;
     Ok(())
 }
 
@@ -204,7 +198,6 @@ async fn get_ready_status(state: Data<&Arc<WorkerState>>) -> poem::http::StatusC
 pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<WorkerState>, exit: Arc<tokio::sync::Notify>) -> anyhow::Result<()> {
     let app = Route::new()
         .at("/index/create", put(create_index))
-        .at("/index/:id", delete(delete_index))
         .at("/search/filter", get(run_filter_search))
         .at("/search/yara", get(run_yara_search))
         .at("/files/update", post(update_file_info))

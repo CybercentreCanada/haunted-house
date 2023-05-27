@@ -12,8 +12,6 @@ use crate::config::WorkerSettings;
 
 use super::sparse::SparseBits;
 
-const FILTER_SUBDIR: &str = "filters";
-
 #[derive(Debug)]
 enum ReaderCommand {
     Query(Query, oneshot::Sender<Result<Vec<u64>>>)
@@ -34,10 +32,7 @@ pub struct FilterWorker {
 
 impl FilterWorker {
     pub fn open(config: WorkerSettings, id: FilterID) -> Result<Self> {
-        {
-            let directory = config.data_path.join(FILTER_SUBDIR);
-            std::fs::create_dir_all(&directory)?;
-        }
+        config.get_filter_directory()?;
 
         let (ready_send, ready_recv) = watch::channel(false);
         let (reader_send, reader_recv) = mpsc::channel(64);
@@ -70,7 +65,7 @@ impl FilterWorker {
 
 fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerSettings, id: FilterID, ready_send: watch::Sender<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
     // Open the file
-    let directory = config.data_path.join(FILTER_SUBDIR);
+    let directory = config.get_filter_directory().unwrap();
     let path = directory.join(id.to_string());
     let filter = if path.exists() {
         ExtensibleTrigramFile::open(directory, id)

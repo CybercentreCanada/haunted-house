@@ -68,10 +68,8 @@ pub struct BufferedSQLite {
 
 impl BufferedSQLite {
 
-    pub async fn new(data_directory: &Path) -> Result<mpsc::Sender<BSQLCommand>> {
+    pub async fn new(data_directory: PathBuf) -> Result<mpsc::Sender<BSQLCommand>> {
 
-        let data_directory = data_directory.join("sqlite");
-        tokio::fs::create_dir_all(&data_directory).await?;
         let path = data_directory.join("directory.sqlite");
 
         let url = if path.is_absolute() {

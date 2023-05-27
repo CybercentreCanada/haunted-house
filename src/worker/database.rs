@@ -1,6 +1,6 @@
 
 use std::collections::{HashSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, Context};
 use tokio::sync::oneshot;
@@ -32,7 +32,7 @@ pub enum Database {
 
 impl Database {
 
-    pub async fn new_sqlite(directory: &Path) -> Result<Self> {
+    pub async fn new_sqlite(directory: PathBuf) -> Result<Self> {
         // Ok(Database::SQLite(SQLiteInterface::new(path).await?))
         Ok(Database::Buffered(BufferedSQLite::new(directory).await?))
     }

@@ -22,13 +22,12 @@ use super::sparse::SparseBits;
 pub struct WorkerState {
     pub database: Database,
     pub running: watch::Receiver<bool>,
-    pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>)>>,
+    pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>, watch::Sender<bool>)>>,
     pub file_storage: BlobStorage,
     pub file_cache: BlobCache,
     pub config: WorkerSettings,
 }
 
-const TRIGRAM_DIRECTORY: &str = "trigram-cache";
 
 impl WorkerState {
 
@@ -43,21 +42,33 @@ impl WorkerState {
         });
 
         // Prepare cache directory
-        tokio::fs::create_dir_all(new.config.data_path.clone().join(TRIGRAM_DIRECTORY)).await?;
+        new.config.get_trigram_cache_directory()?;
 
         // Start workers for every filter
+        let mut to_delete = vec![];
         {
+            let today = ExpiryGroup::today();
             let mut filters = new.filters.write().await;
-            for id in new.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+            for (id, expiry) in new.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+                if expiry < today {
+                    to_delete.push(id);
+                    continue
+                }
+
                 if filters.contains_key(&id) {
                     error!("Duplicate filter?");
                     continue
                 }
                 let notify = Arc::new(tokio::sync::Notify::new());
+                let (send_running, recv_running) = watch::channel(true);
                 let worker = FilterWorker::open(new.config.clone(), id)?;
-                tokio::spawn(new.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone()));
-                filters.insert(id, (worker, notify));
+                tokio::spawn(new.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
+                filters.insert(id, (worker, notify, send_running));
             }
+        }
+
+        for id in to_delete {
+            new.delete_index(id).await?;
         }
 
         Ok(new)
@@ -65,10 +76,11 @@ impl WorkerState {
 
     pub async fn stop(&self) {
         let mut filters = self.filters.write().await;
-        for (_, (_, notify)) in filters.iter() {
+        for (_, (_, notify, running)) in filters.iter() {
+            running.send(false);
             notify.notify_waiters();
         }
-        for (_, (worker, _)) in filters.drain() {
+        for (_, (worker, _, _)) in filters.drain() {
             worker.join().await;
         }
     }
@@ -77,14 +89,29 @@ impl WorkerState {
         self.database.create_filter(id, &expiry).await?;
         let mut filters = self.filters.write().await;
         if filters.contains_key(&id) { return Ok(()); }
+        let (send_running, recv_running) = watch::channel(true);
         let worker = FilterWorker::open(self.config.clone(), id)?;
         let notify = Arc::new(tokio::sync::Notify::new());
-        tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone()));
-        filters.insert(id, (worker, notify));
+        tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
+        filters.insert(id, (worker, notify, send_running));
         return Ok(())
     }
 
     pub async fn delete_index(&self, id: FilterID) -> Result<()> {
+        // Stop the worker if running
+        if let Some((worker, notify, running)) = self.filters.write().await.remove(&id) {
+            running.send(false);
+            notify.notify_waiters();
+            worker.join().await;
+        }
+
+        // Delete data behind the worker
+        FilterWorker::delete(&self.config.data_path, id).await?;
+
+        // Delete the trigram cache data
+        todo!();
+
+        // Delete the database info
         self.database.delete_filter(id).await
     }
 
@@ -221,23 +248,23 @@ impl WorkerState {
     pub async fn notify_ingest_feeders(&self, ids: Vec<FilterID>) {
         let filters = self.filters.read().await;
         for id in ids {
-            if let Some((_, notify)) = filters.get(&id) {
+            if let Some((_, notify, _)) = filters.get(&id) {
                 notify.notify_waiters()
             }
         }
     }
 
-    pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>) {
-        while let Err(err) = self._ingest_feeder(id, &writer, notify.clone()).await {
+    pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>, running: watch::Receiver<bool>) {
+        while let Err(err) = self._ingest_feeder(id, &writer, notify.clone(), running.clone()).await {
             error!("ingest feeder crash {err:?}");
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
         info!("Stopping ingest feeder for {id}");
     }
 
-    pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>) -> Result<()> {
+    pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>, running: watch::Receiver<bool>) -> Result<()> {
         info!("Starting ingest feeder for {id}");
-        while *self.running.borrow() {
+        while *self.running.borrow() && *running.borrow() {
             // Get next set of incomplete files
             let stamp = std::time::Instant::now();
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
@@ -313,7 +340,7 @@ impl WorkerState {
         // Make sure they are all ready
         for id in ids {
             match filters.get(&id) {
-                Some((filter, _)) => if !filter.is_ready() {
+                Some((filter, _, _)) => if !filter.is_ready() {
                     return Ok(false);
                 }
                 None => return Ok(false)
@@ -323,7 +350,7 @@ impl WorkerState {
     }
 
     pub async fn query_filter(self: Arc<Self>, id: FilterID, query: Query, access: HashSet<String>, respond: mpsc::Sender<FilterSearchResponse>) {
-        if let Some((filter, _)) = self.filters.read().await.get(&id) {
+        if let Some((filter, _, _)) = self.filters.read().await.get(&id) {
             match filter.query(query).await {
                 Ok(file_indices) => {
                     match self.database.select_file_hashes(id, &file_indices, &access).await {
