@@ -1,6 +1,6 @@
 use std::iter::Peekable;
 
-use bitvec::bitarr;
+use bitvec::{bitarr, BitArr};
 use bitvec::prelude::BitArray;
 use serde::{Serialize, Deserialize, de::Error};
 
@@ -57,7 +57,7 @@ impl<'de> Deserialize<'de> for SparseBits {
 
 impl SparseBits {
     pub fn new() -> Self {
-        const EMPTY_CHUNK: Chunk = Chunk::Added(vec![]);
+        const EMPTY_CHUNK: Chunk = Chunk::empty();
         SparseBits { 
             chunks: Box::new([EMPTY_CHUNK; 256]) 
         }
@@ -170,17 +170,12 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-// impl Iterator for Chunk {
-//     type Item;
-
-//     type IntoIter;
-
-//     fn into_iter(self) -> Self::IntoIter {
-//         todo!()
-//     }
-// }
 
 impl Chunk {
+    pub const fn empty() -> Self {
+        Self::Added(vec![])
+    }
+
     pub fn iter(&self) -> Iter {
         match self {
             Chunk::Added(items) => Iter::Added(items.iter()),
@@ -189,13 +184,14 @@ impl Chunk {
         }
     }
 
-    // pub fn memory(&self) -> usize {
-    //     core::mem::size_of::<Self>() + match self {
-    //         Chunk::Added(items) => items.capacity() * core::mem::size_of::<u16>(),
-    //         Chunk::Mask(_, _) => 1024 * core::mem::size_of::<u64>(),
-    //         Chunk::Removed(items) => items.capacity() * core::mem::size_of::<u16>(),
-    //     }
-    // }
+    #[cfg(test)]
+    pub fn memory(&self) -> usize {
+        core::mem::size_of::<Self>() + match self {
+            Chunk::Added(items) => items.capacity() * core::mem::size_of::<u16>(),
+            Chunk::Mask(_, _) => 1024 * core::mem::size_of::<u64>(),
+            Chunk::Removed(items) => items.capacity() * core::mem::size_of::<u16>(),
+        }
+    }
 
     pub fn insert(&mut self, item: u16) {
         match self {
@@ -225,11 +221,12 @@ impl Chunk {
 
                 if items.len() >= 4096 {
                     let count = items.len() as u16;
-                    let mut mask = Box::new(bitarr!(u64, bitvec::prelude::Lsb0; 1024; 1 << 16));
+                    let mut mask: Box<BitArr!(for 1 << 16, in u64)> = Box::new(bitarr!(u64, bitvec::prelude::Lsb0; 0; 1 << 16));
                     for item in items {
                         mask.set(*item as usize, true);
                     }
                     *self = Chunk::Mask(count, mask);
+                    self.compact()
                 }
             },
             Chunk::Mask(count, mask) => {
@@ -239,6 +236,7 @@ impl Chunk {
                         items.push(index as u16);
                     }
                     *self = Chunk::Removed(items);
+                    self.compact()
                 }
             },
             Chunk::Removed(items) => {
@@ -262,8 +260,36 @@ impl Chunk {
             new.insert(index as u16)
         }
         new.compact();
-        new.compact();
         return new
     }
 }
 
+#[cfg(test)]
+mod test {
+    use std::collections::BTreeSet;
+
+    use itertools::Itertools;
+    use rand::{thread_rng, Rng};
+
+    use super::Chunk;
+
+
+    #[test]
+    fn build_random() {
+        let mut values = (0..u16::MAX).collect_vec();
+
+        let mut a = Chunk::empty();
+        let mut b = BTreeSet::<u16>::new();
+        let mut prng = thread_rng();
+
+        while !values.is_empty() {
+            let value = values.swap_remove(prng.gen_range(0..values.len()));
+            a.insert(value);
+            b.insert(value);
+            let before = a.memory();
+            a.compact();
+            assert!(a.iter().eq(b.iter().cloned()));
+            assert!(a.memory() <= before);
+        }
+    }
+}
