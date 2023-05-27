@@ -1,5 +1,6 @@
 
 use std::collections::{HashSet, HashMap};
+use std::path::Path;
 
 use anyhow::{Result, Context};
 use tokio::sync::oneshot;
@@ -17,6 +18,13 @@ pub enum IngestStatus {
     Missing
 }
 
+#[derive(Debug, Default)]
+pub struct IngestStatusBundle {
+    pub ready: Vec<Sha256>,
+    pub pending: HashMap<Sha256, FilterID>,
+    pub missing: Vec<Sha256>
+}
+
 pub enum Database {
     SQLite(SQLiteInterface),
     Buffered(tokio::sync::mpsc::Sender<BSQLCommand>)
@@ -24,9 +32,9 @@ pub enum Database {
 
 impl Database {
 
-    pub async fn new_sqlite(path: &str) -> Result<Self> {
+    pub async fn new_sqlite(directory: &Path) -> Result<Self> {
         // Ok(Database::SQLite(SQLiteInterface::new(path).await?))
-        Ok(Database::Buffered(BufferedSQLite::new(path).await?))
+        Ok(Database::Buffered(BufferedSQLite::new(directory).await?))
     }
 
     // pub async fn new_sqlite_temp() -> Result<Self> {
@@ -99,16 +107,16 @@ impl Database {
         })
     }
 
-    pub async fn filter_pending_count(&self) -> Result<HashMap<FilterID, u64>> {
-        Ok(match self {
-            Database::SQLite(db) => db.filter_pending_count().await,
-            Database::Buffered(chan) => {
-                let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::FilterPendingCount { response: send }).await?;
-                resp.await?
-            }
-        })
-    }
+    // pub async fn filter_pending_count(&self) -> Result<HashMap<FilterID, u64>> {
+    //     Ok(match self {
+    //         Database::SQLite(db) => db.filter_pending_count().await,
+    //         Database::Buffered(chan) => {
+    //             let (send, resp) = oneshot::channel();
+    //             chan.send(BSQLCommand::FilterPendingCount { response: send }).await?;
+    //             resp.await?
+    //         }
+    //     })
+    // }
 
     pub async fn filter_pending(&self) -> Result<HashMap<FilterID, HashSet<Sha256>>> {
         Ok(match self {
@@ -121,12 +129,12 @@ impl Database {
         })
     }
 
-    pub async fn update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
+    pub async fn update_file_access(&self, files: Vec<FileInfo>) -> Result<IngestStatusBundle> {
         match self {
-            Database::SQLite(db) => db.update_file_access(file).await.context("update_file_access"),
+            Database::SQLite(_db) => todo!(), //db.update_file_access(file).await.context("update_file_access"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::UpdateFileAccess { file: file.clone(), response: send }).await?;
+                chan.send(BSQLCommand::UpdateFileAccess { files, response: send }).await?;
                 resp.await?
             }
         }

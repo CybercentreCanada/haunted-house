@@ -15,7 +15,7 @@ use crate::storage::BlobStorage;
 use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;
-use super::database::{IngestStatus, Database};
+use super::database::{IngestStatus, Database, IngestStatusBundle};
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
 
@@ -90,16 +90,8 @@ impl WorkerState {
 
     pub async fn update_files(&self, files: Vec<FileInfo>) -> Result<UpdateFileInfoResponse> {
         //
-        let mut processed = vec![];
-        let mut pending: HashMap<Sha256, FilterID> = Default::default();
-        let mut missing = vec![];
-        for file in files {
-            match self.database.update_file_access(&file).await.context("update_file_access")? {
-                IngestStatus::Ready => processed.push(file.hash),
-                IngestStatus::Pending(filter) => { pending.insert(file.hash, filter); },
-                IngestStatus::Missing => missing.push(file),
-            }
-        }
+        let IngestStatusBundle{missing, ready, pending} = self.database.update_file_access(files.clone()).await.context("update_file_access")?;
+        let files: HashMap<_, _> = files.into_iter().map(|file|(file.hash.clone(), file)).collect();
 
         //
         let filter_sizes = self.database.filter_sizes().await?;
@@ -107,21 +99,23 @@ impl WorkerState {
         let mut assignments: HashMap<Sha256, Vec<FilterID>> = Default::default();
         let storage_pressure = self.check_storage_pressure().await.context("check_storage_pressure")?;
         if !storage_pressure {
-            for file in missing {
+            for hash in missing {
                 let mut selected = vec![];
-                for (id, expiry) in &filters {
-                    if *expiry == file.expiry {
-                        if *filter_sizes.get(id).unwrap_or(&u64::MAX) < self.config.filter_item_limit {
-                            selected.push(*id);
+                if let Some(file) = files.get(&hash) {
+                    for (id, expiry) in &filters {
+                        if *expiry == file.expiry {
+                            if *filter_sizes.get(id).unwrap_or(&u64::MAX) < self.config.filter_item_limit {
+                                selected.push(*id);
+                            }
                         }
                     }
                 }
-                assignments.insert(file.hash, selected);
+                assignments.insert(hash, selected);
             }
         }
 
         Ok(UpdateFileInfoResponse {
-            processed,
+            processed: ready,
             pending,
             assignments,
             storage_pressure,

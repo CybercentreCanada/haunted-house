@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use anyhow::{Result, Context};
 use log::info;
-use sqlx::{SqlitePool, query_as, query};
+use sqlx::{SqlitePool, query_as};
 use sqlx::pool::PoolOptions;
 
 use crate::access::AccessControl;
@@ -190,43 +190,44 @@ impl SQLiteInterface {
         return pending.iter().map(|(key, values)|(*key, values.len() as u64)).collect()
     }
 
-    pub async fn update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
-        let mut filters = self.get_expiry(&file.expiry, &ExpiryGroup::max()).await?;
-        filters.sort_unstable_by(|a, b|b.1.cmp(&a.1));
+    pub async fn update_file_access(&self, files: Vec<FileInfo>) -> Result<IngestStatus> {
+        todo!();
+        // let mut filters = self.get_expiry(&file.expiry, &ExpiryGroup::max()).await?;
+        // filters.sort_unstable_by(|a, b|b.1.cmp(&a.1));
 
-        let mut conn = self.db.acquire().await?;
-        'filters: for (id, _) in filters {
-            loop {
-                let (access_string, ingested): (String, bool) = match query_as(&format!("SELECT access, ingested FROM filter_{id} WHERE hash = ?")).bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
-                    Some(row) => row,
-                    None => continue 'filters
-                };
+        // let mut conn = self.db.acquire().await?;
+        // 'filters: for (id, _) in filters {
+        //     loop {
+        //         let (access_string, ingested): (String, bool) = match query_as(&format!("SELECT access, ingested FROM filter_{id} WHERE hash = ?")).bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
+        //             Some(row) => row,
+        //             None => continue 'filters
+        //         };
 
-                let access = AccessControl::from_str(&access_string)?.or(&file.access).simplify();
-                let new_string = access.to_string();
-                if access_string == new_string {
-                    if ingested {
-                        return Ok(IngestStatus::Ready)
-                    } else {
-                        return Ok(IngestStatus::Pending(id))
-                    }
-                }
+        //         let access = AccessControl::from_str(&access_string)?.or(&file.access).simplify();
+        //         let new_string = access.to_string();
+        //         if access_string == new_string {
+        //             if ingested {
+        //                 return Ok(IngestStatus::Ready)
+        //             } else {
+        //                 return Ok(IngestStatus::Pending(id))
+        //             }
+        //         }
 
-                let result = query(&format!("UPDATE filter_{id} SET access = ? WHERE access = ? AND hash = ?"))
-                    .bind(new_string)
-                    .bind(access_string)
-                    .bind(file.hash.as_bytes())
-                    .execute(&mut conn).await?;
-                if result.rows_affected() > 0 {
-                    if ingested {
-                        return Ok(IngestStatus::Ready)
-                    } else {
-                        return Ok(IngestStatus::Pending(id))
-                    }
-                }
-            }
-        }
-        return Ok(IngestStatus::Missing)
+        //         let result = query(&format!("UPDATE filter_{id} SET access = ? WHERE access = ? AND hash = ?"))
+        //             .bind(new_string)
+        //             .bind(access_string)
+        //             .bind(file.hash.as_bytes())
+        //             .execute(&mut conn).await?;
+        //         if result.rows_affected() > 0 {
+        //             if ingested {
+        //                 return Ok(IngestStatus::Ready)
+        //             } else {
+        //                 return Ok(IngestStatus::Pending(id))
+        //             }
+        //         }
+        //     }
+        // }
+        // return Ok(IngestStatus::Missing)
     }
 
     pub async fn check_insert_status(&self, id: FilterID, file: &FileInfo) -> Result<IngestStatus, ErrorKinds> {
