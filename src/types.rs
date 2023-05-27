@@ -121,8 +121,18 @@ impl From<i64> for FilterID {
 }
 
 impl FilterID {
+    pub const NULL: FilterID = FilterID(0);
+
     pub fn to_i64(&self) -> i64 {
         self.0
+    }
+
+    pub fn max(&self, other: FilterID) -> FilterID {
+        FilterID::from(self.0.max(other.0))
+    }
+
+    pub fn next(&self) -> FilterID {
+        FilterID::from(self.0 + 1)
     }
 }
 

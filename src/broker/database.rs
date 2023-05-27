@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Result, Context};
 
-use crate::types::{ExpiryGroup, FilterID, WorkerID, Sha256};
+use crate::types::{Sha256};
 
 use super::database_sqlite::{SQLiteInterface, SearchRecord};
 use super::interface::{SearchRequest, InternalSearchStatus};
@@ -52,24 +52,5 @@ impl Database {
             Database::SQLite(local) => local.search_status(code).await.context("search_status")
         }
     }
-
-    pub async fn list_filters(&self) -> Result<Vec<(WorkerID, FilterID, ExpiryGroup)>> {
-        match self {
-            Database::SQLite(local) => local.list_filters().await.context("list_filters")
-        }
-    }
-
-    pub async fn get_expiry(&self, filter: FilterID) -> Result<Option<ExpiryGroup>> {
-        match self {
-            Database::SQLite(local) => local.get_expiry(filter).await.context("get_expiry")
-        }
-    }
-
-    pub async fn create_filter(&self, worker: &WorkerID, expiry: &ExpiryGroup) -> Result<FilterID> {
-        match self {
-            Database::SQLite(local) => local.create_filter(worker, expiry).await.context("create_filter")
-        }
-    }
-
 }
 

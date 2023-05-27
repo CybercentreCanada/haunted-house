@@ -167,12 +167,12 @@ impl HouseCore {
         return Ok(res)
     }
 
-    pub async fn create_new_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup) -> Result<FilterID> {
-        info!("Create new filter for worker {worker} in expiry group {expiry}");
-        let filter_id = self.database.create_filter(&worker, &expiry).await?;
-        self.install_filter(worker, expiry, filter_id).await?;
-        return Ok(filter_id)
-    }
+    // pub async fn create_new_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup, filter_id: ) -> Result<FilterID> {
+    //     info!("Create new filter for worker {worker} in expiry group {expiry}");
+    //     // let filter_id = self.database.create_filter(&worker, &expiry).await?;
+    //     self.install_filter(worker, expiry, filter_id).await?;
+    //     return Ok(filter_id)
+    // }
 
     pub async fn install_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup, filter_id: FilterID) -> Result<()> {
         info!("Installing filter {filter_id} into worker {worker}");
@@ -324,7 +324,9 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     let mut buffer_hashes: HashSet<Sha256> = Default::default();
     let mut unchecked_buffer = VecDeque::<IngestTask>::new();
     let mut delay_buffer = tokio_util::time::DelayQueue::new();
-    let mut check_worker: JoinSet<Result<Vec<IngestTask>>> = JoinSet::new();
+    // This must only ever have a single task launched in order to be sure that it 
+    // can create new filters with unique IDs.
+    let mut check_worker: JoinSet<Result<Vec<IngestTask>>> = JoinSet::new(); 
     let mut active_batch_size = 0;
     let mut counter = crate::counters::RateCounter::new(60);
 
@@ -465,19 +467,11 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
     // Collect results from each worker, dismissing tasks which we can consider processed
     let mut filter_pending = HashMap::new();
     let mut workers_without_pressure = HashSet::new();
+    let mut filter_assignment = HashMap::<(WorkerID, ExpiryGroup), u32>::new();
+    let mut last_filter: FilterID = FilterID::NULL;
     let mut suggestions: HashMap<Sha256, Vec<(WorkerID, FilterID)>> = HashMap::new();
     while let Some(res) = requests.join_next().await {
-        let (worker, res) = match res {
-            Ok(Ok(data)) => data,
-            Ok(Err(err)) => {
-                error!("{err}");
-                continue
-            }
-            Err(err) => {
-                error!("{err}");
-                continue
-            },
-        };
+        let (worker, res) = res??;
         debug!("Ingest Check result from {worker}, {} processed, {} pending", res.processed.len(), res.pending.len());
 
         // If an ingestion is totally processed by the worker, we can respond to the caller
@@ -500,6 +494,13 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         filter_pending.extend(res.filter_pending.into_iter());
         if !res.storage_pressure {
             workers_without_pressure.insert(worker.clone());
+        }
+        for (filter, expiry) in res.filters {
+            last_filter = last_filter.max(filter);
+            match filter_assignment.entry((worker.clone(), expiry)) {
+                hash_map::Entry::Occupied(mut entry) => { *entry.get_mut() += 1; },
+                hash_map::Entry::Vacant(entry) => { entry.insert(1); },
+            }
         }
         for (sha, filters) in res.assignments {
             match suggestions.entry(sha) {
@@ -549,13 +550,13 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
     }
 
     // Pull down the list of all filters
-    let mut filter_assignment: HashMap<ExpiryGroup, Vec<(WorkerID, FilterID)>> = Default::default();
-    for (worker, filter, expiry) in core.database.list_filters().await? {
-        match filter_assignment.entry(expiry) {
-            hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push((worker, filter)); },
-            hash_map::Entry::Vacant(entry) => { entry.insert(vec![(worker, filter)]); },
-        };
-    }
+    // let mut filter_assignment: HashMap<ExpiryGroup, Vec<(WorkerID, FilterID)>> = Default::default();
+    // for (worker, filter, expiry) in core.database.list_filters().await? {
+    //     match filter_assignment.entry(expiry) {
+    //         hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push((worker, filter)); },
+    //         hash_map::Entry::Vacant(entry) => { entry.insert(vec![(worker, filter)]); },
+    //     };
+    // }
 
     // Since none of the workers recommended an OK filter for this we need to
     // look at creating new filters to contain these files
@@ -571,26 +572,20 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         // count related filters on each worker
         let mut filter_count = HashMap::<WorkerID, u32>::new();
         for worker in &workers_without_pressure {
-            let mut count = 0;
-            if let Some(filter_set) = filter_assignment.get(&task.info.expiry){
-                for (ww, _ff) in filter_set {
-                    if ww == worker {
-                        count += 1;
-                    }
-                }
+            if let Some(count) = filter_assignment.get(&(worker.clone(), task.info.expiry.clone())) {
+                filter_count.insert(worker.clone(), *count);
             }
-            filter_count.insert(worker.clone(), count);
         }
-        // debug!("No filter found for task in {}, worker loads {:?}", task.info.expiry, filter_count);
 
         // try to find a worker without a related filter to create one on
         // Then start doubling up filters until the limit
         for limit in 0..core.config.per_worker_group_duplication {
             for (worker, count) in &filter_count {
                 if *count <= limit {
-                    let filter_id = core.create_new_filter(worker.clone(), task.info.expiry.clone()).await?;
-                    new_filters.insert(task.info.expiry.clone(), (worker.clone(), filter_id));
-                    core.send_to_ingest_watcher(worker, task, filter_id).await?;
+                    last_filter = last_filter.next();
+                    core.install_filter(worker.clone(), task.info.expiry.clone(), last_filter).await?;
+                    new_filters.insert(task.info.expiry.clone(), (worker.clone(), last_filter));
+                    core.send_to_ingest_watcher(worker, task, last_filter).await?;
                     continue 'tasks
                 }
             }
@@ -617,7 +612,7 @@ async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver
     }
 }
 
-async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: &WorkerID, address: &WorkerAddress) -> Result<()> {
+async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, _worker: &WorkerID, address: &WorkerAddress) -> Result<()> {
     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
     let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
     let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -725,9 +720,12 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
 
                 // refresh any missing filters
-                for filter in response.unknown_filters {
-                    if let Some(expiry) = core.database.get_expiry(filter).await? {
-                        core.install_filter(worker.clone(), expiry, filter).await?;
+                for hash in active.keys().cloned().collect_vec() {
+                    if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
+                        if response.unknown_filters.contains(&entry.get().0) {
+                            let (_, task) = entry.remove();
+                            core.ingest_queue.send(IngestMessage::IngestMessage(task))?;
+                        }
                     }
                 }
             }

@@ -130,10 +130,10 @@ pub struct UpdateFileInfoResponse {
     pub processed: Vec<Sha256>,
     pub pending: HashMap<Sha256, FilterID>,
     pub assignments: HashMap<Sha256, Vec<FilterID>>,
-    // pub free_bytes: u64,
     pub storage_pressure: bool,
-    pub filter_sizes: HashMap<FilterID, u64>,
     pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
+    // pub filters: HashMap<FilterID, (ExpiryGroup, u32)>,
+    pub filters: HashMap<FilterID, ExpiryGroup>,
 }
 
 #[handler]

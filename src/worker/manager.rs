@@ -119,8 +119,8 @@ impl WorkerState {
             pending,
             assignments,
             storage_pressure,
-            filter_sizes,
             filter_pending: self.database.filter_pending().await?,
+            filters: filters.into_iter().collect(),
         })
     }
 

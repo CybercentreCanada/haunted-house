@@ -9,7 +9,7 @@ use sqlx::pool::PoolOptions;
 
 use crate::access::AccessControl;
 use crate::query::Query;
-use crate::types::{ExpiryGroup, Sha256, WorkerID, FilterID};
+use crate::types::{ExpiryGroup, Sha256};
 
 use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestResponse};
 
@@ -96,12 +96,6 @@ impl SQLiteInterface {
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
         sqlx::query("PRAGMA busy_timeout=600000").execute(&mut *con).await?;
-
-        sqlx::query(&format!("create table if not exists filters (
-            id INTEGER PRIMARY KEY,
-            worker TEXT NOT NULL,
-            expiry_group TEXT NOT NULL
-        )")).execute(&mut con).await.context("error creating table filters")?;
 
         sqlx::query(&format!("create table if not exists searches (
             code TEXT PRIMARY KEY,
@@ -201,31 +195,6 @@ impl SQLiteInterface {
             }),
             None => None,
         })
-    }
-
-    pub async fn list_filters(&self) -> Result<Vec<(WorkerID, FilterID, ExpiryGroup)>> {
-        let data: Vec<(i64, String, String)> = query_as("SELECT id, worker, expiry_group FROM filters").fetch_all(&self.db).await?;
-        let mut output = vec![];
-        for (id, worker, expiry) in data {
-            output.push((WorkerID::from(worker), FilterID::from(id), ExpiryGroup::from(&expiry)))
-        }
-        return Ok(output)
-    }
-
-    pub async fn get_expiry(&self, filter: FilterID) -> Result<Option<ExpiryGroup>> {
-        let data: Option<(String, )> = query_as("SELECT expiry_group FROM filters WHERE id = ?").bind(filter.to_i64()).fetch_optional(&self.db).await?;
-        Ok(match data {
-            Some((data, )) => Some(ExpiryGroup::from(&data)),
-            None => None
-        })
-    }
-
-    pub async fn create_filter(&self, worker: &WorkerID, expiry: &ExpiryGroup) -> Result<FilterID> {
-        let result = sqlx::query("INSERT INTO filters(worker, expiry_group) VALUES(?, ?)")
-        .bind(worker.to_string())
-        .bind(expiry.to_string())
-        .execute(&self.db).await?;
-        Ok(FilterID::from(result.last_insert_rowid()))
     }
 }
 
