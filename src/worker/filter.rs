@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -17,6 +18,7 @@ use tokio::sync::RwLock;
 use crate::query::Query;
 use crate::timing::{TimingCapture, mark, NullCapture};
 use crate::types::FilterID;
+use crate::worker::sparse::SparseIterator;
 
 use super::encoding::{cost_to_add, encode_into, decode_into};
 use super::sparse::SparseBits;
@@ -487,12 +489,6 @@ impl ExtensibleTrigramFile {
         let mut writer = std::io::BufWriter::new(write_buffer);
         writer.write_u64::<LittleEndian>(0)?;
 
-        // Timing information
-        // let mut invert_time: f64 = 0.0;
-        // let mut build_ops_time: f64 = 0.0;
-        // let mut op_write_time: f64 = 0.0;
-        // let mut seg_read_time: f64 = 0.0;
-
         // Buffers reused in this loop
         let mut file_ids = vec![];
         let mut extend_data_buffer = vec![0u8; 128];
@@ -503,25 +499,39 @@ impl ExtensibleTrigramFile {
         // sort the files so that file ids always end up reversed below
         files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
+        let mut collector = IdCollector {
+            acceptable: 0,
+            iterators: files.iter().map(|(id, row)|(*id, row.iter().peekable())).collect_vec(),
+        };
+
         // track how many segments are added in this batch
         let mut added_segments = 0u32;
-        'trigrams: for trigram in 0usize..TRIGRAM_RANGE as usize {
-            {
+        // 'trigrams: for trigram in 0usize..TRIGRAM_RANGE as usize {
+        'trigrams: loop {
+            let trigram = {
                 let _mark = mark!(capture, "invert");
                 // Invert batch into REVERSED index lists
-                file_ids.clear();
-                for (id, grams) in files.iter() {
-                    if skipped.contains(id) {
-                        continue
-                    }
-                    if grams.has(trigram) {
-                        file_ids.push(*id);
-                    }
-                }
-                if file_ids.is_empty() {
-                    continue
-                }
-            }
+                // file_ids.clear();
+
+                let trigram = match collector.next(&mut file_ids) {
+                    Some(trigram) => trigram,
+                    None => break,
+                };
+
+                // for (id, grams) in files.iter() {
+                //     if skipped.contains(id) {
+                //         continue
+                //     }
+                //     if grams.has(trigram) {
+                //         file_ids.push(*id);
+                //     }
+                // }
+                // if file_ids.is_empty() {
+                //     continue
+                // }
+                trigram
+            };
+            // println!("{trigram} {file_ids:?}");
 
             // file_ids.sort_unstable_by(|a, b| b.cmp(&a));
             let operations_span = mark!(capture, "build_ops");
@@ -816,6 +826,49 @@ impl ExtensibleTrigramFile {
     }
 }
 
+// A helper to collect file ids for each trigram
+struct IdCollector<'a> {
+    acceptable: u32,
+    iterators: Vec<(u64, Peekable<SparseIterator<'a>>)>
+}
+
+impl<'a> IdCollector<'a> {
+    fn next(&mut self, hits: &mut Vec<u64>) -> Option<u32> {
+        // hits.clear();
+
+        let mut selected_trigram = u32::MAX;
+
+        for (id, input) in self.iterators.iter_mut() {
+            while let Some(&value) = input.peek() {
+                if value < self.acceptable {
+                    input.next();
+                    continue
+                }
+
+                match value.cmp(&selected_trigram) {
+                    std::cmp::Ordering::Less => {
+                        hits.clear();
+                        hits.push(*id);
+                        selected_trigram = value;
+                    },
+                    std::cmp::Ordering::Equal => {
+                        hits.push(*id);
+                    },
+                    std::cmp::Ordering::Greater => {},
+                }
+                break
+            }
+        }
+
+        if selected_trigram == u32::MAX {
+            None
+        } else {
+            self.acceptable = selected_trigram + 1;
+            Some(selected_trigram)
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
@@ -829,7 +882,7 @@ mod test {
     use crate::worker::filter::ExtensibleTrigramFile;
     use crate::worker::sparse::SparseBits;
 
-    use super::TRIGRAM_RANGE;
+    use super::{TRIGRAM_RANGE, IdCollector};
 
     #[test]
     fn simple_save_and_load() -> Result<()> {
@@ -843,6 +896,7 @@ mod test {
             } else {
                 data.insert(TRIGRAM_RANGE as u32 - 1);
             }
+            data.compact();
             trigrams.push((ii, data));
         }
 
@@ -888,6 +942,7 @@ mod test {
             } else {
                 data.insert(TRIGRAM_RANGE as u32 - 1);
             }
+            data.compact();
             trigrams.push((ii, data));
         }
 
@@ -934,7 +989,7 @@ mod test {
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
-        trigrams.sort();
+        trigrams.sort_by(|a, b|a.0.cmp(&b.0));
 
         // write it
         let tempdir = tempfile::tempdir()?;
@@ -1019,6 +1074,9 @@ mod test {
                 if values.contains(&1) {
                     recreated.insert(trigram);
                 }
+                if trigram % (1 << 16) == 0 {
+                    recreated.compact()
+                }
             }
 
             assert!(data == recreated);
@@ -1032,9 +1090,11 @@ mod test {
     fn large_batch() -> Result<()> {
         // build test data
         let mut trigrams = vec![];
+        let timestamp = std::time::Instant::now();
         for ii in 1..500 {
             trigrams.push((ii, SparseBits::random(ii)));
         }
+        println!("generate {:.2}", timestamp.elapsed().as_secs_f64());
 
         // write it
         let tempdir = tempfile::tempdir()?;
@@ -1070,5 +1130,31 @@ mod test {
         // }
         // println!("read {}", timer.elapsed().as_secs_f64());
         Ok(())
+    }
+
+    #[test]
+    fn collector() {
+        let mut objects = vec![];
+        for ii in 0..256 {
+            let mut abc = SparseBits::new();
+            for jj in 0..=0xFFFF {
+                abc.insert(ii << 16 | jj);
+            }
+            abc.compact();
+            objects.push(((ii + 1) as u64, abc));
+        }
+
+        let mut collector = IdCollector {
+            acceptable: 0,
+            iterators: objects.iter().map(|(id, row)|(*id, row.iter().peekable())).collect(),
+        };
+
+        let mut rounds = 0;
+        let mut ids = vec![];
+        while let Some(trigram) = collector.next(&mut ids) {
+            assert_eq!(vec![(trigram as u64 >> 16) + 1], ids);
+            rounds += 1;
+        }
+        assert_eq!(rounds, 1 << 24)
     }
 }

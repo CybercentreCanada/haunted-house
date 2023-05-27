@@ -9,17 +9,43 @@ pub struct SparseBits {
     chunks: Box<[Chunk; 256]>
 }
 
-impl Ord for SparseBits {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.chunks.iter().cmp(other.chunks.iter())
+pub struct SparseIterator<'a> {
+    iter: std::slice::Iter<'a, Chunk>,
+    current_index: u32,
+    current: Iter<'a>
+}
+
+impl<'a> Iterator for SparseIterator<'a> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(value) = self.current.next() {
+                return Some(self.current_index << 16 | value as u32)
+            }
+
+            match self.iter.next() {
+                Some(new) => {
+                    self.current_index += 1;
+                    self.current = new.iter();
+                },
+                None => return None
+            }
+        }
     }
 }
 
-impl PartialOrd for SparseBits {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.chunks.iter().cmp(other.chunks.iter()))
-    }
-}
+// impl Ord for SparseBits {
+//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+//         self.chunks.iter().cmp(other.chunks.iter())
+//     }
+// }
+
+// impl PartialOrd for SparseBits {
+//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+//         Some(self.chunks.iter().cmp(other.chunks.iter()))
+//     }
+// }
 
 impl PartialEq for SparseBits {
     fn eq(&self, other: &Self) -> bool {
@@ -63,6 +89,12 @@ impl SparseBits {
         }
     }
 
+    pub fn iter(&self) -> SparseIterator {
+        let mut iter = self.chunks.iter();
+        let current = iter.next().unwrap();
+        SparseIterator { iter, current_index: 0, current: current.iter() }
+    } 
+
     // #[cfg(test)]
     // pub fn memory(&self) -> usize {
     //     let mut memory = core::mem::size_of::<Self>();
@@ -83,14 +115,14 @@ impl SparseBits {
         }
     }
 
-    pub fn has(&self, index: usize) -> bool {
-        let chunk = &self.chunks[index >> 16];
-        match chunk {
-            Chunk::Added(items) => items.binary_search(&(index as u16)).is_ok(),
-            Chunk::Mask(_, items) => unsafe {*items.get_unchecked(index & 0xFFFF)},
-            Chunk::Removed(items) => !items.binary_search(&(index as u16)).is_ok(),
-        }
-    }
+    // pub fn has(&self, index: usize) -> bool {
+    //     let chunk = &self.chunks[index >> 16];
+    //     match chunk {
+    //         Chunk::Added(items) => items.binary_search(&(index as u16)).is_ok(),
+    //         Chunk::Mask(_, items) => unsafe {*items.get_unchecked(index & 0xFFFF)},
+    //         Chunk::Removed(items) => !items.binary_search(&(index as u16)).is_ok(),
+    //     }
+    // }
 
     #[cfg(test)]
     pub fn random(seed: u64) -> Self {
@@ -98,9 +130,7 @@ impl SparseBits {
 
         let mut prng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut values = vec![];
-        for _ in 0..0xFF {
-            values.push(Chunk::random(&mut prng));
-        }
+        values.resize_with(256, ||Chunk::random(&mut prng));
         Self {
             chunks: values.try_into().unwrap()
         }
@@ -239,8 +269,8 @@ impl Chunk {
                     self.compact()
                 }
             },
-            Chunk::Removed(items) => {
-                items.reserve_exact(0);
+            Chunk::Removed(_items) => {
+                // items.reserve_exact(0);
             },
         }
     }
@@ -271,11 +301,11 @@ mod test {
     use itertools::Itertools;
     use rand::{thread_rng, Rng};
 
-    use super::Chunk;
+    use super::{Chunk, SparseBits};
 
 
     #[test]
-    fn build_random() {
+    fn build_random_chunk() {
         let mut values = (0..u16::MAX).collect_vec();
 
         let mut a = Chunk::empty();
@@ -292,4 +322,14 @@ mod test {
             assert!(a.memory() <= before);
         }
     }
+
+    #[test]
+    fn single_values() {
+        for ii in 0..=0xFFFFFF {
+            let mut bits = SparseBits::new();
+            bits.insert(ii);
+            assert!(bits.iter().eq([ii].iter().cloned()))
+        }
+    }
+
 }
