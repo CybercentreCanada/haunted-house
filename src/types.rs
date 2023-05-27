@@ -69,6 +69,10 @@ impl ExpiryGroup {
         })
     }
 
+    pub fn today() -> ExpiryGroup {
+        ExpiryGroup::create(&Some(Utc::now()))
+    }
+
     pub fn from(data: &str) -> Self {
         Self(data.to_owned())
     }

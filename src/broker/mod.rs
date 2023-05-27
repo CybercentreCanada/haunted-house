@@ -331,9 +331,18 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     loop {
         // Restart the check worker
         if check_worker.is_empty() && !unchecked_buffer.is_empty() {
+            let today = ExpiryGroup::today();
             let core = core.clone();
             let mut tasks: HashMap<_, _> = Default::default();
             while let Some(task) = unchecked_buffer.pop_front() {
+                // Drop stale tasks
+                if task.info.expiry <= today {
+                    for resp in task.response {
+                        _ = resp.send(Ok(()));
+                    }
+                    continue
+                }
+
                 buffer_hashes.remove(&task.info.hash);
                 tasks.insert(task.info.hash.clone(), task);
                 if tasks.len() >= 200 {
@@ -724,6 +733,19 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
             }
 
             _ = query_interval.tick() => {
+                // Pull out expired tasks
+                let today = ExpiryGroup::today();
+                for hash in active.keys().cloned().collect_vec() {
+                    if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
+                        if entry.get().1.info.expiry <= today {
+                            let (_, task) = entry.remove();
+                            for resp in task.response {
+                                _ = resp.send(Ok(()));
+                            }    
+                        }
+                    }
+                }
+
                 //
                 if query.is_empty() && !active.is_empty() {
                     let request = core.client.post(address.http("/files/ingest")?)

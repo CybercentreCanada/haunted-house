@@ -8,7 +8,6 @@
 
 ## Important
 - azure retry for connection errors
-- don't accept files near expiry
 - turn garbage collection back on
 - allow out of order insertion
 
