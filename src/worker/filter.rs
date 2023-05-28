@@ -338,6 +338,15 @@ impl ExtensibleTrigramFile {
         return Ok(filter);
     }
 
+    pub fn delete(directory: PathBuf, id: FilterID) -> Result<()> {
+        let journals = get_operation_journals(&directory, id)?;
+        for (_, path) in journals {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::remove_file(directory.join(format!("{id}")))?;
+        return Ok(())
+    }
+
     pub fn read_trigram(&self, trigram: u32) -> Result<Vec<u64>> {
         let mut output = vec![];
         let mut segment = self.read_initial_segment(trigram).context("reading initial segment")?;

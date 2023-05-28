@@ -184,22 +184,23 @@ const FILTER_DIRETORY: &str = "filters";
 const DATABASE_DIRETORY: &str = "sql-data";
 
 impl WorkerSettings {
-    pub fn get_trigram_cache_directory(&self) -> Result<PathBuf> {
-        let directory = self.data_path.join(TRIGRAM_DIRECTORY);
-        std::fs::create_dir_all(&directory)?;    
-        return Ok(directory);
+    pub fn init_directories(&self) -> Result<()> {
+        std::fs::create_dir_all(self.get_trigram_cache_directory())?;
+        std::fs::create_dir_all(self.get_filter_directory())?;
+        std::fs::create_dir_all(self.get_database_directory())?;
+        return Ok(())
     }
 
-    pub fn get_filter_directory(&self) -> Result<PathBuf> {
-        let directory = self.data_path.join(FILTER_DIRETORY);
-        std::fs::create_dir_all(&directory)?;    
-        return Ok(directory)
+    pub fn get_trigram_cache_directory(&self) -> PathBuf {
+        self.data_path.join(TRIGRAM_DIRECTORY)
     }
 
-    pub fn get_database_directory(&self) -> Result<PathBuf> {
-        let directory = self.data_path.join(DATABASE_DIRETORY);
-        std::fs::create_dir_all(&directory)?;    
-        return Ok(directory)
+    pub fn get_filter_directory(&self) -> PathBuf {
+        self.data_path.join(FILTER_DIRETORY)
+    }
+
+    pub fn get_database_directory(&self) -> PathBuf {
+        self.data_path.join(DATABASE_DIRETORY)
     }
 }
 

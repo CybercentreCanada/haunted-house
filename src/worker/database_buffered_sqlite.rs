@@ -62,15 +62,15 @@ pub struct BufferedSQLite {
     filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>,
     filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>,
     _temp_dir: Option<tempfile::TempDir>,
-    data_directory: PathBuf,
+    database_directory: PathBuf,
 }
 
 
 impl BufferedSQLite {
 
-    pub async fn new(data_directory: PathBuf) -> Result<mpsc::Sender<BSQLCommand>> {
+    pub async fn new(database_directory: PathBuf) -> Result<mpsc::Sender<BSQLCommand>> {
 
-        let path = data_directory.join("directory.sqlite");
+        let path = database_directory.join("directory.sqlite");
 
         let url = if path.is_absolute() {
             format!("sqlite://{}?mode=rwc", path.to_str().unwrap())
@@ -92,13 +92,13 @@ impl BufferedSQLite {
             workers: HashMap::new(),
             channel: reciver,
             _temp_dir: None,
-            data_directory: data_directory.clone(),
+            database_directory: database_directory.clone(),
             filter_sizes: Arc::new(RwLock::new(Default::default())),
             filter_pending: Arc::new(RwLock::new(Default::default()))
         };
 
         for (name, expiry) in db.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
-            db.workers.insert(name, FilterSQLWorker::new(&data_directory, name, expiry, db.filter_sizes.clone(), db.filter_pending.clone()).await?);
+            db.workers.insert(name, FilterSQLWorker::new(&database_directory, name, expiry, db.filter_sizes.clone(), db.filter_pending.clone()).await?);
         }
 
         tokio::spawn(db.run());
@@ -170,7 +170,7 @@ impl BufferedSQLite {
             .bind(expiry.as_str())
             .execute(&mut con).await?;
 
-        self.workers.insert(name, FilterSQLWorker::new(&self.data_directory, name, expiry.clone(), self.filter_sizes.clone(), self.filter_pending.clone()).await?);
+        self.workers.insert(name, FilterSQLWorker::new(&self.database_directory, name, expiry.clone(), self.filter_sizes.clone(), self.filter_pending.clone()).await?);
 
         con.commit().await?;
 
@@ -292,9 +292,9 @@ struct FilterSQLWorker {
 
 impl FilterSQLWorker {
 
-    pub async fn new(directory: &Path, id: FilterID, expiry: ExpiryGroup, filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>, filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>) -> Result<mpsc::Sender<BSQLCommand>> {
+    pub async fn new(database_directory: &Path, id: FilterID, expiry: ExpiryGroup, filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>, filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>) -> Result<mpsc::Sender<BSQLCommand>> {
 
-        let directory = directory.join(id.to_string());
+        let directory = database_directory.join(id.to_string());
         tokio::fs::create_dir_all(&directory).await?;
         let path = directory.join("filter_files.sqlite");
 
@@ -348,7 +348,6 @@ impl FilterSQLWorker {
         Ok(sender)
     }
 
-    
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;
 
@@ -404,6 +403,7 @@ impl FilterSQLWorker {
     }
 
     pub async fn delete_filter(&self) -> Result<()> {
+        self.db.close().await;
         tokio::fs::remove_dir_all(&self.directory).await?;
         Ok(())
     }

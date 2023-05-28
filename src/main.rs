@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
             // Load the config file
             info!("Loading config from: {config:?}");
             let config = load_worker_config(config)?;
+            config.settings.init_directories()?;
             crate::worker::main(config).await?;
         }
     }

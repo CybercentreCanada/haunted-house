@@ -32,8 +32,6 @@ pub struct FilterWorker {
 
 impl FilterWorker {
     pub fn open(config: WorkerSettings, id: FilterID) -> Result<Self> {
-        config.get_filter_directory()?;
-
         let (ready_send, ready_recv) = watch::channel(false);
         let (reader_send, reader_recv) = mpsc::channel(64);
         let (writer_send, writer_recv) = mpsc::channel(2);
@@ -65,7 +63,7 @@ impl FilterWorker {
 
 fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerSettings, id: FilterID, ready_send: watch::Sender<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
     // Open the file
-    let directory = config.get_filter_directory().unwrap();
+    let directory = config.get_filter_directory();
     let path = directory.join(id.to_string());
     let filter = if path.exists() {
         ExtensibleTrigramFile::open(directory, id)

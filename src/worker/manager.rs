@@ -15,6 +15,7 @@ use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;
 use super::database::{IngestStatus, Database, IngestStatusBundle};
+use super::filter::ExtensibleTrigramFile;
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
 use super::sparse::SparseBits;
@@ -40,9 +41,6 @@ impl WorkerState {
             file_storage,
             config,
         });
-
-        // Prepare cache directory
-        new.config.get_trigram_cache_directory()?;
 
         // Start workers for every filter
         let mut to_delete = vec![];
@@ -100,16 +98,27 @@ impl WorkerState {
     pub async fn delete_index(&self, id: FilterID) -> Result<()> {
         // Stop the worker if running
         if let Some((worker, notify, running)) = self.filters.write().await.remove(&id) {
-            running.send(false);
+            _ = running.send(false);
             notify.notify_waiters();
             worker.join().await;
         }
 
         // Delete data behind the worker
-        FilterWorker::delete(&self.config.data_path, id).await?;
+        ExtensibleTrigramFile::delete(self.config.get_filter_directory(), id)?;
 
         // Delete the trigram cache data
-        todo!();
+        let trigram_cache_dir = self.config.get_trigram_cache_directory();
+        let mut cursor = tokio::fs::read_dir(trigram_cache_dir).await?;
+        while let Ok(Some(file)) = cursor.next_entry().await {
+            let file_type = file.file_type().await?;
+            if !file_type.is_file() { continue }
+            if let Some(name) = file.path().file_name() {
+                let name = name.to_str().unwrap();
+                if name.starts_with(&id.to_string()) {
+                    tokio::fs::remove_file(file.path()).await?;
+                }
+            }
+        }
 
         // Delete the database info
         self.database.delete_filter(id).await
@@ -205,7 +214,7 @@ impl WorkerState {
                         };
 
                         // Store the trigrams
-                        let trigram_cache_dir = core.config.data_path.join(TRIGRAM_DIRECTORY);
+                        let trigram_cache_dir = core.config.get_trigram_cache_directory();
                         let cache_path = trigram_cache_dir.join(format!("{filter}-{}", file.hash));
                         tokio::task::spawn_blocking(move ||{
                             let mut temp = tempfile::NamedTempFile::new_in(&trigram_cache_dir)?;
@@ -289,7 +298,7 @@ impl WorkerState {
             let mut trigrams = vec![];
             let mut paths = vec![];
             for (number, hash) in &batch {
-                let trigram_cache_dir = self.config.data_path.join(TRIGRAM_DIRECTORY);
+                let trigram_cache_dir = self.config.get_trigram_cache_directory();
                 let cache_path = trigram_cache_dir.join(format!("{id}-{}", hash));
                 let data: SparseBits = postcard::from_bytes(&tokio::fs::read(&cache_path).await.context(cache_path.to_str().unwrap().to_owned())?)?;
                 paths.push(cache_path);

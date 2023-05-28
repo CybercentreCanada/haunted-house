@@ -58,7 +58,7 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
     info!("Status interface binding on: {bind_address}");
 
     info!("Setting up database.");
-    let database = Database::new_sqlite(config.settings.get_database_directory()?).await?;
+    let database = Database::new_sqlite(config.settings.get_database_directory()).await?;
 
     // let address = config.server_address;
     // let verify = config.server_tls;
