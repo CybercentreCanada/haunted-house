@@ -615,7 +615,7 @@ async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver
 async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, _worker: &WorkerID, address: &WorkerAddress) -> Result<()> {
     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
     let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
-    let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+    let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
     query_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut counters = HashMap::<FilterID, crate::counters::RateCounter>::new();
     let start = std::time::Instant::now();

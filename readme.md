@@ -16,3 +16,6 @@
 - add tracing
 - use more single value structs for better build time error detection
 - join query and of literals into block ands
+- let index file handle out of order writes
+- segment worker database
+- use websocket for communication between broker and workers
