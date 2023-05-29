@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, Context};
 use log::{info, error};
 use sqlx::{SqlitePool, query_as, query};
-use sqlx::pool::PoolOptions;
+use sqlx::pool::{PoolOptions, PoolConnection};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::access::AccessControl;
@@ -51,7 +51,7 @@ impl BSQLCommand {
             BSQLCommand::GetIngestBatch { id, .. } => Some(*id),
             BSQLCommand::FinishedIngest { id, .. } => Some(*id),
         }
-    } 
+    }
 }
 
 pub struct BufferedSQLite {
@@ -77,7 +77,7 @@ impl BufferedSQLite {
         } else {
             format!("sqlite:{}?mode=rwc", path.to_str().unwrap())
         };
-    
+
         let pool = PoolOptions::new()
             .max_connections(200)
             .acquire_timeout(std::time::Duration::from_secs(600))
@@ -472,13 +472,15 @@ impl FilterSQLWorker {
 
     pub async fn update_file_access(&self, files: Vec<FileInfo>) -> Result<IngestStatusBundle> {
         let mut output = IngestStatusBundle::default();
+        let mut conn = self.db.acquire().await?;
+
         for file in files {
             if file.expiry < self.expiry {
                 output.missing.push(file.hash);
                 continue
             }
 
-            match self._update_file_access(&file).await? {
+            match self._update_file_access(&mut conn, &file).await? {
                 IngestStatus::Ready => output.ready.push(file.hash),
                 IngestStatus::Pending(id) => { output.pending.insert(file.hash, id); },
                 IngestStatus::Missing => output.missing.push(file.hash),
@@ -487,9 +489,8 @@ impl FilterSQLWorker {
         return Ok(output);
     }
 
-    pub async fn _update_file_access(&self, file: &FileInfo) -> Result<IngestStatus> {
-        let mut conn = self.db.acquire().await?;
-        let (access_string, ingested): (String, bool) = match query_as(&format!("SELECT access, ingested FROM files WHERE hash = ?")).bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
+    pub async fn _update_file_access(&self, conn: &mut PoolConnection<sqlx::Sqlite>, file: &FileInfo) -> Result<IngestStatus> {
+        let (access_string, ingested): (String, bool) = match query_as(&format!("SELECT access, ingested FROM files WHERE hash = ?")).bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
             Some(row) => row,
             None => return Ok(IngestStatus::Missing)
         };
@@ -508,7 +509,7 @@ impl FilterSQLWorker {
             .bind(new_string)
             .bind(access_string)
             .bind(file.hash.as_bytes())
-            .execute(&mut conn).await?;
+            .execute(&mut *conn).await?;
         if result.rows_affected() > 0 {
             if ingested {
                 return Ok(IngestStatus::Ready)

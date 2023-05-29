@@ -106,8 +106,7 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
                     filter.apply_operations(batch.0, batch.1, batch.2, &capture)?;
                 }
                 _ = finished.send(());
-                debug!("Ingested {} files into {}", size, id);
-                info!("Ingest install time: \n{}", capture.format());
+                info!("Ingest {size} into {id} install time: \n{}", capture.format());
             },
             WriterCommand::Flush => {
                 let filter = filter.blocking_read();
@@ -117,10 +116,12 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
             }
         }
     }
+    info!("Stopping ingest writer for {id}");
     {
         let filter = filter.blocking_read();
         filter.flush_blocking();
     }
+    info!("Stopped ingest writer for {id}");
     return Ok(())
 }
 

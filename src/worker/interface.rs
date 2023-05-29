@@ -123,11 +123,11 @@ pub struct UpdateFileInfoRequest {
 pub struct UpdateFileInfoResponse {
     pub processed: Vec<Sha256>,
     pub pending: HashMap<Sha256, FilterID>,
-    pub assignments: HashMap<Sha256, Vec<FilterID>>,
-    pub storage_pressure: bool,
-    pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
+    // pub assignments: HashMap<Sha256, Vec<FilterID>>,
+    // pub storage_pressure: bool,
+    // pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
     // pub filters: HashMap<FilterID, (ExpiryGroup, u32)>,
-    pub filters: HashMap<FilterID, ExpiryGroup>,
+    // pub filters: HashMap<FilterID, ExpiryGroup>,
 }
 
 #[handler]
@@ -143,7 +143,10 @@ pub struct IngestFilesRequest {
 #[derive(Serialize, Deserialize)]
 pub struct IngestFilesResponse {
     pub completed: Vec<Sha256>,
-    pub unknown_filters: Vec<FilterID>
+    pub unknown_filters: Vec<FilterID>,
+    pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
+    pub expiry_groups: HashMap<ExpiryGroup, Vec<FilterID>>,
+    pub storage_pressure: bool,
 }
 
 #[handler]

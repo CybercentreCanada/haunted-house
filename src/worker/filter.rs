@@ -490,7 +490,10 @@ impl ExtensibleTrigramFile {
     pub fn write_batch(&self, files: &mut [(u64, SparseBits)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations
-        let (write_buffer, _buffer_location, buffer_counter) = get_next_journal(&self.directory, self.id);
+        let (write_buffer, _buffer_location, buffer_counter) = {
+            let _mark = mark!(capture, "get_journal");
+            get_next_journal(&self.directory, self.id)
+        };
         // let write_buffer = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&self.edit_buffer_location)?;
         let mut skipped = HashSet::<u64>::new();
 
@@ -506,11 +509,14 @@ impl ExtensibleTrigramFile {
         let mut content = vec![];
 
         // sort the files so that file ids always end up reversed below
-        files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut collector = {
+            let _mark = mark!(capture, "prepare_inputs");
+            files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-        let mut collector = IdCollector {
-            acceptable: 0,
-            iterators: files.iter().map(|(id, row)|(*id, row.iter().peekable())).collect_vec(),
+            IdCollector {
+                acceptable: 0,
+                iterators: files.iter().map(|(id, row)|(*id, row.iter().peekable())).collect_vec(),
+            }
         };
 
         // track how many segments are added in this batch

@@ -75,7 +75,7 @@ impl WorkerState {
     pub async fn stop(&self) {
         let mut filters = self.filters.write().await;
         for (_, (_, notify, running)) in filters.iter() {
-            running.send(false);
+            _ = running.send(false);
             notify.notify_waiters();
         }
         for (_, (worker, _, _)) in filters.drain() {
@@ -127,37 +127,37 @@ impl WorkerState {
 
     pub async fn update_files(&self, files: Vec<FileInfo>) -> Result<UpdateFileInfoResponse> {
         //
-        let IngestStatusBundle{missing, ready, pending} = self.database.update_file_access(files.clone()).await.context("update_file_access")?;
-        let files: HashMap<_, _> = files.into_iter().map(|file|(file.hash.clone(), file)).collect();
+        let IngestStatusBundle{missing: _, ready, pending} = self.database.update_file_access(files.clone()).await.context("update_file_access")?;
+        // let files: HashMap<_, _> = files.into_iter().map(|file|(file.hash.clone(), file)).collect();
 
         //
-        let filter_sizes = self.database.filter_sizes().await?;
-        let filters = self.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
-        let mut assignments: HashMap<Sha256, Vec<FilterID>> = Default::default();
-        let storage_pressure = self.check_storage_pressure().await.context("check_storage_pressure")?;
-        if !storage_pressure {
-            for hash in missing {
-                let mut selected = vec![];
-                if let Some(file) = files.get(&hash) {
-                    for (id, expiry) in &filters {
-                        if *expiry == file.expiry {
-                            if *filter_sizes.get(id).unwrap_or(&u64::MAX) < self.config.filter_item_limit {
-                                selected.push(*id);
-                            }
-                        }
-                    }
-                }
-                assignments.insert(hash, selected);
-            }
-        }
+        // let filter_sizes = self.database.filter_sizes().await?;
+        // let filters = self.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
+        // let mut assignments: HashMap<Sha256, Vec<FilterID>> = Default::default();
+        // let storage_pressure = self.check_storage_pressure().await.context("check_storage_pressure")?;
+        // if !storage_pressure {
+        //     for hash in missing {
+        //         let mut selected = vec![];
+        //         if let Some(file) = files.get(&hash) {
+        //             for (id, expiry) in &filters {
+        //                 if *expiry == file.expiry {
+        //                     if *filter_sizes.get(id).unwrap_or(&u64::MAX) < self.config.filter_item_limit {
+        //                         selected.push(*id);
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //         assignments.insert(hash, selected);
+        //     }
+        // }
 
         Ok(UpdateFileInfoResponse {
             processed: ready,
             pending,
-            assignments,
-            storage_pressure,
-            filter_pending: self.database.filter_pending().await?,
-            filters: filters.into_iter().collect(),
+            // assignments,
+            // storage_pressure,
+            // filter_pending: self.database.filter_pending().await?,
+            // filters: filters.into_iter().collect(),
         })
     }
 
@@ -251,8 +251,22 @@ impl WorkerState {
             }
         }
 
+        let mut expiry_groups: HashMap<ExpiryGroup, Vec<FilterID>> = Default::default();
+        for (id, group) in self.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+            match expiry_groups.entry(group) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(id),
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(vec![id]); },
+            }
+        }
+
         self.notify_ingest_feeders(modified_filters).await;
-        return Ok(IngestFilesResponse { completed, unknown_filters })
+        return Ok(IngestFilesResponse {
+            completed,
+            unknown_filters,
+            filter_pending: self.database.filter_pending().await?,
+            expiry_groups,
+            storage_pressure: self.check_storage_pressure().await?
+        })
     }
 
     pub async fn notify_ingest_feeders(&self, ids: Vec<FilterID>) {
@@ -328,7 +342,7 @@ impl WorkerState {
                 }
             }
             let time_cleanup = stamp.elapsed().as_secs_f64();
-            info!("Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish}; cleanup {time_cleanup}");
+            info!("{id} Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish}; cleanup {time_cleanup}");
         }
         return Ok(())
     }
