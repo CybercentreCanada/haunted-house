@@ -96,6 +96,7 @@ impl WorkerState {
     }
 
     pub async fn delete_index(&self, id: FilterID) -> Result<()> {
+        info!("Deleting index {id}");
         // Stop the worker if running
         if let Some((worker, notify, running)) = self.filters.write().await.remove(&id) {
             _ = running.send(false);
