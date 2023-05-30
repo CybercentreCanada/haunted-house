@@ -111,18 +111,6 @@ impl WorkerState {
 
         // Delete the trigram cache data
         self.trigrams.expire(id).await?;
-        // let trigram_cache_dir = self.config.get_trigram_cache_directory();
-        // let mut cursor = tokio::fs::read_dir(trigram_cache_dir).await?;
-        // while let Ok(Some(file)) = cursor.next_entry().await {
-        //     let file_type = file.file_type().await?;
-        //     if !file_type.is_file() { continue }
-        //     if let Some(name) = file.path().file_name() {
-        //         let name = name.to_str().unwrap();
-        //         if name.starts_with(&id.to_string()) {
-        //             tokio::fs::remove_file(file.path()).await?;
-        //         }
-        //     }
-        // }
 
         // Delete the database info
         self.database.delete_filter(id).await
@@ -131,36 +119,10 @@ impl WorkerState {
     pub async fn update_files(&self, files: Vec<FileInfo>) -> Result<UpdateFileInfoResponse> {
         //
         let IngestStatusBundle{missing: _, ready, pending} = self.database.update_file_access(files.clone()).await.context("update_file_access")?;
-        // let files: HashMap<_, _> = files.into_iter().map(|file|(file.hash.clone(), file)).collect();
-
-        //
-        // let filter_sizes = self.database.filter_sizes().await?;
-        // let filters = self.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
-        // let mut assignments: HashMap<Sha256, Vec<FilterID>> = Default::default();
-        // let storage_pressure = self.check_storage_pressure().await.context("check_storage_pressure")?;
-        // if !storage_pressure {
-        //     for hash in missing {
-        //         let mut selected = vec![];
-        //         if let Some(file) = files.get(&hash) {
-        //             for (id, expiry) in &filters {
-        //                 if *expiry == file.expiry {
-        //                     if *filter_sizes.get(id).unwrap_or(&u64::MAX) < self.config.filter_item_limit {
-        //                         selected.push(*id);
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //         assignments.insert(hash, selected);
-        //     }
-        // }
 
         Ok(UpdateFileInfoResponse {
             processed: ready,
             pending,
-            // assignments,
-            // storage_pressure,
-            // filter_pending: self.database.filter_pending().await?,
-            // filters: filters.into_iter().collect(),
         })
     }
 

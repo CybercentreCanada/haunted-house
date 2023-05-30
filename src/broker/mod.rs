@@ -437,11 +437,6 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
     }
 
     // Collect results from each worker, dismissing tasks which we can consider processed
-    // let mut filter_pending = HashMap::new();
-    // let mut workers_without_pressure = HashSet::new();
-    // let mut filter_assignment = HashMap::<(WorkerID, ExpiryGroup), u32>::new();
-    // let mut last_filter: FilterID = FilterID::NULL;
-    // let mut suggestions: HashMap<Sha256, Vec<(WorkerID, FilterID)>> = HashMap::new();
     while let Some(res) = requests.join_next().await {
         let (worker, res) = res??;
         debug!("Ingest Check result from {worker}, {} processed, {} pending", res.processed.len(), res.pending.len());
@@ -461,25 +456,6 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
                 core.send_to_ingest_watcher(&worker, task, filter).await?;
             }
         }
-
-        // Collate the information across workers
-        // filter_pending.extend(res.filter_pending.into_iter());
-        // if !res.storage_pressure {
-        //     workers_without_pressure.insert(worker.clone());
-        // }
-        // for (filter, expiry) in res.filters {
-        //     last_filter = last_filter.max(filter);
-        //     match filter_assignment.entry((worker.clone(), expiry)) {
-        //         hash_map::Entry::Occupied(mut entry) => { *entry.get_mut() += 1; },
-        //         hash_map::Entry::Vacant(entry) => { entry.insert(1); },
-        //     }
-        // }
-        // for (sha, filters) in res.assignments {
-        //     match suggestions.entry(sha) {
-        //         hash_map::Entry::Occupied(mut entry) => { entry.get_mut().extend(filters.into_iter().map(|fid|(worker.clone(), fid))); },
-        //         hash_map::Entry::Vacant(entry) => { entry.insert(filters.into_iter().map(|fid|(worker.clone(), fid)).collect_vec()); },
-        //     }
-        // }
     }
 
     // Put the tasks not marked as processed or pending by any working into the queue
@@ -491,76 +467,6 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         }
     }
     return Ok(())
-
-    // for (filter, files) in core.get_ingest_pending().await {
-    //     match filter_pending.entry(filter) {
-    //         hash_map::Entry::Occupied(mut entry) => { entry.get_mut().extend(files);},
-    //         hash_map::Entry::Vacant(entry) => {entry.insert(files.into_iter().collect());},
-    //     }
-    // }
-
-    // debug!("Ingest Check simple assignments, {} task remaining, {} nodes without pressure.", tasks.len(), workers_without_pressure.len());
-    // // debug!("Pending {filter_pending:?}");
-    // // Accept assignments from workers that are uncontroversial
-    // for sha in tasks.keys().cloned().collect_vec() {
-    //     // let task = tasks.get(&sha).unwrap();
-    //     let mut best = None;
-    //     let mut best_pending = u64::MAX;
-
-    //     for (worker, suggested) in suggestions.get(&sha).unwrap_or(&vec![]) {
-    //         let pending = filter_pending.get(suggested).unwrap_or(&[].into()).len() as u64;
-    //         if pending >=  {
-    //             continue
-    //         }
-    //         if pending < best_pending {
-    //             best_pending = pending;
-    //             best = Some((worker.clone(), *suggested))
-    //         }
-    //     }
-
-    //     if let Some((worker, filter)) = best {
-    //         if let Some(task) = tasks.remove(&sha) {
-    //             core.send_to_ingest_watcher(&worker, task, filter).await?;
-    //         }
-    //     }
-    // }
-
-    // // Check if we need to do more work or not
-    // if tasks.is_empty() {
-    //     debug!("Ingest Check all tasks handled by simple assignments.");
-    //     return Ok(vec![])
-    // }
-
-    // Pull down the list of all filters
-    // let mut filter_assignment: HashMap<ExpiryGroup, Vec<(WorkerID, FilterID)>> = Default::default();
-    // for (worker, filter, expiry) in core.database.list_filters().await? {
-    //     match filter_assignment.entry(expiry) {
-    //         hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push((worker, filter)); },
-    //         hash_map::Entry::Vacant(entry) => { entry.insert(vec![(worker, filter)]); },
-    //     };
-    // }
-
-    // Since none of the workers recommended an OK filter for this we need to
-    // look at creating new filters to contain these files
-    // let mut delayed = vec![];
-    // let mut new_filters = HashMap::new();
-    // 'tasks: for (_, task) in tasks {
-    //     // If we already made a filter for this group use it
-    //     if let Some((worker, filter)) = new_filters.get(&task.info.expiry) {
-    //         core.send_to_ingest_watcher(worker, task, *filter).await?;
-    //         continue
-    //     }
-
-    //     // try to find a worker without a related filter to create one on
-    //     // Then start doubling up filters until the limit
-
-
-    //     // Reject the ingestion command
-    //     delayed.push(task);
-    // }
-
-    // debug!("Ingest Check delaying {} tasks.", delayed.len());
-    // Ok(delayed)
 }
 
 //

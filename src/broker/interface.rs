@@ -103,44 +103,6 @@ impl StatusInterface {
     }
 }
 
-
-// struct WorkerInterface {
-//     core: Arc<HouseCore>
-// }
-
-// impl WorkerInterface {
-//     pub fn new(core: Arc<HouseCore>) -> Self {
-//         Self{core}
-//     }
-
-//     pub async fn get_work(&self, req: WorkRequest) -> Result<WorkPackage> {
-//         let start = std::time::Instant::now();
-//         loop {
-//             let work = self.core.get_work(&req).await?;
-//             if !work.is_empty() {
-//                 return Ok(work);
-//             }
-
-//             let wait_max = match Duration::from_secs(30).checked_sub(start.elapsed()) {
-//                 Some(wait) => wait,
-//                 None => return Ok(Default::default()),
-//             };
-
-//             if let Err(_) = tokio::time::timeout(wait_max, self.core.get_work_notification()).await {
-//                 return Ok(Default::default())
-//             }
-//         }
-//     }
-
-//     pub fn finish_work(&self, req: WorkResult) -> Result<()> {
-//         self.core.finish_work(req)
-//     }
-
-//     pub async fn work_error(&self, req: WorkError) -> Result<()> {
-//         self.core.work_error(req).await
-//     }
-// }
-
 struct SearcherInterface {
     core: Arc<HouseCore>
 }
