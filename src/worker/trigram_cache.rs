@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,10 +9,10 @@ use tokio::sync::{Semaphore, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::config::WorkerSettings;
+use crate::storage::BlobStorage;
 use crate::types::{Sha256, FilterID};
 
 use super::sparse::SparseBits;
-
 
 
 pub struct TrigramCache {
@@ -19,17 +20,43 @@ pub struct TrigramCache {
     temp_dir: PathBuf,
     permits: Semaphore,
     pending: RwLock<HashMap<(FilterID, Sha256), JoinHandle<()>>>,
+    files: BlobStorage
 }
 
 
 impl TrigramCache {
 
-    pub async fn new(config: WorkerSettings) -> Result<Arc<Self>> {
-        todo!()
+    pub async fn new(config: WorkerSettings, files: BlobStorage) -> Result<Arc<Self>> {
+        let temp_dir = config.get_trigram_cache_directory().join("temp");
+        tokio::fs::remove_dir_all(&temp_dir).await?;
+        tokio::fs::create_dir_all(&temp_dir).await?;
+        Ok(Arc::new(Self {
+            cache_dir: config.get_trigram_cache_directory(),
+            temp_dir,
+            permits: Semaphore::new(config.parallel_file_downloads),
+            pending: RwLock::new(Default::default()),
+            files,
+        }))
     }
 
     pub async fn expire(&self, filter: FilterID) -> Result<()> {
-        todo!()
+        // Flush out pending tasks
+        {
+            let mut pending = self.pending.write().await;
+            let mut remove = vec![];
+            for (key, task) in pending.iter() {
+                if key.0 == filter {
+                    remove.push(key.clone());
+                    task.abort();
+                }
+            }
+            for key in remove {
+                pending.remove(&key);
+            }
+        }
+
+        // Erase directory
+        return Ok(tokio::fs::remove_dir_all(self._filter_path(filter)).await?);
     }
 
     pub async fn start_fetch(self: Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
@@ -51,7 +78,22 @@ impl TrigramCache {
 
     async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
         let _permit = self.permits.acquire().await?;
-        todo!();
+
+        // Gather the file content
+        let stream = self.files.stream(&hash.hex()).await?;
+        let trigrams = build_file(stream).await?;
+
+        // Store the trigrams
+        let cache_path = self._path(filter, hash);
+        let temp_dir = self.temp_dir.clone();
+        tokio::task::spawn_blocking(move ||{
+            let mut temp = tempfile::NamedTempFile::new_in(&temp_dir)?;
+            temp.write_all(&postcard::to_allocvec(&trigrams)?)?;
+            temp.flush()?;
+            temp.persist(cache_path)?;
+            anyhow::Ok(())
+        }).await??;
+        return Ok(())
     }
 
     pub async fn is_pending(&self, entries: Vec<(FilterID, Sha256)>) -> Result<HashMap<(FilterID, Sha256), bool>> {
@@ -92,8 +134,54 @@ impl TrigramCache {
         }
     }
 
+    pub fn _filter_path(&self, filter: FilterID) -> PathBuf {
+        self.cache_dir.join(filter.to_string())
+    }
+
     pub fn _path(&self, filter: FilterID, hash: &Sha256) -> PathBuf {
-        self.cache_dir.join(filter.to_string()).join(hash.to_string())
+        self._filter_path(filter).join(hash.to_string())
     }
 }
 
+
+async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>) -> Result<SparseBits> {
+    // Prepare accumulators
+    let mut output = SparseBits::new();
+
+    // Read the initial block
+    let mut buffer = vec![];
+    while buffer.len() <= 2 {
+        let sub_buffer = match input.recv().await {
+            Some(sub_buffer) => sub_buffer?,
+            None => return Ok(output),
+        };
+
+        buffer.extend(sub_buffer);
+    }
+
+    // Initialize trigram
+    let mut trigram: u32 = (buffer[0] as u32) << 8 | (buffer[1] as u32);
+    let mut index_start = 2;
+
+    'outer: loop {
+        for _ in 0..1<<16 {
+            for byte in &buffer[index_start..] {
+                trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+                output.insert(trigram);
+            }
+
+            buffer = match input.recv().await {
+                Some(buffer) => buffer?,
+                None => break 'outer,
+            };
+            if buffer.is_empty() {
+                break 'outer;
+            }
+            index_start = 0;
+        }
+        output.compact();
+    }
+    output.compact();
+
+    return Ok(output)
+}

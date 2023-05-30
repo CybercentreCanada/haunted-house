@@ -177,6 +177,8 @@ pub struct WorkerSettings {
     pub extended_segment_size: u32,
     #[serde(default="default_ingest_batch_size")]
     pub ingest_batch_size: u32,
+    #[serde(default="default_parallel_file_downloads")]
+    pub parallel_file_downloads: usize
 }
 
 const TRIGRAM_DIRECTORY: &str = "trigram-cache";
@@ -205,7 +207,6 @@ impl WorkerSettings {
 }
 
 
-
 fn default_filter_item_limit() -> u64 { 50_000_000 }
 fn default_data_path() -> PathBuf { PathBuf::from("/data/") }
 fn default_data_limit() -> u64 { 1 << 40 }
@@ -213,6 +214,8 @@ fn default_data_reserve() -> u64 { 5 << 30 }
 fn default_initial_segment_size() -> u32 { 128 }
 fn default_extended_segment_size() -> u32 { 2048 }
 fn default_ingest_batch_size() -> u32 { 100 }
+fn default_parallel_file_downloads() -> usize { 100 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -237,6 +240,7 @@ impl Default for WorkerConfig {
                 initial_segment_size: default_initial_segment_size(),
                 extended_segment_size: default_extended_segment_size(),
                 ingest_batch_size: default_ingest_batch_size(),
+                parallel_file_downloads: default_parallel_file_downloads(),
             },
             bind_address: Some("localhost:4444".to_owned()),
             tls: None,
