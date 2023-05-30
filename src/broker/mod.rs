@@ -557,7 +557,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
             },
 
             response = query.join_next(), if !query.is_empty() => {
-                info!("response from {id}");
+                debug!("response from {id}");
                 let response = match response {
                     Some(response) => response,
                     None => continue,
@@ -576,7 +576,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 };
 
                 // Pull out the tasks that have been finished
-                info!("response from {id}: process {} completed", response.completed.len());
+                debug!("response from {id}: process {} completed", response.completed.len());
                 for hash in response.completed {
                     if let Some((filter, task)) = active.remove(&hash) {
                         for response in task.response {
@@ -608,7 +608,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
 
                 // Check if there is room in existing filters
-                info!("response from {id}: check existing");
+                debug!("response from {id}: check existing");
                 let mut backlocked_groups = vec![];
                 {
                     let mut filter_pending = response.filter_pending;
@@ -648,12 +648,12 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
 
                 // Check if any of the expiry groups we couldn't fit in existing filters can take more filters
-                info!("response from {id}: check backlogs");
+                debug!("response from {id}: check backlogs");
                 'groups: for group in backlocked_groups {
                     for limit in 0..core.config.per_worker_group_duplication {
                         if response.expiry_groups.get(&group).unwrap_or(&vec![]).len() <= limit as usize {
                             last_id = last_id.next();
-                            info!("response from {id}: create filter {last_id}");
+                            debug!("response from {id}: create filter {last_id}");
                             core.client.put(address.http("/index/create")?)
                             .json(&CreateIndexRequest {
                                 filter_id: last_id,
@@ -665,7 +665,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                     }
                 }
 
-                info!("response from {id}: finished result");
+                debug!("response from {id}: finished result");
             },
             _ = query_interval.tick() => {
                 // Pull out expired tasks

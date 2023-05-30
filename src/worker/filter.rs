@@ -526,27 +526,13 @@ impl ExtensibleTrigramFile {
             let trigram = {
                 let _mark = mark!(capture, "invert");
                 // Invert batch into REVERSED index lists
-                // file_ids.clear();
-
                 let trigram = match collector.next(&mut file_ids) {
                     Some(trigram) => trigram,
                     None => break,
                 };
 
-                // for (id, grams) in files.iter() {
-                //     if skipped.contains(id) {
-                //         continue
-                //     }
-                //     if grams.has(trigram) {
-                //         file_ids.push(*id);
-                //     }
-                // }
-                // if file_ids.is_empty() {
-                //     continue
-                // }
                 trigram
             };
-            // println!("{trigram} {file_ids:?}");
 
             // file_ids.sort_unstable_by(|a, b| b.cmp(&a));
             let operations_span = mark!(capture, "build_ops");
