@@ -1,5 +1,5 @@
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Datelike};
 use serde::{Serialize, Deserialize};
 use serde_with::{SerializeDisplay, DeserializeFromStr};
 
@@ -59,13 +59,13 @@ impl std::str::FromStr for Sha256 {
 
 /// An identifier for grouping filter tables by the day they expire
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
-pub struct ExpiryGroup(String);
+pub struct ExpiryGroup(u32);
 
 impl ExpiryGroup {
     pub fn create(expiry: &Option<DateTime<Utc>>) -> ExpiryGroup {
         ExpiryGroup(match expiry {
-            Some(date) => format!("{}", date.format("%Y0%j")),
-            None => format!("99990999"),
+            Some(date) => ((date.year() as u32) << 16) | date.ordinal(),
+            None => u32::MAX-1,
         })
     }
 
@@ -73,26 +73,20 @@ impl ExpiryGroup {
         ExpiryGroup::create(&Some(Utc::now()))
     }
 
-    pub fn from(data: &str) -> Self {
-        Self(data.to_owned())
+    pub fn from(data: u32) -> Self {
+        Self(data)
     }
 
     pub fn min() -> ExpiryGroup {
-        ExpiryGroup(format!(""))
+        ExpiryGroup(u32::MAX)
     }
 
     pub fn max() -> ExpiryGroup {
-        ExpiryGroup(format!("99999999"))
+        ExpiryGroup(u32::MAX)
     }
 
-    pub fn as_str<'a>(&'a self) -> &'a str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for ExpiryGroup {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+    pub fn to_u32(&self) -> u32 {
+        self.0
     }
 }
 

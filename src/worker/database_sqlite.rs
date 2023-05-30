@@ -103,7 +103,7 @@ impl SQLiteInterface {
 
         sqlx::query(&format!("create table if not exists filters (
             id INTEGER PRIMARY KEY,
-            expiry CHAR(8) NOT NULL
+            expiry INTEGER NOT NULL
         )")).execute(&mut con).await.context("error creating table filters")?;
         sqlx::query(&format!("create index if not exists expiry ON filters(expiry)")).execute(&mut con).await?;
 
@@ -116,7 +116,7 @@ impl SQLiteInterface {
 
         sqlx::query(&format!("INSERT INTO filters(id, expiry) VALUES(?, ?) ON CONFLICT DO NOTHING"))
             .bind(name.to_i64())
-            .bind(expiry.as_str())
+            .bind(expiry.to_u32())
             .execute(&mut con).await?;
 
         sqlx::query(&format!("create table if not exists filter_{name} (
@@ -137,18 +137,18 @@ impl SQLiteInterface {
 
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>, ErrorKinds> {
         let rows : Vec<(i64, )> = sqlx::query_as("SELECT id FROM filters WHERE ? <= expiry AND expiry <= ?")
-            .bind(first.as_str())
-            .bind(last.as_str())
+            .bind(first.to_u32())
+            .bind(last.to_u32())
             .fetch_all(&self.db).await?;
         Ok(rows.into_iter().map(|(id, )|FilterID::from(id)).collect())
     }
 
     pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds> {
-        let rows : Vec<(i64, String)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
-            .bind(first.as_str())
-            .bind(last.as_str())
+        let rows : Vec<(i64, u32)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
+            .bind(first.to_u32())
+            .bind(last.to_u32())
             .fetch_all(&self.db).await?;
-        rows.into_iter().map(|(id, expiry)|Ok((FilterID::from(id), ExpiryGroup::from(&expiry)))).collect()
+        rows.into_iter().map(|(id, expiry)|Ok((FilterID::from(id), ExpiryGroup::from(expiry)))).collect()
     }
 
     pub async fn delete_filter(&self, name: FilterID) -> Result<()> {

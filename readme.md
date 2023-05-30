@@ -19,4 +19,3 @@
 - let index file handle out of order writes
 - segment worker database
 - use websocket for communication between broker and workers
-- use u32 for expiry group
