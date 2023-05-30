@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::WorkerSettings;
 use crate::storage::BlobStorage;
-use crate::types::{Sha256, FilterID};
+use crate::types::{Sha256, FilterID, FileInfo};
 
 use super::sparse::SparseBits;
 
@@ -26,9 +26,11 @@ pub struct TrigramCache {
 
 impl TrigramCache {
 
-    pub async fn new(config: WorkerSettings, files: BlobStorage) -> Result<Arc<Self>> {
+    pub async fn new(config: &WorkerSettings, files: BlobStorage) -> Result<Arc<Self>> {
         let temp_dir = config.get_trigram_cache_directory().join("temp");
-        tokio::fs::remove_dir_all(&temp_dir).await?;
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await?;
+        }
         tokio::fs::create_dir_all(&temp_dir).await?;
         Ok(Arc::new(Self {
             cache_dir: config.get_trigram_cache_directory(),
@@ -59,7 +61,7 @@ impl TrigramCache {
         return Ok(tokio::fs::remove_dir_all(self._filter_path(filter)).await?);
     }
 
-    pub async fn start_fetch(self: Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
+    pub async fn start_fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
         if self.is_ready(filter, &hash).await? {
             return Ok(())
         }
@@ -86,41 +88,35 @@ impl TrigramCache {
         // Store the trigrams
         let cache_path = self._path(filter, hash);
         let temp_dir = self.temp_dir.clone();
+        let filter_dir = self._filter_path(filter);
         tokio::task::spawn_blocking(move ||{
             let mut temp = tempfile::NamedTempFile::new_in(&temp_dir)?;
             temp.write_all(&postcard::to_allocvec(&trigrams)?)?;
             temp.flush()?;
+            std::fs::create_dir_all(filter_dir)?;
             temp.persist(cache_path)?;
             anyhow::Ok(())
         }).await??;
         return Ok(())
     }
 
-    pub async fn is_pending(&self, entries: Vec<(FilterID, Sha256)>) -> Result<HashMap<(FilterID, Sha256), bool>> {
+    pub async fn strip_pending(&self, entries: &mut Vec<(FilterID, FileInfo)>) {
         let workers = self.pending.read().await;
-        let mut output = HashMap::new();
-        for job_parameters in entries {
-            if let Some(task) = workers.get(&job_parameters) {
-                if !task.is_finished() {
-                    output.insert(job_parameters, true);
-                    continue
-                }
-            }
-            output.insert(job_parameters, false);
-        }
-        return Ok(output)
+        entries.retain(|(filter, info)|{
+            !workers.contains_key(&(*filter, info.hash.clone()))
+        });
     }
 
     pub async fn is_ready(&self, filter: FilterID, hash: &Sha256) -> Result<bool> {
         Ok(tokio::fs::try_exists(self._path(filter, hash)).await?)
     }
 
-    pub async fn get(&mut self, filter: FilterID, hash: &Sha256) -> Result<SparseBits> {
+    pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<SparseBits> {
         let data = tokio::fs::read(self._path(filter, hash)).await?;
         Ok(postcard::from_bytes(&data)?)
     }
 
-    pub async fn release(&mut self, filter: FilterID, hash: &Sha256) -> Result<()> {
+    pub async fn release(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
         let path = self._path(filter, hash);
         match tokio::fs::remove_file(&path).await {
             Ok(_) => Ok(()),
@@ -129,7 +125,7 @@ impl TrigramCache {
                     Ok(())
                 } else {
                     Err(err.into())
-                }               
+                }
             },
         }
     }

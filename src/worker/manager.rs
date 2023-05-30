@@ -1,10 +1,8 @@
 use std::collections::{HashSet, HashMap};
-use std::io::Write;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use log::{debug, info, error};
 use tokio::sync::{mpsc, watch, Notify, oneshot};
-use tokio::task::JoinSet;
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
@@ -18,7 +16,7 @@ use super::database::{IngestStatus, Database, IngestStatusBundle};
 use super::filter::ExtensibleTrigramFile;
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
-use super::sparse::SparseBits;
+use super::trigram_cache::TrigramCache;
 
 pub struct WorkerState {
     pub database: Database,
@@ -26,6 +24,7 @@ pub struct WorkerState {
     pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>, watch::Sender<bool>)>>,
     pub file_storage: BlobStorage,
     pub file_cache: BlobCache,
+    pub trigrams: Arc<TrigramCache>,
     pub config: WorkerSettings,
 }
 
@@ -33,6 +32,9 @@ pub struct WorkerState {
 impl WorkerState {
 
     pub async fn new(database: Database, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerSettings, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
+
+        let trigrams = TrigramCache::new(&config, file_storage.clone()).await.context("setting up trigram cache")?;
+
         let new = Arc::new(Self {
             database,
             running,
@@ -40,6 +42,7 @@ impl WorkerState {
             file_cache,
             file_storage,
             config,
+            trigrams,
         });
 
         // Start workers for every filter
@@ -66,7 +69,7 @@ impl WorkerState {
         }
 
         for id in to_delete {
-            new.delete_index(id).await?;
+            new.delete_index(id).await.context("expiry")?;
         }
 
         Ok(new)
@@ -108,18 +111,19 @@ impl WorkerState {
         ExtensibleTrigramFile::delete(self.config.get_filter_directory(), id)?;
 
         // Delete the trigram cache data
-        let trigram_cache_dir = self.config.get_trigram_cache_directory();
-        let mut cursor = tokio::fs::read_dir(trigram_cache_dir).await?;
-        while let Ok(Some(file)) = cursor.next_entry().await {
-            let file_type = file.file_type().await?;
-            if !file_type.is_file() { continue }
-            if let Some(name) = file.path().file_name() {
-                let name = name.to_str().unwrap();
-                if name.starts_with(&id.to_string()) {
-                    tokio::fs::remove_file(file.path()).await?;
-                }
-            }
-        }
+        self.trigrams.expire(id).await?;
+        // let trigram_cache_dir = self.config.get_trigram_cache_directory();
+        // let mut cursor = tokio::fs::read_dir(trigram_cache_dir).await?;
+        // while let Ok(Some(file)) = cursor.next_entry().await {
+        //     let file_type = file.file_type().await?;
+        //     if !file_type.is_file() { continue }
+        //     if let Some(name) = file.path().file_name() {
+        //         let name = name.to_str().unwrap();
+        //         if name.starts_with(&id.to_string()) {
+        //             tokio::fs::remove_file(file.path()).await?;
+        //         }
+        //     }
+        // }
 
         // Delete the database info
         self.database.delete_filter(id).await
@@ -188,69 +192,65 @@ impl WorkerState {
         // the ones that are currently pending can be dropped
         let pending = self.database.filter_pending().await?;
         files.retain(|(filter, file)|!pending.get(filter).unwrap_or(&Default::default()).contains(&file.hash));
+        // The ones we currently waiting for their file download can also be dropped
+        self.trigrams.strip_pending(&mut files).await;
 
         // Gather information for each file individually next
-        let mut workers: JoinSet<std::result::Result<(bool, FilterID, Sha256), ErrorKinds>> = JoinSet::new();
         let mut completed = vec![];
         let mut modified_filters = vec![];
         let mut unknown_filters = vec![];
-        while !workers.is_empty() || !files.is_empty() {
-            while !files.is_empty() && workers.len() < 10 {
-                let core = self.clone();
-                if let Some((filter, file)) = files.pop() {
-                    workers.spawn(async move {
-                        // Check if the file is already inserted
-                        let status = core.database.check_insert_status(filter, &file).await?;
-                        match status {
-                            IngestStatus::Ready => return Ok((true, filter, file.hash)),
-                            IngestStatus::Pending(filter) => return Ok((false, filter, file.hash)),
-                            IngestStatus::Missing => {}
-                        }
-
-                        // Gather the file content
-                        let stream = core.file_storage.stream(&file.hash.hex()).await?;
-                        let trigrams = match build_file(stream).await {
-                            Ok(trigrams) => trigrams,
-                            Err(_) => return Err(ErrorKinds::UnableToBuildTrigrams),
-                        };
-
-                        // Store the trigrams
-                        let trigram_cache_dir = core.config.get_trigram_cache_directory();
-                        let cache_path = trigram_cache_dir.join(format!("{filter}-{}", file.hash));
-                        tokio::task::spawn_blocking(move ||{
-                            let mut temp = tempfile::NamedTempFile::new_in(&trigram_cache_dir)?;
-                            temp.write_all(&postcard::to_allocvec(&trigrams)?)?;
-                            temp.flush()?;
-                            temp.persist(cache_path)?;
-                            Result::<(), ErrorKinds>::Ok(())
-                        }).await??;
-
-                        // Ingest the file
-                        let complete = core.database.ingest_file(filter, &file).await?;
-                        return Ok((complete, filter, file.hash))
-                    });
+        for (filter, file) in files {
+            // Check if the file is already inserted
+            let status = match self.database.check_insert_status(filter, &file).await {
+                Ok(status) => status,
+                Err(ErrorKinds::FilterUnknown(id)) => {
+                    unknown_filters.push(id);
+                    continue
                 }
+                Err(err) => {
+                    return Err(err.into())
+                }
+            };
+            match status {
+                IngestStatus::Ready => {
+                    completed.push(file.hash);
+                    continue
+                },
+                IngestStatus::Pending(_) => {
+                    continue
+                },
+                IngestStatus::Missing => {}
             }
 
-            let result = match workers.join_next().await {
-                Some(result) => result?,
-                None => continue,
+            // Gather the file content
+            if !self.trigrams.is_ready(filter, &file.hash).await? {
+                self.trigrams.start_fetch(filter, file.hash).await?;
+                continue
+            }
+
+            // Ingest the file
+            let complete = match self.database.ingest_file(filter, &file).await {
+                Ok(status) => status,
+                Err(ErrorKinds::FilterUnknown(id)) => {
+                    unknown_filters.push(id);
+                    continue
+                }
+                Err(err) => {
+                    return Err(err.into())
+                }
             };
 
-            match result {
-                Ok((complete, filter, hash)) => if complete {
-                    completed.push(hash);
-                } else {
-                    modified_filters.push(filter)
-                },
-                Err(err) => if let ErrorKinds::FilterUnknown(filter) = err {
-                    unknown_filters.push(filter);
-                } else {
-                    error!("ingest error {err:?}");
-                }
+            if complete {
+                completed.push(file.hash);
+            } else {
+                modified_filters.push(filter)
             }
         }
 
+        // Let ingest feeders know files are ready
+        self.notify_ingest_feeders(modified_filters).await;
+
+        // gather a list of which filters are assigned to what
         let mut expiry_groups: HashMap<ExpiryGroup, Vec<FilterID>> = Default::default();
         for (id, group) in self.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
             match expiry_groups.entry(group) {
@@ -259,17 +259,20 @@ impl WorkerState {
             }
         }
 
-        self.notify_ingest_feeders(modified_filters).await;
+        // return progress, with metadata about our filters
         return Ok(IngestFilesResponse {
             completed,
             unknown_filters,
             filter_pending: self.database.filter_pending().await?,
             expiry_groups,
-            storage_pressure: self.check_storage_pressure().await?
+            storage_pressure: self.check_storage_pressure().await?,
+            filter_size: self.database.filter_sizes().await?,
         })
     }
 
-    pub async fn notify_ingest_feeders(&self, ids: Vec<FilterID>) {
+    pub async fn notify_ingest_feeders(&self, mut ids: Vec<FilterID>) {
+        ids.sort_unstable();
+        ids.dedup();
         let filters = self.filters.read().await;
         for id in ids {
             if let Some((_, notify, _)) = filters.get(&id) {
@@ -311,12 +314,10 @@ impl WorkerState {
             let stamp = std::time::Instant::now();
             // Load the file trigrams
             let mut trigrams = vec![];
-            let mut paths = vec![];
+            let mut hashes = vec![];
             for (number, hash) in &batch {
-                let trigram_cache_dir = self.config.get_trigram_cache_directory();
-                let cache_path = trigram_cache_dir.join(format!("{id}-{}", hash));
-                let data: SparseBits = postcard::from_bytes(&tokio::fs::read(&cache_path).await.context(cache_path.to_str().unwrap().to_owned())?)?;
-                paths.push(cache_path);
+                hashes.push(hash.clone());
+                let data = self.trigrams.get(id, hash).await?;
                 trigrams.push((*number, data));
             }
             let time_load_trigrams = stamp.elapsed().as_secs_f64();
@@ -336,8 +337,8 @@ impl WorkerState {
             let time_finish = stamp.elapsed().as_secs_f64();
 
             let stamp = std::time::Instant::now();
-            for file in paths {
-                if let Err(err) = tokio::fs::remove_file(file).await {
+            for hash in hashes {
+                if let Err(err) = self.trigrams.release(id, &hash).await {
                     error!("{err}");
                 }
             }
@@ -351,9 +352,9 @@ impl WorkerState {
         Ok(self.database.get_filters(first, last).await?)
     }
 
-    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>> {
-        Ok(self.database.get_expiry(first, last).await?)
-    }
+    // pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>> {
+    //     Ok(self.database.get_expiry(first, last).await?)
+    // }
 
     pub async fn is_ready(&self) -> Result<bool> {
         // Get the most comprehensive list of filters we can

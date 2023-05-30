@@ -115,6 +115,8 @@ pub struct CoreConfig {
     pub yara_jobs_per_worker: usize,
     #[serde(default="default_yara_batch_size")]
     pub yara_batch_size: u32,
+    #[serde(default="default_filter_item_limit")]
+    pub filter_item_limit: u64,
 }
 
 fn default_per_filter_pending_limit() -> u64 { 1000 }
@@ -122,6 +124,7 @@ fn default_per_worker_group_duplication() -> u32 { 2 }
 fn default_search_hit_limit() -> usize { 50000 }
 fn default_yara_jobs_per_worker() -> usize { 2 }
 fn default_yara_batch_size() -> u32 { 100 }
+fn default_filter_item_limit() -> u64 { 50_000_000 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -146,6 +149,7 @@ impl Default for Config {
                     (WorkerID::from("worker-1".to_owned()), WorkerAddress::from("worker-0:4000"))
                 ].into(),
                 worker_certificate: WorkerTLSConfig::AllowAll,
+                filter_item_limit: default_filter_item_limit(),
                 per_filter_pending_limit: default_per_filter_pending_limit(),
                 per_worker_group_duplication: default_per_worker_group_duplication(),
                 search_hit_limit: default_search_hit_limit(),
@@ -163,8 +167,6 @@ impl Default for Config {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkerSettings {
-    #[serde(default="default_filter_item_limit")]
-    pub filter_item_limit: u64,
     #[serde(default="default_data_path")]
     pub data_path: PathBuf,
     #[serde(default="default_data_limit")]
@@ -207,7 +209,6 @@ impl WorkerSettings {
 }
 
 
-fn default_filter_item_limit() -> u64 { 50_000_000 }
 fn default_data_path() -> PathBuf { PathBuf::from("/data/") }
 fn default_data_limit() -> u64 { 1 << 40 }
 fn default_data_reserve() -> u64 { 5 << 30 }
@@ -233,7 +234,6 @@ impl Default for WorkerConfig {
             file_cache: Default::default(),
             files: Default::default(),
             settings: WorkerSettings {
-                filter_item_limit: default_filter_item_limit(),
                 data_path: default_data_path(),
                 data_limit: default_data_limit(),
                 data_reserve: default_data_reserve(),

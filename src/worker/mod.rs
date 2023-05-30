@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use serde::{Serialize, Deserialize};
-use anyhow::Result;
+use anyhow::{Result, Context};
 use log::{info, error};
 use crate::blob_cache::BlobCache;
 use crate::types::Sha256;
@@ -59,13 +59,11 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
     info!("Status interface binding on: {bind_address}");
 
     info!("Setting up database.");
-    let database = Database::new_sqlite(config.settings.get_database_directory()).await?;
+    let database = Database::new_sqlite(config.settings.get_database_directory()).await.context("setting up database")?;
 
-    // let address = config.server_address;
-    // let verify = config.server_tls;
-    // let (sender, recv) = mpsc::unbounded_channel();
+    info!("Spawing processing daemons.");
     let (set_running, running) = tokio::sync::watch::channel(true);
-    let data = WorkerState::new(database, file_storage, file_cache, config.settings, running).await?;
+    let data = WorkerState::new(database, file_storage, file_cache, config.settings, running).await.context("spawning")?;
 
     // Watch for exit signal
     let exit_notice = Arc::new(tokio::sync::Notify::new());
@@ -85,6 +83,7 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
     });
 
     // Run the worker
+    info!("Starting HTTP interface.");
     let api = tokio::spawn(interface::serve(bind_address, config.tls, data.clone(), exit_notice.clone()));
     // let manager = tokio::spawn(worker_manager(data.clone(), recv));
 

@@ -52,6 +52,24 @@ impl BSQLCommand {
             BSQLCommand::FinishedIngest { id, .. } => Some(*id),
         }
     }
+
+    pub fn error(self, error: ErrorKinds) {
+        match self {
+            BSQLCommand::CreateFilter { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::GetFilters { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::GetExpiry { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::DeleteFilter {  response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::FilterSizes { .. } => { },
+            BSQLCommand::FilterPending { .. } => { },
+            BSQLCommand::UpdateFileAccess { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::GetFileAccess {  response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::CheckInsertStatus { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::IngestFile { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::SelectFileHashes { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::GetIngestBatch { response, .. } => { _ = response.send(Err(error.into())); },
+            BSQLCommand::FinishedIngest { response, .. } => { _ = response.send(Err(error.into())); },
+        }
+    }
 }
 
 pub struct BufferedSQLite {
@@ -81,7 +99,7 @@ impl BufferedSQLite {
         let pool = PoolOptions::new()
             .max_connections(200)
             .acquire_timeout(std::time::Duration::from_secs(600))
-            .connect(&url).await?;
+            .connect(&url).await.context("create root sqlite file")?;
 
         Self::initialize(&pool).await?;
 
@@ -149,12 +167,9 @@ impl BufferedSQLite {
                 if let Some(id) = other.get_id() {
                     if let Some(channel) = self.workers.get(&id) {
                         channel.send(other).await?;
+                    } else {
+                        other.error(ErrorKinds::FilterUnknown(id));
                     }
-
-                    // match self.workers.get(id) {
-                    //     Some(channel) => channel.send(other),
-                    //     None => other.response(),
-                    // };
                 };
             }
         };

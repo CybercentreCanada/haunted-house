@@ -58,7 +58,7 @@ impl std::str::FromStr for Sha256 {
 }
 
 /// An identifier for grouping filter tables by the day they expire
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
 pub struct ExpiryGroup(u32);
 
 impl ExpiryGroup {
@@ -78,7 +78,7 @@ impl ExpiryGroup {
     }
 
     pub fn min() -> ExpiryGroup {
-        ExpiryGroup(u32::MAX)
+        ExpiryGroup(u32::MIN)
     }
 
     pub fn max() -> ExpiryGroup {
@@ -90,6 +90,19 @@ impl ExpiryGroup {
     }
 }
 
+impl std::fmt::Display for ExpiryGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let year = self.0 >> 16;
+        let day = self.0 & 0xFFFF;
+        f.write_fmt(format_args!("{year}-{day:03}"))
+    }
+}
+
+impl std::fmt::Debug for ExpiryGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ExpiryGroup").field(&self.0).finish()
+    }
+}
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -99,7 +112,7 @@ pub struct FileInfo {
     pub expiry: ExpiryGroup
 }
 
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub struct FilterID(i64);
 
 impl std::fmt::Display for FilterID {
@@ -119,10 +132,6 @@ impl FilterID {
 
     pub fn to_i64(&self) -> i64 {
         self.0
-    }
-
-    pub fn max(&self, other: FilterID) -> FilterID {
-        FilterID::from(self.0.max(other.0))
     }
 
     pub fn next(&self) -> FilterID {

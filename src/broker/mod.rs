@@ -189,24 +189,24 @@ impl HouseCore {
         return Ok(())
     }
 
-    pub async fn get_ingest_pending(self: &Arc<Self>) -> HashMap<FilterID, Vec<Sha256>> {
-        let mut requests = vec![];
-        {
-            let workers = self.worker_ingest.read().await;
-            for (_worker, channel) in workers.iter() {
-                let (send, recv) = oneshot::channel();
-                _ = channel.send(WorkerIngestMessage::ListPending(send));
-                requests.push(recv);
-            }
-        }
-        let mut output = HashMap::<FilterID, Vec<Sha256>>::new();
-        for resp in requests {
-            if let Ok(resp) = resp.await {
-                output.extend(resp);
-            }
-        }
-        return output
-    }
+    // pub async fn get_ingest_pending(self: &Arc<Self>) -> HashMap<FilterID, Vec<Sha256>> {
+    //     let mut requests = vec![];
+    //     {
+    //         let workers = self.worker_ingest.read().await;
+    //         for (_worker, channel) in workers.iter() {
+    //             let (send, recv) = oneshot::channel();
+    //             _ = channel.send(WorkerIngestMessage::ListPending(send));
+    //             requests.push(recv);
+    //         }
+    //     }
+    //     let mut output = HashMap::<FilterID, Vec<Sha256>>::new();
+    //     for resp in requests {
+    //         if let Ok(resp) = resp.await {
+    //             output.extend(resp);
+    //         }
+    //     }
+    //     return output
+    // }
 
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         let channel = {
@@ -305,7 +305,7 @@ pub struct IngestWatchStatus {
 pub enum WorkerIngestMessage {
     IngestMessage((IngestTask, FilterID)),
     Status(oneshot::Sender<HashMap<FilterID, IngestWatchStatus>>),
-    ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
+    // ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
 }
 
 
@@ -637,16 +637,16 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         }
                         _ = resp.send(status);
                     },
-                    WorkerIngestMessage::ListPending(resp) => {
-                        let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
-                        for (id, task) in active.values() {
-                            match count.entry(*id) {
-                                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push(task.info.hash.clone()); },
-                                hash_map::Entry::Vacant(entry) => { entry.insert(vec![task.info.hash.clone()]); },
-                            }
-                        }
-                        _ = resp.send(count);
-                    },
+                    // WorkerIngestMessage::ListPending(resp) => {
+                    //     let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
+                    //     for (id, task) in active.values() {
+                    //         match count.entry(*id) {
+                    //             hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push(task.info.hash.clone()); },
+                    //             hash_map::Entry::Vacant(entry) => { entry.insert(vec![task.info.hash.clone()]); },
+                    //         }
+                    //     }
+                    //     _ = resp.send(count);
+                    // },
                 }
             },
 
@@ -670,7 +670,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 };
 
                 // Pull out the tasks that have been finished
-                info!("response from {id}: process completed");
+                info!("response from {id}: process {} completed", response.completed.len());
                 for hash in response.completed {
                     if let Some((filter, task)) = active.remove(&hash) {
                         for response in task.response {
@@ -712,6 +712,10 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                             continue
                         }
                         for filter in response.expiry_groups.get(group).unwrap_or(&vec![]) {
+                            if response.filter_size.get(filter).unwrap_or(&u64::MAX) >= &core.config.filter_item_limit {
+                                continue
+                            }
+
                             if let Some(pending) = filter_pending.get_mut(filter) {
                                 while pending.len() < core.config.per_filter_pending_limit as usize {
                                     match queue.pop_front() {
@@ -771,19 +775,27 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                     }
                 }
 
-                //
-                if query.is_empty() {
-                    let request = core.client.post(address.http("/files/ingest")?)
-                    .json(&IngestFilesRequest{
-                        files: active.values().map(|(filter, task)|{
-                            (*filter, task.info.clone())
-                        }).collect_vec()
-                    });
-                    query.spawn(async move {
-                        let result = request.send().await?;
-                        anyhow::Ok(result)
-                    });
+                // Only one query at a time
+                if !query.is_empty() {
+                    continue
                 }
+
+                // Check if there is work
+                if active.is_empty() && core.pending_assignments.read().await.is_empty() {
+                    continue
+                }
+
+                //
+                let request = core.client.post(address.http("/files/ingest")?)
+                .json(&IngestFilesRequest{
+                    files: active.values().map(|(filter, task)|{
+                        (*filter, task.info.clone())
+                    }).collect_vec()
+                });
+                query.spawn(async move {
+                    let result = request.send().await?;
+                    anyhow::Ok(result)
+                });
             }
         }
     }
