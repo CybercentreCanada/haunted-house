@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context};
 use futures::{SinkExt, StreamExt};
-use log::error;
+use log::{error, info};
 use poem::web::websocket::{WebSocket, Message};
 use poem::{handler, Route, get, EndpointExt, Server, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
@@ -83,17 +83,25 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
         };
 
         // Dispatch a query to each of those filters
-        let (send, mut recv) = mpsc::channel(128);
-        // let mut queries = tokio::task::JoinSet::new();
-        for filter_id in filter_ids {
-            let state = state.clone();
-            tokio::spawn(state.query_filter(filter_id, request.query.clone(), request.access.clone(), send.clone()));
-        }
+        let mut recv = {
+            let (send, recv) = mpsc::channel(128);
+            // let mut queries = tokio::task::JoinSet::new();
+            for filter_id in &filter_ids {
+                let state = state.clone();
+                tokio::spawn(state.query_filter(*filter_id, request.query.clone(), request.access.clone(), send.clone()));
+            }
+            recv
+        };
 
         // Collect the results
+        let mut counter = 0;
         while let Some(message) = recv.recv().await {
+            counter += 1;
+            info!("search {}/{}", counter, filter_ids.len());
             _ = socket.send(Message::Text(serde_json::to_string(&message).unwrap())).await;
         }
+        info!("Finished");
+        _ = socket.close().await;
     })
 }
 

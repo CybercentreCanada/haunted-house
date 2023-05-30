@@ -26,12 +26,12 @@ class DuplicateToken(KeyError):
 
 class SearchStatus(pydantic.BaseModel):
     code: str
-    group: str
+    # group: str
     finished: bool
     errors: list[str]
-    total_indices: int
-    pending_indices: int
-    pending_candidates: int
+    # total_indices: int
+    # pending_indices: int
+    # pending_candidates: int
     hits: list[str]
     truncated: bool
 
@@ -226,6 +226,7 @@ class Client:
             if self.ingest_connection is None:
                 self.ingest_connection = await self.session.ws_connect("/ingest/stream/", protocols=['ingest-stream'])
                 self.ingest_task = asyncio.create_task(self._socket_listener(self.ingest_connection))
+                self.ingest_futures = {}
             return self.ingest_connection
 
     async def _socket_listener(self, ws: aiohttp.ClientWebSocketResponse):
@@ -252,6 +253,10 @@ class Client:
             except Exception:
                 logger.exception("Error in receiveed message")
         self.ingest_connection = None
+
+        # Clear futures wating on this socket to complete
+        for future in self.ingest_futures.values():
+            future.cancel()
 
 
 def query_from_yara(yara_rule: str) -> str:

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use futures::{StreamExt, SinkExt};
 use itertools::Itertools;
 use log::{error, info, debug};
+use native_tls::Certificate;
 use rand::{thread_rng, Rng};
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
@@ -17,6 +18,7 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use anyhow::{Result, Context};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::broker::interface::SearchRequestResponse;
@@ -65,6 +67,7 @@ pub async fn main(config: crate::config::Config) -> Result<()> {
 pub struct HouseCore {
     pub database: Database,
     pub client: ClientWithMiddleware,
+    pub ws_connector: tokio_tungstenite::Connector,
 //     // pub quit_trigger: tokio::sync::watch::Sender<bool>,
 //     // pub quit_signal: tokio::sync::watch::Receiver<bool>,
     pub authenticator: Authenticator,
@@ -113,6 +116,24 @@ impl HouseCore {
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build();
 
+        // Prepare websocket tls settings
+        let connector = Connector::NativeTls(
+            match &config.worker_certificate {
+                WorkerTLSConfig::AllowAll => {
+                    native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .danger_accept_invalid_hostnames(true)
+                    .build()?
+                },
+                WorkerTLSConfig::Certificate(cert) => {
+                    native_tls::TlsConnector::builder()
+                    .add_root_certificate(Certificate::from_pem(cert.as_bytes())?)
+                    .build()?
+                },
+            }
+        );
+
+        // Create core object
         let core = Arc::new(Self {
             database,
             // quit_trigger,
@@ -121,6 +142,7 @@ impl HouseCore {
             ingest_queue: send_ingest,
             config,
             client,
+            ws_connector: connector,
             worker_ingest: RwLock::new(Default::default()),
             pending_assignments: RwLock::new(Default::default()),
             running_searches: RwLock::new(Default::default()),
@@ -460,9 +482,17 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
 
     // Put the tasks not marked as processed or pending by any working into the queue
     let mut unassigned = core.pending_assignments.write().await;
-    for task in tasks.into_values() {
+    'next_task: for task in tasks.into_values() {
         match unassigned.entry(task.info.expiry.clone()) {
-            hash_map::Entry::Occupied(mut entry) => entry.get_mut().push_back(task),
+            hash_map::Entry::Occupied(mut entry) => {
+                for existing in entry.get_mut().iter_mut() {
+                    if existing.info.hash == task.info.hash {
+                        existing.merge(task);
+                        continue 'next_task;
+                    }
+                }
+                entry.get_mut().push_back(task)
+            },
             hash_map::Entry::Vacant(entry) => { entry.insert(VecDeque::from_iter([task])); },
         }
     }
@@ -715,17 +745,14 @@ pub enum SearcherMessage {
 async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherMessage>, code: String) {
     loop {
         match _search_worker(core.clone(), &mut input, &code).await {
-            Err(err) => error!("Crash in ingestion system: {err}"),
+            Err(err) => error!("Crash in search: {err}"),
             Ok(()) => break,
         }
     }
 }
 
-// fn websocket_address(address: &str) -> String {
-//     address.replace("https://", "wss://").replace("http://", "ws://")
-// }
-
 async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<SearcherMessage>, code: &str) -> Result<()> {
+    info!("Search {code}: Starting");
     // Load the search status
     let status = match core.database.search_record(code).await? {
         Some(status) => status,
@@ -736,39 +763,43 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
     }
 
     // Open a connection for each worker
+    info!("Search {code}: Filtering");
     let request_body = serde_json::to_string(&FilterSearchRequest{
         expiry_group_range: (status.start_date.clone(), status.end_date.clone()),
         query: status.query.clone(),
         access: status.access.clone(),
     })?;
 
-    let (client_sender, mut result_stream) = mpsc::channel(128);
-    for (_worker, address) in &core.config.workers {
-        let address = address.websocket("/search/filter")?;
-        let (mut socket, _) = tokio_tungstenite::connect_async(address).await?;
-        let client_sender = client_sender.clone();
-        let request_body = request_body.clone();
-        tokio::spawn(async move {
-            if let Err(err) = socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await {
-                _ = client_sender.send(FilterSearchResponse::Error(format!("connection error: {err}")));
-            }
+    let mut result_stream = {
+        let (client_sender, result_stream) = mpsc::channel(128);
+        for (_worker, address) in &core.config.workers {
+            let address = address.websocket("/search/filter")?;
+            let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(address, None, false, Some(core.ws_connector.clone())).await?;
+            let client_sender = client_sender.clone();
+            let request_body = request_body.clone();
+            tokio::spawn(async move {
+                if let Err(err) = socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await {
+                    _ = client_sender.send(FilterSearchResponse::Error(format!("connection error: {err}")));
+                }
 
-            while let Some(message) = socket.next().await {
-                let message: FilterSearchResponse = match message {
-                    Ok(message) => if let Message::Text(text) = message {
-                        match serde_json::from_str(&text) {
-                            Ok(message) => message,
-                            Err(err) => FilterSearchResponse::Error(format!("decode error: {err}")),
-                        }
-                    } else {
-                        continue
-                    },
-                    Err(err) => FilterSearchResponse::Error(format!("message error: {err}")),
-                };
-                _ = client_sender.send(message);
-            }
-        });
-    }
+                while let Some(message) = socket.next().await {
+                    let message: FilterSearchResponse = match message {
+                        Ok(message) => if let Message::Text(text) = message {
+                            match serde_json::from_str(&text) {
+                                Ok(message) => message,
+                                Err(err) => FilterSearchResponse::Error(format!("decode error: {err}")),
+                            }
+                        } else {
+                            continue
+                        },
+                        Err(err) => FilterSearchResponse::Error(format!("message error: {err}")),
+                    };
+                    _ = client_sender.send(message);
+                }
+            });
+        }
+        result_stream
+    };
 
     // Absorb messages from the workers until we have them all
     let mut errors = vec![];
@@ -808,11 +839,11 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     FilterSearchResponse::Error(error) => { errors.push(error); },
                 }
             }
-
         }
     }
 
     // Run through yara jobs
+    info!("Search {code}: Yara");
     let mut hits: BTreeSet<Sha256> = Default::default();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
     let mut next_batch = None;
@@ -888,6 +919,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
     };
 
     // Save results
+    info!("Search {code}: Finishing");
     core.database.finalize_search(&status.code, hits, errors, truncated).await?;
     let mut searches = core.running_searches.write().await;
     searches.remove(code);

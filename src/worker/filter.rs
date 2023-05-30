@@ -90,7 +90,7 @@ fn into_trigrams(bytes: &Vec<u8>) -> Vec<u32> {
     let mut trigrams = vec![];
     let mut trigram: u32 = (bytes[0] as u32) << 8 | (bytes[1] as u32);
 
-    for index in 2.. {
+    for index in 2..bytes.len() {
         trigram = (trigram & 0x00FFFF) << 8 | (bytes[index] as u32);
         trigrams.push(trigram);
     }

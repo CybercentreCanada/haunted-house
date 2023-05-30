@@ -77,7 +77,7 @@ async def socket_main(config: Config, verify: bool) -> None:
             assert house_client.access_engine.enforce
 
         logger.info("Starting loop")
-        assignment = {}
+        assignment: dict = {}
 
         while True:
             await asyncio.sleep(0)

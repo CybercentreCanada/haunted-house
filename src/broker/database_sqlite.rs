@@ -126,7 +126,7 @@ impl SQLiteInterface {
         };
 
         // Add operation to the search table
-        sqlx::query("INSERT INTO searches(code, data, start_time) VALUES(?, ?, ?)")
+        sqlx::query("INSERT INTO searches(code, data, start_time, finished) VALUES(?, ?, ?, FALSE)")
             .bind(&code)
             .bind(&postcard::to_allocvec(&SearchRecord{
                 code: code.to_owned(),
