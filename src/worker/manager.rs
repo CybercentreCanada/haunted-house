@@ -6,7 +6,6 @@ use tokio::sync::{mpsc, watch, Notify, oneshot};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
-use crate::error::ErrorKinds;
 use crate::query::Query;
 use crate::storage::BlobStorage;
 use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
@@ -191,60 +190,44 @@ impl WorkerState {
         // Filter those we already have information for quickly
         // the ones that are currently pending can be dropped
         let pending = self.database.filter_pending().await?;
-        files.retain(|(filter, file)|!pending.get(filter).unwrap_or(&Default::default()).contains(&file.hash));
+        files.retain(|(filter, file)| {
+            match pending.get(filter) {
+                Some(hashes) => !hashes.contains(&file.hash),
+                None => true
+            }
+        });
         // The ones we currently waiting for their file download can also be dropped
         self.trigrams.strip_pending(&mut files).await;
 
-        // Gather information for each file individually next
+        // Check for any completed files
         let mut completed = vec![];
+        let files = self.database.check_insert_status(files).await?;
+        let mut outstanding = vec![];
         let mut modified_filters = vec![];
-        let mut unknown_filters = vec![];
-        for (filter, file) in files {
-            // Check if the file is already inserted
-            let status = match self.database.check_insert_status(filter, &file).await {
-                Ok(status) => status,
-                Err(ErrorKinds::FilterUnknown(id)) => {
-                    unknown_filters.push(id);
-                    continue
-                }
-                Err(err) => {
-                    return Err(err.into())
-                }
-            };
+        for (filter, file, status) in files {
             match status {
                 IngestStatus::Ready => {
                     completed.push(file.hash);
                     continue
                 },
-                IngestStatus::Pending(_) => {
-                    continue
-                },
-                IngestStatus::Missing => {}
-            }
-
-            // Gather the file content
-            if !self.trigrams.is_ready(filter, &file.hash).await? {
-                self.trigrams.start_fetch(filter, file.hash).await?;
-                continue
-            }
-
-            // Ingest the file
-            let complete = match self.database.ingest_file(filter, &file).await {
-                Ok(status) => status,
-                Err(ErrorKinds::FilterUnknown(id)) => {
-                    unknown_filters.push(id);
-                    continue
+                IngestStatus::Pending(_) => continue,
+                IngestStatus::Missing => {
+                    // if its not complete, either start downloading it, or pass it
+                    // to the next step
+                    if !self.trigrams.is_ready(filter, &file.hash).await? {
+                        self.trigrams.start_fetch(filter, file.hash).await?;
+                    } else {
+                        outstanding.push((filter, file));
+                        modified_filters.push(filter);
+                    }
                 }
-                Err(err) => {
-                    return Err(err.into())
-                }
-            };
-
-            if complete {
-                completed.push(file.hash);
-            } else {
-                modified_filters.push(filter)
             }
+        }
+
+        // Ingest the file
+        let complete = self.database.ingest_files(outstanding).await?;
+        for completed_file in complete {
+            completed.push(completed_file.hash);
         }
 
         // Let ingest feeders know files are ready
@@ -259,11 +242,15 @@ impl WorkerState {
             }
         }
 
+        //
+        let mut filter_pending = self.database.filter_pending().await?;
+        self.trigrams.add_pending(&mut filter_pending).await;
+
         // return progress, with metadata about our filters
         return Ok(IngestFilesResponse {
             completed,
-            unknown_filters,
-            filter_pending: self.database.filter_pending().await?,
+            // unknown_filters,
+            filter_pending,
             expiry_groups,
             storage_pressure: self.check_storage_pressure().await?,
             filter_size: self.database.filter_sizes().await?,
@@ -333,7 +320,7 @@ impl WorkerState {
 
             // Commit those file ids
             let stamp = std::time::Instant::now();
-            self.database.finished_ingest(id, batch).await?;
+            let processing = self.database.finished_ingest(id, batch).await?;
             let time_finish = stamp.elapsed().as_secs_f64();
 
             let stamp = std::time::Instant::now();
@@ -343,7 +330,7 @@ impl WorkerState {
                 }
             }
             let time_cleanup = stamp.elapsed().as_secs_f64();
-            info!("{id} Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish}; cleanup {time_cleanup}");
+            info!("{id} Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish} ({processing}); cleanup {time_cleanup}");
         }
         return Ok(())
     }

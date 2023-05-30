@@ -140,24 +140,36 @@ impl Database {
         }
     }
 
-    pub async fn check_insert_status(&self, id: FilterID, file: &FileInfo) -> Result<IngestStatus, ErrorKinds> {
+    pub async fn check_insert_status(&self, files: Vec<(FilterID, FileInfo)>) -> Result<Vec<(FilterID, FileInfo, IngestStatus)>, ErrorKinds> {
         match self {
-            Database::SQLite(db) => db.check_insert_status(id, file).await,
+            Database::SQLite(db) => todo!(),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::CheckInsertStatus { id, file: file.clone(), response: send }).await?;
-                resp.await?
+                chan.send(BSQLCommand::CheckInsertStatus { files, response: send }).await?;
+
+                let mut results = vec![];
+                for part in resp.await? {
+                    let part = part.await??;
+                    results.extend(part.into_iter());
+                }
+                return Ok(results)
             }
         }
     }
 
-    pub async fn ingest_file(&self, id: FilterID, file: &FileInfo) -> core::result::Result<bool, ErrorKinds> {
+    pub async fn ingest_files(&self, files: Vec<(FilterID, FileInfo)>) -> Result<Vec<FileInfo>> {
         match self {
-            Database::SQLite(db) => db.ingest_file(id, file).await,
+            Database::SQLite(db) => todo!(), //db.ingest_file(id, file).await,
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::IngestFile { id, file: file.clone(), response: send }).await?;
-                resp.await?
+                chan.send(BSQLCommand::IngestFiles { files, response: send }).await?;
+
+                let mut results = vec![];
+                for part in resp.await? {
+                    let part = part.await??;
+                    results.extend(part.into_iter());
+                }
+                return Ok(results)
             }
         }
     }
@@ -184,9 +196,9 @@ impl Database {
         }
     }
 
-    pub async fn finished_ingest(&self, id: FilterID, files: Vec<(u64, Sha256)>) -> Result<()> {
+    pub async fn finished_ingest(&self, id: FilterID, files: Vec<(u64, Sha256)>) -> Result<f64> {
         match self {
-            Database::SQLite(db) => db.finished_ingest(id, files).await.context("finished_ingest"),
+            Database::SQLite(db) => todo!(),// db.finished_ingest(id, files).await.context("finished_ingest"),
             Database::Buffered(chan) => {
                 let (send, resp) = oneshot::channel();
                 chan.send(BSQLCommand::FinishedIngest { id, files, response: send }).await?;

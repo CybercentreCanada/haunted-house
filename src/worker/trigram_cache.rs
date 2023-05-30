@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,11 +100,21 @@ impl TrigramCache {
         return Ok(())
     }
 
-    pub async fn strip_pending(&self, entries: &mut Vec<(FilterID, FileInfo)>) {
+    pub async fn strip_pending(&self, collection: &mut Vec<(FilterID, FileInfo)>) {
         let workers = self.pending.read().await;
-        entries.retain(|(filter, info)|{
+        collection.retain(|(filter, info)|{
             !workers.contains_key(&(*filter, info.hash.clone()))
         });
+    }
+
+    pub async fn add_pending(&self, collection: &mut HashMap<FilterID, HashSet<Sha256>>) {
+        let workers = self.pending.read().await;
+        for (filter, sha) in workers.keys() {
+            match collection.entry(*filter) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(sha.clone()); },
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert([sha.clone()].into()); },
+            }
+        }
     }
 
     pub async fn is_ready(&self, filter: FilterID, hash: &Sha256) -> Result<bool> {

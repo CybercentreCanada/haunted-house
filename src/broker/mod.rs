@@ -253,9 +253,9 @@ impl HouseCore {
             self.running_searches.read().await.len() as u32
         };
 
-        let mut pending_tasks = HashMap::<ExpiryGroup, u32>::new();
+        let mut pending_tasks = HashMap::<String, u32>::new();
         for (group, queue) in self.pending_assignments.read().await.iter() {
-            pending_tasks.insert(group.clone(), queue.len() as u32);
+            pending_tasks.insert(group.to_string(), queue.len() as u32);
         }
 
         Ok(StatusReport{
@@ -688,14 +688,14 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
 
                 // process any missing filters
-                for hash in active.keys().cloned().collect_vec() {
-                    if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
-                        if response.unknown_filters.contains(&entry.get().0) {
-                            let (_, task) = entry.remove();
-                            core.ingest_queue.send(IngestMessage::IngestMessage(task))?;
-                        }
-                    }
-                }
+                // for hash in active.keys().cloned().collect_vec() {
+                //     if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
+                //         if response.unknown_filters.contains(&entry.get().0) {
+                //             let (_, task) = entry.remove();
+                //             core.ingest_queue.send(IngestMessage::IngestMessage(task))?;
+                //         }
+                //     }
+                // }
 
                 if response.storage_pressure {
                     continue

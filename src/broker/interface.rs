@@ -406,7 +406,7 @@ pub struct StatusReport {
     pub ingest_check: IngestCheckStatus,
     pub ingest_watchers: HashMap<WorkerID, HashMap<FilterID, IngestWatchStatus>>,
     pub active_searches: u32,
-    pub pending_tasks: HashMap<ExpiryGroup, u32>,
+    pub pending_tasks: HashMap<String, u32>,
 }
 
 #[handler]
