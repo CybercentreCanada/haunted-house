@@ -15,6 +15,7 @@ mod database_buffered_sqlite;
 mod database;
 mod database_sqlite;
 mod sparse;
+mod trigram_cache;
 mod encoding;
 mod manager;
 mod filter;

@@ -5,7 +5,7 @@ use crate::timing::{Capture};
 use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;
-use log::{error, debug, info};
+use log::{error, info};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;

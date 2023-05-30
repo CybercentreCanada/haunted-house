@@ -1,6 +1,6 @@
 
 use std::collections::{HashSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, Context};
 use tokio::sync::oneshot;
