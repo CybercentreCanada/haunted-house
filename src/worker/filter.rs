@@ -20,14 +20,15 @@ use crate::timing::{TimingCapture, mark, NullCapture};
 use crate::types::FilterID;
 use crate::worker::sparse::SparseIterator;
 
-use super::encoding::{cost_to_add, encode_into, decode_into};
+use super::encoding::{cost_to_add, encode_into, decode_into, encoded_number_size};
 use super::sparse::SparseBits;
 
 
+const TRIGRAM_RANGE: u64 = 1 << 24;
 const HEADER_SIZE: u64 = 4 + 4 + 4 + 4;
+const PREFIX_SIZE: u64 = TRIGRAM_RANGE * 4;
 const HEADER_MAGIC: u32 = 0x0e3d9def;
 const POINTER_SIZE: u64 = 4;
-const TRIGRAM_RANGE: u64 = 1 << 24;
 
 
 struct TrigramCursor<'a> {
@@ -229,7 +230,7 @@ enum SegmentAddress {
 #[derive(Serialize, Deserialize)]
 enum UpdateOperations<'a> {
     WriteSegment{segment: SegmentAddress, data: &'a[u8]},
-    ExtendSegment{segment: SegmentAddress, new_segment: u32},
+    ExtendSegment{trigram: u32, segment: SegmentAddress, new_segment: u32},
 }
 
 // impl std::fmt::Debug for UpdateOperations {
@@ -275,7 +276,7 @@ impl ExtensibleTrigramFile {
         // prepare file
         let location = directory.join(format!("{id}"));
         let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&location).context("Creating data file")?;
-        data.set_len(HEADER_SIZE + TRIGRAM_RANGE * initial_segment_size as u64).context("Adjusting file size")?;
+        data.set_len(HEADER_SIZE + PREFIX_SIZE + TRIGRAM_RANGE * initial_segment_size as u64).context("Adjusting file size")?;
 
         // write header
         data.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
@@ -313,7 +314,7 @@ impl ExtensibleTrigramFile {
 
         // Use file size to infer number of extended segments
         let metadata = data.metadata()?;
-        if metadata.len() < HEADER_SIZE + initial_segment_size as u64 * TRIGRAM_RANGE {
+        if metadata.len() < HEADER_SIZE + PREFIX_SIZE + initial_segment_size as u64 * TRIGRAM_RANGE {
             return Err(anyhow::anyhow!("Corrupt data file: below minimum size for configuration"));
         }
         let extended_size = metadata.len() - HEADER_SIZE - initial_segment_size as u64 * TRIGRAM_RANGE;
@@ -463,14 +464,28 @@ impl ExtensibleTrigramFile {
     }
 
     fn get_initial_segment_offset(&self, address: u32) -> u64 {
-        HEADER_SIZE + address as u64 * self.initial_segment_size as u64
+        HEADER_SIZE + PREFIX_SIZE + address as u64 * self.initial_segment_size as u64
     }
 
     fn get_extended_segment_offset(&self, address: u32) -> u64 {
-        HEADER_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + (address - 1) as u64 * self.extended_segment_size as u64
+        HEADER_SIZE + PREFIX_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + (address - 1) as u64 * self.extended_segment_size as u64
     }
 
-    // #[instrument]
+    fn get_tail_hint_offset(&self, trigram: u32) -> u64 {
+        HEADER_SIZE + trigram as u64 * 4
+    }
+
+    fn get_tail_hint(&self, trigram: u32) -> SegmentAddress {
+        let data = self.data.blocking_read();
+        let address = self.get_tail_hint_offset(trigram) as usize;
+        let value = u32::from_le_bytes(data[address..address+4].try_into().unwrap());
+        if value == 0 {
+            SegmentAddress::Trigram(trigram)
+        } else {
+            SegmentAddress::Segment(value)
+        }
+    }
+
     fn read_initial_segment(&self, trigram: u32) -> Result<RawSegmentInfo> {
         let location = self.get_initial_segment_offset(trigram) as usize;
         let data = self.data.blocking_read();
@@ -478,12 +493,18 @@ impl ExtensibleTrigramFile {
         return Ok(RawSegmentInfo::new(data))
     }
 
-    // #[instrument]
     fn read_extended_segment(&self, segment: u32) -> Result<RawSegmentInfo> {
         let location = self.get_extended_segment_offset(segment) as usize;
         let data = self.data.blocking_read();
         let data = data[location..location+self.extended_segment_size as usize].to_vec();
         return Ok(RawSegmentInfo::new(data))
+    }
+
+    fn read_segment(&self, segment: SegmentAddress) -> Result<RawSegmentInfo> {
+        match segment {
+            SegmentAddress::Trigram(trigram) => self.read_initial_segment(trigram),
+            SegmentAddress::Segment(segment) => self.read_extended_segment(segment),
+        }
     }
 
     // #[instrument]
@@ -534,19 +555,87 @@ impl ExtensibleTrigramFile {
                 trigram
             };
 
-            // file_ids.sort_unstable_by(|a, b| b.cmp(&a));
             let operations_span = mark!(capture, "build_ops");
 
-            // move through segments until we get the last one
-            let mut address = SegmentAddress::Trigram(trigram as u32);
+            // Get the last segment used by this trigram
+            let mut address = self.get_tail_hint(trigram);
             let mut active_segment = {
                 let _span = mark!(operations_span, "read_segment");
-                self.read_initial_segment(trigram as u32)?
+                self.read_segment(address)?
             };
-            while let Some(extension) = active_segment.extension() {
-                let _span = mark!(operations_span, "read_segment");
-                content.clear();
-                active_segment.decode_into(&mut content);
+            content.clear();
+            let mut encoded_size = active_segment.decode_into(&mut content);
+
+            // Check if we are inserting values out of order with ones already there
+            let out_of_order = if let Some(highest_old_value) = content.last() {
+                let lowest_new_value = match file_ids.last() {
+                    Some(next) => *next,
+                    None => continue 'trigrams,
+                };
+                lowest_new_value <= *highest_old_value
+            } else {
+                false
+            };
+            
+            if out_of_order {
+                // If we are inserting out of order we are going to load the entire
+                // set of values currently in the database and merge in our new values where
+                // we have to. Once current segments are full, merge the lists and fall through
+                // to adding new segments
+                file_ids.extend(self.read_trigram(trigram)?);
+                file_ids.sort_unstable_by(|a, b| b.cmp(&a));
+                file_ids.dedup();
+
+                // Move to the first segment
+                let mut address = SegmentAddress::Trigram(trigram);
+
+                loop {
+                    // Load the segment
+                    active_segment = {
+                        let _span = mark!(operations_span, "read_segment");
+                        self.read_segment(address)?
+                    };
+                    content.clear();
+                    active_segment.decode_into(&mut content);
+    
+                    // write values into this segment
+                    let mut new_content = vec![];
+                    if let Some(next) = file_ids.pop() {
+                        new_content.push(next);
+                        let mut data_size = encoded_number_size(next);
+                        while let Some(next) = file_ids.pop() {
+                            let cost = cost_to_add(&new_content, next);
+                            if data_size + cost <= active_segment.payload_bytes() {
+                                data_size += cost;
+                                new_content.push(next)
+                            } else {
+                                file_ids.push(next);
+                                break
+                            }
+                        }
+                    }
+
+                    // fill the entire data section of that buffer with these values (even if they are zeros)
+                    if content != new_content {
+                        let _span = mark!(operations_span, "write_operation");
+                        encode_data_buffer.clear();
+                        encode_into(&new_content, &mut encode_data_buffer);
+                        encode_data_buffer.resize(active_segment.payload_bytes() as usize, 0);
+                        write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
+                        writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                    }
+
+                    // point to next segment
+                    address = match active_segment.extension() {
+                        Some(address) => SegmentAddress::Segment(address),
+                        None => break
+                    };
+                }
+            } else {
+                // if we are inserting in order we can add values to the current segment
+                // until it is full then fall through to adding new segments
+
+                // Load the existing segment content
                 if let Some(&peak) = content.last() {
                     loop {
                         let next = match file_ids.last() {
@@ -563,52 +652,37 @@ impl ExtensibleTrigramFile {
                     }
                 }
 
-                active_segment = self.read_extended_segment(extension)?;
-                address = SegmentAddress::Segment(extension);
-            }
-
-            // Load the existing segment content
-            content.clear();
-            let mut encoded_size = active_segment.decode_into(&mut content);
-            if let Some(&peak) = content.last() {
-                loop {
-                    let next = match file_ids.last() {
-                        Some(next) => *next,
-                        None => continue 'trigrams,
-                    };
-
-                    if peak < next {
-                        break
+                // pack in as many more values as we can
+                let mut changed = false;
+                let limit = active_segment.payload_bytes();
+                while let Some(index) = file_ids.pop() {
+                    let new_size = encoded_size + cost_to_add(&content, index);
+                    if new_size <= limit {
+                        content.push(index);
+                        encoded_size = new_size;
+                        changed = true;
+                        continue
                     } else {
-                        file_ids.pop();
-                        skipped.insert(next);
+                        file_ids.push(index);
+                        break;
                     }
                 }
-            }
 
-            // pack in as many more values as we can
-            let mut changed = false;
-            let limit = active_segment.payload_bytes();
-            while let Some(index) = file_ids.pop() {
-                let new_size = encoded_size + cost_to_add(&content, index);
-                if new_size <= limit {
-                    content.push(index);
-                    encoded_size = new_size;
-                    changed = true;
-                    continue
-                } else {
-                    file_ids.push(index);
-                    break;
+                // if we changed the content of that segment add the write op
+                if changed {
+                    let _span = mark!(operations_span, "write_operation");
+                    encode_data_buffer.clear();
+                    encode_into(&content, &mut encode_data_buffer);
+                    // in case we are overwriting existing data that could have been longer due to 
+                    // delta encoding or similar we will add an extra zero if there is room to 
+                    // mark the end of the encoded data. If there is no extra space we don't need
+                    // to worry because there can't be hanging data
+                    if encode_data_buffer.len() < limit as usize - POINTER_SIZE as usize {
+                        encode_data_buffer.push(0);
+                    }    
+                    write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
+                    writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                 }
-            }
-
-            // if we changed the content of that segment add the write op
-            if changed {
-                let _span = mark!(operations_span, "write_operation");
-                encode_data_buffer.clear();
-                encode_into(&content, &mut encode_data_buffer);
-                write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
             }
 
             // if there are more indices add extensions
@@ -634,7 +708,7 @@ impl ExtensibleTrigramFile {
 
                 let new_address = SegmentAddress::Segment(new_segment);
                 let _span = mark!(operations_span, "write_operation");
-                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { segment: address, new_segment }, &mut extend_data_buffer)?)?;
+                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { trigram, segment: address, new_segment }, &mut extend_data_buffer)?)?;
                 encode_data_buffer.clear();
                 encode_into(&content, &mut encode_data_buffer);
                 write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
@@ -706,7 +780,7 @@ impl ExtensibleTrigramFile {
         if extended_segments > self.extended_segments {
             let _mark = mark!(capture, "resize");
 
-            let new_size = HEADER_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + extended_segments as u64 * self.extended_segment_size as u64;
+            let new_size = HEADER_SIZE + PREFIX_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + extended_segments as u64 * self.extended_segment_size as u64;
             let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.location)?;
             data.set_len(new_size).context("Resizing data file")?;
             let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
@@ -745,19 +819,20 @@ impl ExtensibleTrigramFile {
                         UpdateOperations::WriteSegment { segment, data } => {
                             let segment_offset = self.get_segment_offset(segment) as usize;
                             mmap[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
-                            // self.data.seek(SeekFrom::Start(segment_offset))?;
-                            // self.data.write(&data)?;
                         },
-                        UpdateOperations::ExtendSegment { segment, new_segment } => {
+                        UpdateOperations::ExtendSegment { trigram, segment, new_segment } => {
+                            // Write the new segment value into the segment being extended for forward reading
                             let segment_offset = self.get_segment_offset(segment);
                             let segment_length = match segment {
                                 SegmentAddress::Trigram(_) => self.initial_segment_size as u64,
                                 SegmentAddress::Segment(_) => self.extended_segment_size as u64,
                             };
                             let write_location = segment_offset + segment_length - POINTER_SIZE;
-                            // self.data.seek(SeekFrom::Start(write_location))?;
-                            // self.data.write(&new_segment.to_le_bytes())?;
                             mmap[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
+                            
+                            // write the new segment value into the hint table for fast appends
+                            let hint_location = self.get_tail_hint_offset(trigram);
+                            mmap[hint_location as usize..hint_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
                         },
                     }
                 }
@@ -1083,6 +1158,86 @@ mod test {
             assert!(data == recreated);
         }
 
+
+        return Ok(())
+    }
+
+    #[test]
+    fn out_of_order_batch() -> Result<()> {
+        let mut bits = SparseBits::new();
+        bits.insert(0);
+
+        let mut trigrams_a = vec![];
+        let mut trigrams_b = vec![];
+        for ii in 1..=50000 {
+            if ii % 2 == 0 {
+                trigrams_a.push((ii, bits.clone()));
+            } else {
+                trigrams_b.push((ii, bits.clone()));
+            }
+        }
+
+        let tempdir = tempfile::tempdir()?;
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
+        {
+            let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
+            let x = file.write_batch(&mut trigrams_a, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
+        }
+
+        {
+            let mut file = ExtensibleTrigramFile::open(location.clone(), id)?;
+            let x = file.write_batch(&mut trigrams_b, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
+        }
+
+        {
+            let file = ExtensibleTrigramFile::open(location, id)?;
+            let values = file.read_trigram(0)?;
+            assert_eq!(values, (1..=50000).collect_vec())
+        }
+
+
+        return Ok(())
+    }
+
+    #[test]
+    fn out_of_order_batch_reversed() -> Result<()> {
+        let mut bits = SparseBits::new();
+        bits.insert(0);
+
+        let mut trigrams_a = vec![];
+        let mut trigrams_b = vec![];
+        for ii in 1..=50000 {
+            if ii % 2 == 0 {
+                trigrams_a.push((ii, bits.clone()));
+            } else {
+                trigrams_b.push((ii, bits.clone()));
+            }
+        }
+
+        let tempdir = tempfile::tempdir()?;
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
+        {
+            let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
+            let x = file.write_batch(&mut trigrams_b, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
+        }
+
+        {
+            let mut file = ExtensibleTrigramFile::open(location.clone(), id)?;
+            let x = file.write_batch(&mut trigrams_a, NullCapture::new())?;
+            file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
+        }
+
+        {
+            let file = ExtensibleTrigramFile::open(location, id)?;
+            let values = file.read_trigram(0)?;
+            assert_eq!(values.len(), 50000);
+            assert_eq!(values, (1..=50000).collect_vec())
+        }
 
         return Ok(())
     }
