@@ -202,10 +202,10 @@ class Client:
 
         future: asyncio.Future[str] = asyncio.Future()
         try:
-            self.ingest_futures[token] = future
             if expiry is not None:
                 expiry = arrow.get(expiry).int_timestamp
             ws = await self._get_ingest_socket()
+            self.ingest_futures[token] = future
 
             body = {
                 'token': token,

@@ -56,6 +56,7 @@ impl Capture {
         let mut lines = vec![];
         let heritage = HERITAGE.lock().unwrap().clone();
         let labels = LABELS.lock().unwrap().clone();
+        let mut roots = vec![];
 
         {
             let mut data = self.data.borrow_mut();
@@ -67,11 +68,16 @@ impl Capture {
                     data.calls.resize(*child + 1, 0);
                 }
             }
-        }
-        for index in parents {
-            if children.contains(&index) {
-                continue
+            for index in parents {
+                if children.contains(&index) {
+                    continue
+                }
+                roots.push((data.times[index], index));
             }
+        }
+
+        roots.sort_by(|a, b|b.0.partial_cmp(&a.0).unwrap());
+        for (_, index) in roots {
             self.format_item(index, "", &heritage, &labels, &mut lines);
         }
 
