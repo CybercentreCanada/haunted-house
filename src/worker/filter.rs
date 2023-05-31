@@ -10,9 +10,7 @@ use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread::JoinHandle;
-use tokio::sync::RwLock;
 
 // use crate::mark;
 use crate::query::Query;
@@ -203,7 +201,7 @@ fn get_operation_journals(directory: &Path, id: FilterID) -> Result<Vec<(u64, Pa
 pub struct ExtensibleTrigramFile {
     initial_segment_size: u32,
     extended_segment_size: u32,
-    data: Arc<RwLock<memmap2::MmapMut>>,
+    data: memmap2::MmapMut,
     extended_segments: u32,
     directory: PathBuf,
     location: PathBuf,
@@ -242,12 +240,12 @@ enum UpdateOperations<'a> {
 //     }
 // }
 
-struct RawSegmentInfo {
-    data: Vec<u8>,
+struct RawSegmentInfo<'a> {
+    data: &'a [u8],
 }
 
-impl RawSegmentInfo {
-    fn new(data: Vec<u8>) -> Self {
+impl<'a> RawSegmentInfo<'a> {
+    fn new(data: &'a [u8]) -> Self {
         RawSegmentInfo { data }
     }
 
@@ -288,7 +286,6 @@ impl ExtensibleTrigramFile {
         // return object
         let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         data.advise(memmap2::Advice::Random)?;
-        let data = Arc::new(RwLock::new(data));
         Ok(Self { initial_segment_size, extended_segment_size, data, extended_segments: 0, directory, location, id })
     }
 
@@ -322,7 +319,6 @@ impl ExtensibleTrigramFile {
 
         let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
         data.advise(memmap2::Advice::Random)?;
-        let data = Arc::new(RwLock::new(data));
         let edit_buffers = get_operation_journals(&directory, id)?;
         let mut filter = Self{ initial_segment_size, extended_segment_size, data, extended_segments, directory, location, id };
 
@@ -476,9 +472,9 @@ impl ExtensibleTrigramFile {
     }
 
     fn get_tail_hint(&self, trigram: u32) -> SegmentAddress {
-        let data = self.data.blocking_read();
+        // let data = self.data.blocking_read();
         let address = self.get_tail_hint_offset(trigram) as usize;
-        let value = u32::from_le_bytes(data[address..address+4].try_into().unwrap());
+        let value = u32::from_le_bytes(self.data[address..address+4].try_into().unwrap());
         if value == 0 {
             SegmentAddress::Trigram(trigram)
         } else {
@@ -488,15 +484,15 @@ impl ExtensibleTrigramFile {
 
     fn read_initial_segment(&self, trigram: u32) -> Result<RawSegmentInfo> {
         let location = self.get_initial_segment_offset(trigram) as usize;
-        let data = self.data.blocking_read();
-        let data = data[location..location+self.initial_segment_size as usize].to_vec();
+        // let data = self.data.blocking_read();
+        let data = &self.data[location..location+self.initial_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
     fn read_extended_segment(&self, segment: u32) -> Result<RawSegmentInfo> {
         let location = self.get_extended_segment_offset(segment) as usize;
-        let data = self.data.blocking_read();
-        let data = data[location..location+self.extended_segment_size as usize].to_vec();
+        // let data = self.data.blocking_read();
+        let data = &self.data[location..location+self.extended_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
@@ -783,15 +779,15 @@ impl ExtensibleTrigramFile {
             let new_size = HEADER_SIZE + PREFIX_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + extended_segments as u64 * self.extended_segment_size as u64;
             let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.location)?;
             data.set_len(new_size).context("Resizing data file")?;
-            let data = unsafe { memmap2::MmapMut::map_mut(&data)? };
+            let mut data = unsafe { memmap2::MmapMut::map_mut(&data)? };
             data.advise(memmap2::Advice::Random)?;
-            let old_data = self.data.clone();
-            self.data = Arc::new(RwLock::new(data));
+            std::mem::swap(&mut data, &mut self.data);
+            // self.data = Arc::new(RwLock::new(data));
             self.extended_segments = extended_segments;
 
             // If we have a duplicate mapping, use the old one for an opertunistic flush
             if counter > 0 {
-                self.flush_threaded(Some(old_data), Some(counter - 1));
+                self.flush_threaded(Some(data), Some(counter - 1))?;
             }
         }
 
@@ -809,7 +805,7 @@ impl ExtensibleTrigramFile {
             let mut bytes_read = 8;
 
             let mut buffer = vec![];
-            let mut mmap = self.data.blocking_write();
+            // let mut mmap = self.data.blocking_write();
             while bytes_read < offset {
                 buffer.clear();
                 bytes_read += reader.read_until(0, &mut buffer)? as u64;
@@ -818,7 +814,7 @@ impl ExtensibleTrigramFile {
                     match operation {
                         UpdateOperations::WriteSegment { segment, data } => {
                             let segment_offset = self.get_segment_offset(segment) as usize;
-                            mmap[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
+                            self.data[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
                         },
                         UpdateOperations::ExtendSegment { trigram, segment, new_segment } => {
                             // Write the new segment value into the segment being extended for forward reading
@@ -828,11 +824,11 @@ impl ExtensibleTrigramFile {
                                 SegmentAddress::Segment(_) => self.extended_segment_size as u64,
                             };
                             let write_location = segment_offset + segment_length - POINTER_SIZE;
-                            mmap[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
+                            self.data[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
                             
                             // write the new segment value into the hint table for fast appends
                             let hint_location = self.get_tail_hint_offset(trigram);
-                            mmap[hint_location as usize..hint_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
+                            self.data[hint_location as usize..hint_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
                         },
                     }
                 }
@@ -846,21 +842,26 @@ impl ExtensibleTrigramFile {
         Ok(get_operation_journals(&self.directory, self.id)?.len())
     }
 
-    pub fn flush_threaded(&self, map: Option<Arc<RwLock<MmapMut>>>, counter: Option<u64>) -> JoinHandle<()> {
+    pub fn flush_threaded(&mut self, map: Option<MmapMut>, counter: Option<u64>) -> Result<JoinHandle<()>> {
         // get a memory mapping
         let data = match map {
             Some(data) => data,
-            None => self.data.clone(),
+            None => {
+                let data = std::fs::OpenOptions::new().write(true).read(true).truncate(false).open(&self.location)?;
+                let mut data = unsafe { memmap2::MmapMut::map_mut(&data)? };
+                data.advise(memmap2::Advice::Random)?;
+                std::mem::swap(&mut data, &mut self.data);
+                data    
+            },
         };
 
         // Commit operations
-        std::thread::spawn({
+        let handle = std::thread::spawn({
             let directory = self.directory.clone();
             let id = self.id.clone();
             move || {
                 // Wait until all outstanding data has flushed
                 {
-                    let data = data.blocking_read();
                     if let Err(err) = data.flush() {
                         error!("Flush error: {err}");
                         return
@@ -891,14 +892,16 @@ impl ExtensibleTrigramFile {
                     }
                 }
             }
-        })
+        });
+        return Ok(handle)
     }
 
-    pub fn flush_blocking(&self) {
-        let handle = self.flush_threaded(None, None);
+    pub fn flush_blocking(&mut self) -> Result<()> {
+        let handle = self.flush_threaded(None, None)?;
         if let Err(err) = handle.join() {
-            error!("Flush error {err:?}");
-        }
+            error!("Join error: {err:?}")
+        };
+        return Ok(())
     }
 }
 

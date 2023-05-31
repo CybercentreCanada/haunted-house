@@ -109,17 +109,17 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
                 info!("Ingest {size} into {id} install time: \n{}", capture.format());
             },
             WriterCommand::Flush => {
-                let filter = filter.blocking_read();
+                let mut filter = filter.blocking_write();
                 if filter.outstanding_journals()? > 0 {
-                    filter.flush_threaded(None, None);
+                    filter.flush_threaded(None, None)?;
                 }
             }
         }
     }
     info!("Stopping ingest writer for {id}");
     {
-        let filter = filter.blocking_read();
-        filter.flush_blocking();
+        let mut filter = filter.blocking_write();
+        filter.flush_blocking()?;
     }
     info!("Stopped ingest writer for {id}");
     return Ok(())
