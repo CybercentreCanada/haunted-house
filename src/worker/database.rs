@@ -2,13 +2,14 @@
 use std::collections::{HashSet, HashMap};
 use std::path::PathBuf;
 
-use anyhow::Result;
 use tokio::sync::oneshot;
 
-use super::database_sqlite::{BSQLCommand, BufferedSQLite};
+use super::database_sqlite::{SQLiteCommand, BufferedSQLite};
 use crate::access::AccessControl;
 use crate::error::ErrorKinds;
 use crate::types::{ExpiryGroup, FilterID, Sha256, FileInfo};
+
+type Result<T> = core::result::Result<T, ErrorKinds>;
 
 #[derive(Debug)]
 pub enum IngestStatus {
@@ -25,7 +26,7 @@ pub struct IngestStatusBundle {
 }
 
 pub enum Database {
-    SQLite(tokio::sync::mpsc::Sender<BSQLCommand>)
+    SQLite(tokio::sync::mpsc::Sender<SQLiteCommand>)
 }
 
 impl Database {
@@ -38,27 +39,27 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::CreateFilter { id, expiry: expiry.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::CreateFilter { id, expiry: expiry.clone(), response: send }).await?;
                 resp.await?
             }
         }
     }
 
-    pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>, ErrorKinds> {
+    pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetFilters { first: first.clone(), last: last.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::GetFilters { first: first.clone(), last: last.clone(), response: send }).await?;
                 resp.await?
             }
         }
     }
 
-    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds> {
+    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetExpiry { first: first.clone(), last: last.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::GetExpiry { first: first.clone(), last: last.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -68,7 +69,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::DeleteFilter { id, response: send }).await?;
+                chan.send(SQLiteCommand::DeleteFilter { id, response: send }).await?;
                 resp.await?
             }
         }
@@ -78,7 +79,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetFileAccess { id, hash: hash.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::GetFileAccess { id, hash: hash.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -88,7 +89,7 @@ impl Database {
         Ok(match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::FilterSizes { response: send }).await?;
+                chan.send(SQLiteCommand::FilterSizes { response: send }).await?;
                 resp.await?
             }
         })
@@ -109,7 +110,7 @@ impl Database {
         Ok(match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::FilterPending { response: send }).await?;
+                chan.send(SQLiteCommand::FilterPending { response: send }).await?;
                 resp.await?
             }
         })
@@ -119,17 +120,53 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::UpdateFileAccess { files, response: send }).await?;
-                resp.await?
+                chan.send(SQLiteCommand::UpdateFileAccess { files: files.clone(), response: send }).await?;
+
+                let mut files: HashSet<Sha256> = files.into_iter().map(|file|file.hash).collect();
+
+                // Collect the results
+                let mut unproc_ready = vec![];
+                let mut unproc_pending = vec![];
+                for resp in resp.await? {
+                    let IngestStatusBundle{ready, pending, ..} = resp.await??;
+                    unproc_ready.push(ready);
+                    unproc_pending.push(pending);
+                }
+
+                // Select the files that are ready
+                let mut output = IngestStatusBundle::default();
+                for ready in unproc_ready {
+                    for hash in ready {
+                        if files.remove(&hash) {
+                            output.ready.push(hash);
+                        }
+                    }
+                }
+
+                // Select the files that are pending
+                for pending in unproc_pending {
+                    for (hash, id) in pending {
+                        if files.remove(&hash) {
+                            output.pending.insert(hash, id);
+                        }
+                    }
+                }
+
+                // All the rest are missing
+                for hash in files {
+                    output.missing.push(hash);
+                }
+
+                return Ok(output)
             }
         }
     }
 
-    pub async fn check_insert_status(&self, files: Vec<(FilterID, FileInfo)>) -> Result<Vec<(FilterID, FileInfo, IngestStatus)>, ErrorKinds> {
+    pub async fn check_insert_status(&self, files: Vec<(FilterID, FileInfo)>) -> Result<Vec<(FilterID, FileInfo, IngestStatus)>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::CheckInsertStatus { files, response: send }).await?;
+                chan.send(SQLiteCommand::CheckInsertStatus { files, response: send }).await?;
 
                 let mut results = vec![];
                 for part in resp.await? {
@@ -145,12 +182,11 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::IngestFiles { files, response: send }).await?;
+                chan.send(SQLiteCommand::IngestFiles { files, response: send }).await?;
 
                 let mut results = vec![];
                 for part in resp.await? {
-                    let part = part.await??;
-                    results.extend(part.into_iter());
+                    results.extend(part.await??);
                 }
                 return Ok(results)
             }
@@ -161,7 +197,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::SelectFileHashes { id, file_indices: file_indices.clone(), access: access.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::SelectFileHashes { id, file_indices: file_indices.clone(), access: access.clone(), response: send }).await?;
                 resp.await?
             }
         }
@@ -171,7 +207,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::GetIngestBatch { id, limit, response: send }).await?;
+                chan.send(SQLiteCommand::GetIngestBatch { id, limit, response: send }).await?;
                 resp.await?
             }
         }
@@ -181,7 +217,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(BSQLCommand::FinishedIngest { id, files, response: send }).await?;
+                chan.send(SQLiteCommand::FinishedIngest { id, files, response: send }).await?;
                 resp.await?
             }
         }

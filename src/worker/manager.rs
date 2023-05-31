@@ -113,7 +113,8 @@ impl WorkerState {
         self.trigrams.expire(id).await?;
 
         // Delete the database info
-        self.database.delete_filter(id).await
+        self.database.delete_filter(id).await?;
+        return Ok(())
     }
 
     pub async fn update_files(&self, files: Vec<FileInfo>) -> Result<UpdateFileInfoResponse> {

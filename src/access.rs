@@ -5,6 +5,8 @@ use std::str::FromStr;
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
 
+use crate::error::ErrorKinds;
+
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub enum AccessControl {
@@ -27,7 +29,7 @@ impl Display for AccessControl {
 }
 
 impl FromStr for AccessControl {
-    type Err = anyhow::Error;
+    type Err = ErrorKinds;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(parse::access(s)?)
@@ -314,15 +316,17 @@ mod parse {
     use nom::multi::{separated_list1, many1};
     use nom::sequence::{delimited, tuple};
     use nom::{IResult};
+    use crate::error::ErrorKinds;
+
     use super::AccessControl;
 
-    pub fn access(input: &str) -> anyhow::Result<AccessControl> {
+    pub fn access(input: &str) -> Result<AccessControl, ErrorKinds> {
         let (remain, access) = match parse_access(input) {
             Ok(result) => result,
-            Err(err) => return Err(anyhow::anyhow!("Could not parse access string: {err}")),
+            Err(err) => return Err(ErrorKinds::CouldNotParseAccessString(input.to_owned(), err.to_string())),
         };
         if !remain.is_empty() {
-            return Err(anyhow::anyhow!("Could not parse access string trailing data: {remain}"))
+            return Err(ErrorKinds::CouldNotParseAccessStringTrailing(input.to_owned(), remain.to_owned()))
         }
         return Ok(access)
     }

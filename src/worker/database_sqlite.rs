@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Result, Context};
 use log::{info, error};
 use sqlx::{SqlitePool, query_as, query};
 use sqlx::pool::{PoolOptions, PoolConnection};
@@ -15,74 +14,62 @@ use crate::types::{FilterID, FileInfo, ExpiryGroup, Sha256};
 
 use super::database::{IngestStatus, IngestStatusBundle};
 
+
+type Result<T> = core::result::Result<T, ErrorKinds>;
+type Respond<T> = oneshot::Sender<Result<T>>;
+type BatchRespond<T> = oneshot::Sender<Vec<oneshot::Receiver<Result<T>>>>;
+
 #[derive(Debug)]
-pub enum BSQLCommand {
-    CreateFilter{id: FilterID, expiry: ExpiryGroup, response: oneshot::Sender<Result<()>>},
-    GetFilters{first: ExpiryGroup, last: ExpiryGroup, response: oneshot::Sender<Result<Vec<FilterID>, ErrorKinds>>},
-    GetExpiry{first: ExpiryGroup, last: ExpiryGroup, response: oneshot::Sender<Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds>>},
-    DeleteFilter{id: FilterID, response: oneshot::Sender<Result<()>>},
+pub enum SQLiteCommand {
+    CreateFilter{id: FilterID, expiry: ExpiryGroup, response: Respond<()>},
+    GetFilters{first: ExpiryGroup, last: ExpiryGroup, response: Respond<Vec<FilterID>>},
+    GetExpiry{first: ExpiryGroup, last: ExpiryGroup, response: Respond<Vec<(FilterID, ExpiryGroup)>>},
+    DeleteFilter{id: FilterID, response: Respond<()>},
     FilterSizes{response: oneshot::Sender<HashMap<FilterID, u64>>},
     // FilterPendingCount{response: oneshot::Sender<HashMap<FilterID, u64>>},
     FilterPending{response: oneshot::Sender<HashMap<FilterID, HashSet<Sha256>>>},
-    UpdateFileAccess{files: Vec<FileInfo>, response: oneshot::Sender<Result<IngestStatusBundle>>},
-    GetFileAccess{id: FilterID, hash: Sha256, response: oneshot::Sender<Result<Option<AccessControl>>>},
-    CheckInsertStatus{files: Vec<(FilterID, FileInfo)>, response: oneshot::Sender<Vec<oneshot::Receiver<Result<Vec<(FilterID, FileInfo, IngestStatus)>, ErrorKinds>>>>},
-    CheckInsertStatus0{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo, IngestStatus)>, ErrorKinds>>},
-    IngestFiles{files: Vec<(FilterID, FileInfo)>, response: oneshot::Sender<Vec<oneshot::Receiver<Result<Vec<FileInfo>>>>>},
-    IngestFiles0{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<FileInfo>>>},
-    SelectFileHashes{id: FilterID, file_indices: Vec<u64>, access: HashSet<String>, response: oneshot::Sender<Result<Vec<Sha256>>>},
-    GetIngestBatch{id: FilterID, limit: u32, response: oneshot::Sender<Result<Vec<(u64, Sha256)>>>},
-    FinishedIngest{id: FilterID, files: Vec<(u64, Sha256)>, response: oneshot::Sender<Result<f64>>},
+    UpdateFileAccess{files: Vec<FileInfo>, response: BatchRespond<IngestStatusBundle>},
+    GetFileAccess{id: FilterID, hash: Sha256, response: Respond<Option<AccessControl>>},
+    CheckInsertStatus{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo, IngestStatus)>>},
+    IngestFiles{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<FileInfo>>},
+    SelectFileHashes{id: FilterID, file_indices: Vec<u64>, access: HashSet<String>, response: Respond<Vec<Sha256>>},
+    GetIngestBatch{id: FilterID, limit: u32, response: Respond<Vec<(u64, Sha256)>>},
+    FinishedIngest{id: FilterID, files: Vec<(u64, Sha256)>, response: Respond<f64>},
 }
 
-impl BSQLCommand {
-    pub fn get_id(&self) -> Option<FilterID> {
-        match self {
-            BSQLCommand::CreateFilter { id, .. } => Some(*id),
-            BSQLCommand::GetFilters { .. } => None,
-            BSQLCommand::GetExpiry { .. } => None,
-            BSQLCommand::DeleteFilter { id, .. } => Some(*id),
-            BSQLCommand::FilterSizes { .. } => None,
-            // BSQLCommand::FilterPendingCount { .. } => None,
-            BSQLCommand::FilterPending { .. } => None,
-            BSQLCommand::UpdateFileAccess { .. } => None,
-            BSQLCommand::GetFileAccess { id, .. } => Some(*id),
-            BSQLCommand::CheckInsertStatus { .. } => None,
-            BSQLCommand::CheckInsertStatus0 { .. } => None,
-            BSQLCommand::IngestFiles { .. } => None,
-            BSQLCommand::IngestFiles0 { .. } => None,
-            BSQLCommand::SelectFileHashes { id, .. } => Some(*id),
-            BSQLCommand::GetIngestBatch { id, .. } => Some(*id),
-            BSQLCommand::FinishedIngest { id, .. } => Some(*id),
-        }
-    }
+#[derive(Debug)]
+pub enum FilterCommand {
+    DeleteFilter{response: oneshot::Sender<Result<()>>},
+    GetFileAccess{hash: Sha256, response: oneshot::Sender<Result<Option<AccessControl>>>},
+    CheckInsertStatus{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo, IngestStatus)>>>},
+    IngestFiles{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<FileInfo>>>},
+    SelectFileHashes{file_indices: Vec<u64>, access: HashSet<String>, response: oneshot::Sender<Result<Vec<Sha256>>>},
+    GetIngestBatch{limit: u32, response: oneshot::Sender<Result<Vec<(u64, Sha256)>>>},
+    FinishedIngest{files: Vec<(u64, Sha256)>, response: oneshot::Sender<Result<f64>>},
+    UpdateFileAccess{files: Vec<FileInfo>, response: oneshot::Sender<Result<IngestStatusBundle>>},
+}
 
+impl FilterCommand {
     pub fn error(self, error: ErrorKinds) {
         match self {
-            BSQLCommand::CreateFilter { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::GetFilters { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::GetExpiry { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::DeleteFilter {  response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::FilterSizes { .. } => { },
-            BSQLCommand::FilterPending { .. } => { },
-            BSQLCommand::UpdateFileAccess { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::GetFileAccess {  response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::CheckInsertStatus { .. } => { },
-            BSQLCommand::CheckInsertStatus0 { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::IngestFiles { .. } => { },
-            BSQLCommand::IngestFiles0 { .. } => { },
-            BSQLCommand::SelectFileHashes { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::GetIngestBatch { response, .. } => { _ = response.send(Err(error.into())); },
-            BSQLCommand::FinishedIngest { response, .. } => { _ = response.send(Err(error.into())); },
+            FilterCommand::DeleteFilter { response } => _ = response.send(Err(error)),
+            FilterCommand::GetFileAccess { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::CheckInsertStatus { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::IngestFiles { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::SelectFileHashes { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::GetIngestBatch { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::FinishedIngest { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::UpdateFileAccess { response, .. } => _ = response.send(Err(error)),
         }
     }
 }
+
 
 pub struct BufferedSQLite {
     db: SqlitePool,
-    channel: mpsc::Receiver<BSQLCommand>,
+    channel: mpsc::Receiver<SQLiteCommand>,
     // work_notification: tokio::sync::Notify,
-    workers: HashMap<FilterID, mpsc::Sender<BSQLCommand>>,
+    workers: HashMap<FilterID, mpsc::Sender<FilterCommand>>,
     filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>,
     filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>,
     _temp_dir: Option<tempfile::TempDir>,
@@ -92,7 +79,7 @@ pub struct BufferedSQLite {
 
 impl BufferedSQLite {
 
-    pub async fn new(database_directory: PathBuf) -> Result<mpsc::Sender<BSQLCommand>> {
+    pub async fn new(database_directory: PathBuf) -> Result<mpsc::Sender<SQLiteCommand>> {
 
         let path = database_directory.join("directory.sqlite");
 
@@ -103,9 +90,9 @@ impl BufferedSQLite {
         };
 
         let pool = PoolOptions::new()
-            .max_connections(200)
+            .max_connections(10)
             .acquire_timeout(std::time::Duration::from_secs(600))
-            .connect(&url).await.context("create root sqlite file")?;
+            .connect(&url).await?;
 
         Self::initialize(&pool).await?;
 
@@ -140,7 +127,7 @@ impl BufferedSQLite {
         sqlx::query(&format!("create table if not exists filters (
             id INTEGER PRIMARY KEY,
             expiry INTEGER NOT NULL
-        )")).execute(&mut con).await.context("error creating table filters")?;
+        )")).execute(&mut con).await?;
         sqlx::query(&format!("create index if not exists expiry ON filters(expiry)")).execute(&mut con).await?;
 
         return Ok(())
@@ -159,17 +146,26 @@ impl BufferedSQLite {
         }
     }
 
-    async fn handle_message(&mut self, message: BSQLCommand) -> Result<()> {
+    async fn handle_message(&mut self, message: SQLiteCommand) -> Result<()> {
         match message {
-            BSQLCommand::CreateFilter { id, expiry, response } => { _ = response.send(self.create_filter(id, &expiry).await); },
-            BSQLCommand::GetFilters { first, last, response } => { _ = response.send(self.get_filters(&first, &last).await); },
-            BSQLCommand::GetExpiry { first, last, response } => { _ = response.send(self.get_expiry(&first, &last).await); },
-            BSQLCommand::DeleteFilter { id, response } => { _ = response.send(self.delete_filter(id).await); },
-            BSQLCommand::FilterSizes { response } => { _ = response.send(self.filter_sizes().await); },
+            SQLiteCommand::CreateFilter { id, expiry, response } => { _ = response.send(self.create_filter(id, &expiry).await); },
+            SQLiteCommand::GetFilters { first, last, response } => { _ = response.send(self.get_filters(&first, &last).await); },
+            SQLiteCommand::GetExpiry { first, last, response } => { _ = response.send(self.get_expiry(&first, &last).await); },
+            SQLiteCommand::DeleteFilter { id, response } => { _ = response.send(self.delete_filter(id).await); },
+            SQLiteCommand::FilterSizes { response } => { _ = response.send(self.filter_sizes().await); },
             // BSQLCommand::FilterPendingCount { response } => { _ = response.send(self.filter_pending_count().await); },
-            BSQLCommand::FilterPending { response } => { _ = response.send(self.filter_pending().await); },
-            BSQLCommand::UpdateFileAccess { files, response } => { _ = response.send(self.update_file_access(files).await); },
-            BSQLCommand::IngestFiles{ files, response } => {
+            SQLiteCommand::FilterPending { response } => { _ = response.send(self.filter_pending().await); },
+            SQLiteCommand::UpdateFileAccess { files, response } => { 
+                // Ask all the filters if they know anything about these files
+                let mut sub_results = vec![];
+                for channel in self.workers.values() {
+                    let (send, resp) = oneshot::channel();
+                    channel.send(FilterCommand::UpdateFileAccess { files: files.clone(), response: send }).await?;
+                    sub_results.push(resp);
+                }
+                _ = response.send(sub_results);
+            },
+            SQLiteCommand::IngestFiles{ files, response } => {
                 let mut batches: HashMap<FilterID, Vec<FileInfo>> = Default::default();
                 for (filter, info) in files {
                     match batches.entry(filter) {
@@ -182,14 +178,14 @@ impl BufferedSQLite {
                 for (filter, batch) in batches {
                     if let Some(channel) = self.workers.get(&filter) {
                         let (send, recv) = oneshot::channel();
-                        channel.send(BSQLCommand::IngestFiles0 { files: batch, response: send }).await?;
+                        channel.send(FilterCommand::IngestFiles { files: batch, response: send }).await?;
                         collectors.push(recv)
                     }
                 }
 
                 _ = response.send(collectors);
             },
-            BSQLCommand::CheckInsertStatus{ files, response } => {
+            SQLiteCommand::CheckInsertStatus{ files, response } => {
                 let mut batches: HashMap<FilterID, Vec<FileInfo>> = Default::default();
                 for (filter, info) in files {
                     match batches.entry(filter) {
@@ -202,24 +198,36 @@ impl BufferedSQLite {
                 for (filter, batch) in batches {
                     if let Some(channel) = self.workers.get(&filter) {
                         let (send, recv) = oneshot::channel();
-                        channel.send(BSQLCommand::CheckInsertStatus0 { files: batch, response: send }).await?;
+                        channel.send(FilterCommand::CheckInsertStatus { files: batch, response: send }).await?;
                         collectors.push(recv)
                     }
                 }
 
                 _ = response.send(collectors);
             }
-            other => {
-                if let Some(id) = other.get_id() {
-                    if let Some(channel) = self.workers.get(&id) {
-                        channel.send(other).await?;
-                    } else {
-                        other.error(ErrorKinds::FilterUnknown(id));
-                    }
-                };
-            }
+            SQLiteCommand::GetFileAccess { id, hash, response } => {
+                self.send_filter(id, FilterCommand::GetFileAccess { hash, response }).await
+            },
+            SQLiteCommand::SelectFileHashes { id, file_indices, access, response } => {
+                self.send_filter(id, FilterCommand::SelectFileHashes { file_indices, access, response }).await
+            },
+            SQLiteCommand::GetIngestBatch { id, limit, response } => {
+                self.send_filter(id, FilterCommand::GetIngestBatch { limit, response }).await
+            },
+            SQLiteCommand::FinishedIngest { id, files, response } => {
+                self.send_filter(id, FilterCommand::FinishedIngest { files, response }).await
+            },
         };
         Ok(())
+    }
+
+    async fn send_filter(&self, id: FilterID, command: FilterCommand) {
+        match self.workers.get(&id) {
+            Some(channel) => if let Err(err) = channel.send(command).await {
+                err.0.error(ErrorKinds::FilterUnknown(id));
+            },
+            None => _ = command.error(ErrorKinds::FilterUnknown(id)),
+        }
     }
 
     pub async fn create_filter(&mut self, name: FilterID, expiry: &ExpiryGroup) -> Result<()> {
@@ -238,7 +246,7 @@ impl BufferedSQLite {
         return Ok(())
     }
 
-    pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>, ErrorKinds> {
+    pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {
         let rows : Vec<(i64, )> = sqlx::query_as("SELECT id FROM filters WHERE ? <= expiry AND expiry <= ?")
             .bind(first.to_u32())
             .bind(last.to_u32())
@@ -246,59 +254,12 @@ impl BufferedSQLite {
         Ok(rows.into_iter().map(|(id, )|FilterID::from(id)).collect())
     }
 
-    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>, ErrorKinds> {
+    pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>> {
         let rows : Vec<(i64, u32)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
             .bind(first.to_u32())
             .bind(last.to_u32())
             .fetch_all(&self.db).await?;
         rows.into_iter().map(|(id, expiry)|Ok((FilterID::from(id), ExpiryGroup::from(expiry)))).collect()
-    }
-
-    pub async fn update_file_access(&self, files: Vec<FileInfo>) -> Result<IngestStatusBundle> {
-        // Ask all the filters if they know anything about these files
-        let mut sub_results = vec![];
-        for channel in self.workers.values() {
-            let (send, resp) = oneshot::channel();
-            channel.send(BSQLCommand::UpdateFileAccess { files: files.clone(), response: send }).await?;
-            sub_results.push(resp);
-        }
-
-        let mut files: HashSet<Sha256> = files.into_iter().map(|file|file.hash).collect();
-
-        // Collect the results
-        let mut unproc_ready = vec![];
-        let mut unproc_pending = vec![];
-        for resp in sub_results {
-            let IngestStatusBundle{ready, pending, ..} = resp.await??;
-            unproc_ready.push(ready);
-            unproc_pending.push(pending);
-        }
-
-        // Select the files that are ready
-        let mut output = IngestStatusBundle::default();
-        for ready in unproc_ready {
-            for hash in ready {
-                if files.remove(&hash) {
-                    output.ready.push(hash);
-                }
-            }
-        }
-
-        // Select the files that are pending
-        for pending in unproc_pending {
-            for (hash, id) in pending {
-                if files.remove(&hash) {
-                    output.pending.insert(hash, id);
-                }
-            }
-        }
-
-        // All the rest are missing
-        for hash in files {
-            output.missing.push(hash);
-        }
-
-        return Ok(output)
     }
 
     pub async fn delete_filter(&mut self, name: FilterID) -> Result<()> {
@@ -310,7 +271,7 @@ impl BufferedSQLite {
 
         if let Some(channel) = self.workers.remove(&name) {
             let (send, recv) = oneshot::channel();
-            channel.send(BSQLCommand::DeleteFilter { id: name, response: send }).await?;
+            channel.send(FilterCommand::DeleteFilter { response: send }).await?;
             recv.await??;
         }
 
@@ -345,7 +306,7 @@ struct FilterSQLWorker {
     expiry: ExpiryGroup,
     db: SqlitePool,
     directory: PathBuf,
-    channel: mpsc::Receiver<BSQLCommand>,
+    channel: mpsc::Receiver<FilterCommand>,
     filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>,
     filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>,
 }
@@ -353,7 +314,7 @@ struct FilterSQLWorker {
 
 impl FilterSQLWorker {
 
-    pub async fn new(database_directory: &Path, id: FilterID, expiry: ExpiryGroup, filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>, filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>) -> Result<mpsc::Sender<BSQLCommand>> {
+    pub async fn new(database_directory: &Path, id: FilterID, expiry: ExpiryGroup, filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>, filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>) -> Result<mpsc::Sender<FilterCommand>> {
 
         let directory = database_directory.join(id.to_string());
         tokio::fs::create_dir_all(&directory).await?;
@@ -446,19 +407,16 @@ impl FilterSQLWorker {
         }
     }
 
-    async fn handle_message(&mut self, message: BSQLCommand) -> Result<bool> {
+    async fn handle_message(&mut self, message: FilterCommand) -> Result<bool> {
         match message {
-            BSQLCommand::DeleteFilter { response, .. } => { _ = response.send(self.delete_filter().await); return Ok(true); },
-            BSQLCommand::GetFileAccess { id, hash, response } => { _ = response.send(self.get_file_access(id, &hash).await); },
-            BSQLCommand::CheckInsertStatus0 {files, response } => { _ = response.send(self.check_insert_status(files).await); },
-            BSQLCommand::IngestFiles0 { files, response } => { _ = response.send(self.ingest_files(files).await); },
-            BSQLCommand::SelectFileHashes { id, file_indices, access, response } => { _ = response.send(self.select_file_hashes(id, &file_indices, &access).await); },
-            BSQLCommand::GetIngestBatch { id, limit, response } => { _ = response.send(self.get_ingest_batch(id, limit).await); },
-            BSQLCommand::FinishedIngest { id, files, response } => { _ = response.send(self.finished_ingest(id, files).await); },
-            BSQLCommand::UpdateFileAccess { files, response } => { _ = response.send(self.update_file_access(files).await); },
-            _other => {
-                error!("Message in wrong place?");
-            }
+            FilterCommand::DeleteFilter { response, .. } => { _ = response.send(self.delete_filter().await); return Ok(true); },
+            FilterCommand::GetFileAccess { hash, response } => { _ = response.send(self.get_file_access(&hash).await); },
+            FilterCommand::CheckInsertStatus {files, response } => { _ = response.send(self.check_insert_status(files).await); },
+            FilterCommand::IngestFiles { files, response } => { _ = response.send(self.ingest_files(files).await); },
+            FilterCommand::SelectFileHashes { file_indices, access, response } => { _ = response.send(self.select_file_hashes(&file_indices, &access).await); },
+            FilterCommand::GetIngestBatch { limit, response } => { _ = response.send(self.get_ingest_batch(limit).await); },
+            FilterCommand::FinishedIngest { files, response } => { _ = response.send(self.finished_ingest(files).await); },
+            FilterCommand::UpdateFileAccess { files, response } => { _ = response.send(self.update_file_access(files).await); },
         };
         Ok(false)
     }
@@ -469,7 +427,7 @@ impl FilterSQLWorker {
         Ok(())
     }
 
-    pub async fn get_file_access(&self, _id: FilterID, hash: &Sha256) -> Result<Option<AccessControl>> {
+    pub async fn get_file_access(&self, hash: &Sha256) -> Result<Option<AccessControl>> {
         let row: Option<(String, )> = query_as(&format!("SELECT access FROM files WHERE hash = ?")).bind(hash.as_bytes()).fetch_optional(&self.db).await?;
 
         match row {
@@ -478,7 +436,7 @@ impl FilterSQLWorker {
         }
     }
 
-    pub async fn check_insert_status(&self, files: Vec<FileInfo>) -> Result<Vec<(FilterID, FileInfo, IngestStatus)>, ErrorKinds> {
+    pub async fn check_insert_status(&self, files: Vec<FileInfo>) -> Result<Vec<(FilterID, FileInfo, IngestStatus)>> {
         let mut conn = self.db.acquire().await?;
         let mut output = vec![];
         for file in files {
@@ -585,7 +543,7 @@ impl FilterSQLWorker {
     }
 
 
-    pub async fn select_file_hashes(&self, _id: FilterID, indices: &Vec<u64>, view: &HashSet<String>) -> Result<Vec<Sha256>> {
+    pub async fn select_file_hashes(&self, indices: &Vec<u64>, view: &HashSet<String>) -> Result<Vec<Sha256>> {
         let mut selected: Vec<Sha256> = vec![];
         let mut conn = self.db.acquire().await?;
         for file_id in indices {
@@ -601,7 +559,7 @@ impl FilterSQLWorker {
         return Ok(selected)
     }
 
-    pub async fn get_ingest_batch(&self, _id: FilterID, limit: u32) -> Result<Vec<(u64, Sha256)>> {
+    pub async fn get_ingest_batch(&self, limit: u32) -> Result<Vec<(u64, Sha256)>> {
         let row: Vec<(i64, Vec<u8>)> = sqlx::query_as(&format!("SELECT number, hash FROM files WHERE ingested = FALSE ORDER BY number LIMIT {limit}"))
         .fetch_all(&self.db).await?;
 
@@ -612,14 +570,14 @@ impl FilterSQLWorker {
         return Ok(output)
     }
 
-    pub async fn finished_ingest(&self, id: FilterID, files: Vec<(u64, Sha256)>) -> Result<f64> {
+    pub async fn finished_ingest(&self, files: Vec<(u64, Sha256)>) -> Result<f64> {
         let stamp = std::time::Instant::now();
         let mut transaction = self.db.begin().await?;
         for (number, _) in &files {
             sqlx::query("UPDATE files SET ingested = TRUE WHERE number = ?").bind(*number as i64).execute(&mut transaction).await?;
         }
         let mut pending = self.filter_pending.write().await;
-        if let Some(pending) = pending.get_mut(&id) {
+        if let Some(pending) = pending.get_mut(&self.id) {
             for (_, hash) in files {
                 pending.remove(&hash);
             }

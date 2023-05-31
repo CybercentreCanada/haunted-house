@@ -22,6 +22,8 @@ pub enum ErrorKinds {
     JoinError,
     IOError(String),
     ChannelError(String),
+    CouldNotParseAccessString(String, String),
+    CouldNotParseAccessStringTrailing(String, String),
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -84,5 +86,11 @@ impl From<tokio::sync::oneshot::error::RecvError> for ErrorKinds {
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ErrorKinds {
     fn from(value: tokio::sync::mpsc::error::SendError<T>) -> Self {
         Self::ChannelError(value.to_string())
+    }
+}
+
+impl poem::error::ResponseError for ErrorKinds {
+    fn status(&self) -> http::StatusCode {
+        http::StatusCode::INTERNAL_SERVER_ERROR
     }
 }
