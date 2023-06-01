@@ -149,6 +149,30 @@ impl TrigramCache {
     }
 }
 
+#[cfg(test)]
+pub (crate) fn build_buffer(data: &[u8]) -> Result<SparseBits> {
+    // Prepare accumulators
+    let mut output = SparseBits::new();
+
+    if data.len() < 3 {
+        return Ok(output)
+    }
+
+    // Initialize trigram
+    let mut trigram: u32 = (data[0] as u32) << 8 | (data[1] as u32);
+
+    for (byte_index, byte) in data[2..].iter().enumerate() {
+        trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+        output.insert(trigram);
+        if byte_index % 16000 == 0 {
+            output.compact();
+        }
+    }
+    output.compact();
+
+    return Ok(output)
+}
+
 
 async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>) -> Result<SparseBits> {
     // Prepare accumulators

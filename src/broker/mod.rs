@@ -772,11 +772,12 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
     let mut result_stream = {
         let (client_sender, result_stream) = mpsc::channel(128);
-        for (_worker, address) in &core.config.workers {
+        for (worker, address) in &core.config.workers {
             let address = address.websocket("/search/filter")?;
             let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(address, None, false, Some(core.ws_connector.clone())).await?;
             let client_sender = client_sender.clone();
             let request_body = request_body.clone();
+            let worker = worker.clone();
             tokio::spawn(async move {
                 if let Err(err) = socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await {
                     _ = client_sender.send(FilterSearchResponse::Error(format!("connection error: {err}")));
@@ -794,8 +795,11 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                         },
                         Err(err) => FilterSearchResponse::Error(format!("message error: {err}")),
                     };
-                    _ = client_sender.send(message);
+                    if let Err(err) = client_sender.send(message).await {
+                        error!("search worker connection error: {err}");
+                    }
                 }
+                info!("Finished listening to: {worker}")
             });
         }
         result_stream
@@ -834,6 +838,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                     None => break,
                 };
 
+                info!("Search progress: {message:?}");
                 match message {
                     FilterSearchResponse::Candidates(hashes) => { candidates.insert_batch(&hashes).await?; },
                     FilterSearchResponse::Error(error) => { errors.push(error); },

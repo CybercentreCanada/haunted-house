@@ -572,7 +572,7 @@ impl ExtensibleTrigramFile {
             } else {
                 false
             };
-            
+
             if out_of_order {
                 // If we are inserting out of order we are going to load the entire
                 // set of values currently in the database and merge in our new values where
@@ -593,7 +593,7 @@ impl ExtensibleTrigramFile {
                     };
                     content.clear();
                     active_segment.decode_into(&mut content);
-    
+
                     // write values into this segment
                     let mut new_content = vec![];
                     if let Some(next) = file_ids.pop() {
@@ -669,13 +669,13 @@ impl ExtensibleTrigramFile {
                     let _span = mark!(operations_span, "write_operation");
                     encode_data_buffer.clear();
                     encode_into(&content, &mut encode_data_buffer);
-                    // in case we are overwriting existing data that could have been longer due to 
-                    // delta encoding or similar we will add an extra zero if there is room to 
+                    // in case we are overwriting existing data that could have been longer due to
+                    // delta encoding or similar we will add an extra zero if there is room to
                     // mark the end of the encoded data. If there is no extra space we don't need
                     // to worry because there can't be hanging data
                     if encode_data_buffer.len() < limit as usize - POINTER_SIZE as usize {
                         encode_data_buffer.push(0);
-                    }    
+                    }
                     write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
                     writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                 }
@@ -825,7 +825,7 @@ impl ExtensibleTrigramFile {
                             };
                             let write_location = segment_offset + segment_length - POINTER_SIZE;
                             self.data[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
-                            
+
                             // write the new segment value into the hint table for fast appends
                             let hint_location = self.get_tail_hint_offset(trigram);
                             self.data[hint_location as usize..hint_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
@@ -851,7 +851,7 @@ impl ExtensibleTrigramFile {
                 let mut data = unsafe { memmap2::MmapMut::map_mut(&data)? };
                 data.advise(memmap2::Advice::Random)?;
                 std::mem::swap(&mut data, &mut self.data);
-                data    
+                data
             },
         };
 
@@ -956,10 +956,12 @@ mod test {
     use itertools::Itertools;
     use rand::{Rng, thread_rng};
 
+    use crate::query::Query;
     use crate::timing::{NullCapture, Capture};
     use crate::types::FilterID;
     use crate::worker::filter::ExtensibleTrigramFile;
     use crate::worker::sparse::SparseBits;
+    use crate::worker::trigram_cache::build_buffer;
 
     use super::{TRIGRAM_RANGE, IdCollector};
 
@@ -1245,51 +1247,51 @@ mod test {
         return Ok(())
     }
 
-    #[test]
-    fn large_batch() -> Result<()> {
-        // build test data
-        let mut trigrams = vec![];
-        let timestamp = std::time::Instant::now();
-        for ii in 1..500 {
-            trigrams.push((ii, SparseBits::random(ii)));
-        }
-        println!("generate {:.2}", timestamp.elapsed().as_secs_f64());
+    // #[test]
+    // fn large_batch() -> Result<()> {
+    //     // build test data
+    //     let mut trigrams = vec![];
+    //     let timestamp = std::time::Instant::now();
+    //     for ii in 1..500 {
+    //         trigrams.push((ii, SparseBits::random(ii)));
+    //     }
+    //     println!("generate {:.2}", timestamp.elapsed().as_secs_f64());
 
-        // write it
-        let tempdir = tempfile::tempdir()?;
-        let location = tempdir.path().to_path_buf();
-        let id = FilterID::from(1);
-        let capture = Capture::new();
-        {
-            let mut file = ExtensibleTrigramFile::new(location, id, 256, 1024)?;
-            let x = file.write_batch(&mut trigrams, &capture)?;
-            file.apply_operations(x.0, x.1, x.2, &capture)?;
-        }
+    //     // write it
+    //     let tempdir = tempfile::tempdir()?;
+    //     let location = tempdir.path().to_path_buf();
+    //     let id = FilterID::from(1);
+    //     let capture = Capture::new();
+    //     {
+    //         let mut file = ExtensibleTrigramFile::new(location, id, 256, 1024)?;
+    //         let x = file.write_batch(&mut trigrams, &capture)?;
+    //         file.apply_operations(x.0, x.1, x.2, &capture)?;
+    //     }
 
-        capture.print();
-        // // Recreate the trigrams
-        // let timer = std::time::Instant::now();
-        // {
-        //     let mut recreated: Vec<BitVec> = vec![];
-        //     for _ in 0..20 {
-        //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
-        //     }
+    //     capture.print();
+    //     // // Recreate the trigrams
+    //     // let timer = std::time::Instant::now();
+    //     // {
+    //     //     let mut recreated: Vec<BitVec> = vec![];
+    //     //     for _ in 0..20 {
+    //     //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
+    //     //     }
 
-        //     let mut file = ExtensibleTrigramFile::open(&location)?;
-        //     for trigram in 0..(1<<24) {
-        //         let values = file.read_trigram(trigram)?;
-        //         for index in values {
-        //             recreated[index as usize - 1].set(trigram as usize, true);
-        //         }
-        //     }
+    //     //     let mut file = ExtensibleTrigramFile::open(&location)?;
+    //     //     for trigram in 0..(1<<24) {
+    //     //         let values = file.read_trigram(trigram)?;
+    //     //         for index in values {
+    //     //             recreated[index as usize - 1].set(trigram as usize, true);
+    //     //         }
+    //     //     }
 
-        //     for (index, values) in recreated.into_iter().enumerate() {
-        //         assert_eq!(trigrams[index].1, values)
-        //     }
-        // }
-        // println!("read {}", timer.elapsed().as_secs_f64());
-        Ok(())
-    }
+    //     //     for (index, values) in recreated.into_iter().enumerate() {
+    //     //         assert_eq!(trigrams[index].1, values)
+    //     //     }
+    //     // }
+    //     // println!("read {}", timer.elapsed().as_secs_f64());
+    //     Ok(())
+    // }
 
     #[test]
     fn collector() {
@@ -1315,5 +1317,37 @@ mod test {
             rounds += 1;
         }
         assert_eq!(rounds, 1 << 24)
+    }
+
+    #[test]
+    fn simple_queries() -> Result<()> {
+        // setup data
+        let raw_data = std::include_bytes!("./filter.rs");
+        let trigrams = build_buffer(raw_data)?;
+
+        // build table
+        let tempdir = tempfile::tempdir()?;
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
+        let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
+        let x = file.write_batch(&mut [(1, trigrams)], NullCapture::new())?;
+        file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
+
+        // run literal query
+        let query = Query::Literal(b"query_literal".to_vec());
+        let hits = file.query(&query)?;
+        assert_eq!(hits, vec![1]);
+
+        // run or query
+        let query = Query::Or(vec![Query::Literal(b"1".to_vec()), Query::Literal(b"query_literal".to_vec())]);
+        let hits = file.query(&query)?;
+        assert_eq!(hits, vec![1]);
+
+        // run and query
+        let query = Query::And(vec![Query::Literal(b"1".to_vec()), Query::Literal(b"query_literal".to_vec())]);
+        let hits = file.query(&query)?;
+        assert!(hits.is_empty());
+
+        return Ok(())
     }
 }

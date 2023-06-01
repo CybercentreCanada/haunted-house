@@ -52,6 +52,15 @@ pub enum FilterSearchResponse {
     Error(String),
 }
 
+impl std::fmt::Debug for FilterSearchResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Candidates(arg0) => f.debug_tuple("Candidates").field(&arg0.len()).finish(),
+            Self::Error(arg0) => f.debug_tuple("Error").field(arg0).finish(),
+        }
+    }
+}
+
 #[handler]
 async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> impl IntoResponse {
     let state = state.clone();
@@ -97,7 +106,7 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
         let mut counter = 0;
         while let Some(message) = recv.recv().await {
             counter += 1;
-            info!("search {}/{}", counter, filter_ids.len());
+            info!("search {}/{} {:?}", counter, filter_ids.len(), message);
             _ = socket.send(Message::Text(serde_json::to_string(&message).unwrap())).await;
         }
         info!("Finished");
@@ -207,6 +216,35 @@ async fn get_ready_status(state: Data<&Arc<WorkerState>>) -> poem::http::StatusC
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct StorageStatus {
+    capacity: u64,
+    high_water: u64,
+    used: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DetailedStatus {
+    filters: Vec<(FilterID, ExpiryGroup, u64)>,
+    storage: StorageStatus
+}
+
+#[handler]
+async fn get_detail_status(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<DetailedStatus>> {
+    // Collect filter info
+    let filter_expiry = state.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
+    let filter_size = state.database.filter_sizes().await?;
+    let mut filters = vec![];
+    for (filter, expiry) in filter_expiry {
+        filters.push((filter, expiry, *filter_size.get(&filter).unwrap_or(&0)));
+    }
+
+    Ok(Json(DetailedStatus {
+        filters,
+        storage: state.storage_status().await?
+    }))
+}
+
 pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<WorkerState>, exit: Arc<tokio::sync::Notify>) -> anyhow::Result<()> {
     let app = Route::new()
         .at("/index/create", put(create_index))
@@ -217,6 +255,7 @@ pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<
         .at("/files/ingest-queues", get(list_ingest_files))
         .at("/status/online", get(get_online_status))
         .at("/status/ready", get(get_ready_status))
+        .at("/status/detail", get(get_detail_status))
         .data(state)
         .with(LoggerMiddleware);
 
