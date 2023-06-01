@@ -7,7 +7,6 @@
 - configuration env variable substitution
 
 ## Important
-- turn garbage collection back on
 - search progress
 
 ## Nice to have/performance

@@ -73,6 +73,10 @@ impl ExpiryGroup {
         ExpiryGroup::create(&Some(Utc::now()))
     }
 
+    pub fn yesterday() -> ExpiryGroup {
+        ExpiryGroup::create(&Some(Utc::now() - chrono::Duration::days(1)))
+    }
+
     pub fn from(data: u32) -> Self {
         Self(data)
     }

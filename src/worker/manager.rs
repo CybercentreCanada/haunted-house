@@ -1,6 +1,7 @@
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use anyhow::{Result, Context};
+use chrono::DurationRound;
 use log::{debug, info, error};
 use tokio::sync::{mpsc, watch, Notify, oneshot};
 
@@ -70,6 +71,7 @@ impl WorkerState {
         for id in to_delete {
             new.delete_index(id).await.context("expiry")?;
         }
+        tokio::spawn(new.clone().garbage_collector());
 
         Ok(new)
     }
@@ -95,6 +97,27 @@ impl WorkerState {
         tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
         filters.insert(id, (worker, notify, send_running));
         return Ok(())
+    }
+
+    async fn garbage_collector(self: Arc<Self>) {
+        while let Err(err) = self._garbage_collector().await {
+            error!("Garbage collector error: {err}");
+        }
+    }
+
+    async fn _garbage_collector(&self) -> Result<()> {
+        let day: chrono::Duration = chrono::Duration::days(1);
+        loop {
+            // get all filters
+            for filter in self.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::yesterday()).await? {
+                self.delete_index(filter).await?;
+            }
+
+            // wait for next run
+            let tomorrow = chrono::Utc::now().duration_trunc(day)? + day;
+            let delay = tomorrow - chrono::Utc::now();
+            tokio::time::sleep(delay.to_std()?).await;
+        }
     }
 
     pub async fn delete_index(&self, id: FilterID) -> Result<()> {
