@@ -365,11 +365,11 @@ impl WorkerState {
             match filter.query(query).await {
                 Ok(file_indices) => {
                     match self.database.select_file_hashes(id, &file_indices, &access).await {
-                        Ok(files) => { _ = respond.send(FilterSearchResponse::Candidates(files)).await; },
-                        Err(err) => { _ = respond.send(FilterSearchResponse::Error(err.to_string())).await; }
+                        Ok(files) => { _ = respond.send(FilterSearchResponse::Candidates(id, files)).await; },
+                        Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())).await; }
                     };
                 }
-                Err(err) => { _ = respond.send(FilterSearchResponse::Error(err.to_string())); },
+                Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())); },
             };
         }
     }

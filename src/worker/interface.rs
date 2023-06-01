@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context};
 use futures::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error};
 use poem::web::websocket::{WebSocket, Message};
 use poem::{handler, Route, get, EndpointExt, Server, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
@@ -48,15 +48,17 @@ pub struct FilterSearchRequest {
 
 #[derive(Serialize, Deserialize)]
 pub enum FilterSearchResponse {
-    Candidates(Vec<Sha256>),
-    Error(String),
+    Filters(Vec<FilterID>),
+    Candidates(FilterID, Vec<Sha256>),
+    Error(Option<FilterID>, String),
 }
 
 impl std::fmt::Debug for FilterSearchResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Candidates(arg0) => f.debug_tuple("Candidates").field(&arg0.len()).finish(),
-            Self::Error(arg0) => f.debug_tuple("Error").field(arg0).finish(),
+            Self::Filters(items) => f.debug_tuple("Filters").field(&items.len()).finish(),
+            Self::Candidates(filter, items) => f.debug_tuple("Candidates").field(filter).field(&items.len()).finish(),
+            Self::Error(filter, error) => f.debug_tuple("Error").field(filter).field(error).finish(),
         }
     }
 }
@@ -90,6 +92,8 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
                 return
             }
         };
+        let message = serde_json::to_string(&FilterSearchResponse::Filters(filter_ids.clone())).unwrap();
+        socket.send(Message::Text(message)).await.unwrap();
 
         // Dispatch a query to each of those filters
         let mut recv = {
@@ -103,13 +107,12 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
         };
 
         // Collect the results
-        let mut counter = 0;
-        while let Some(message) = recv.recv().await {
-            counter += 1;
-            info!("search {}/{} {:?}", counter, filter_ids.len(), message);
-            _ = socket.send(Message::Text(serde_json::to_string(&message).unwrap())).await;
+        while let Some(mut message) = recv.recv().await {
+            _ = socket.send(Message::Text(match serde_json::to_string(&message) {
+                Ok(message) => message,
+                Err(_) => continue
+            })).await;
         }
-        info!("Finished");
         _ = socket.close().await;
     })
 }

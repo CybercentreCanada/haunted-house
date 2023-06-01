@@ -810,7 +810,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
             let worker = worker.clone();
             tokio::spawn(async move {
                 if let Err(err) = socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await {
-                    _ = client_sender.send(FilterSearchResponse::Error(format!("connection error: {err}")));
+                    _ = client_sender.send((worker.clone(), FilterSearchResponse::Error(None, format!("connection error: {err}"))));
                 }
 
                 while let Some(message) = socket.next().await {
@@ -818,14 +818,14 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                         Ok(message) => if let Message::Text(text) = message {
                             match serde_json::from_str(&text) {
                                 Ok(message) => message,
-                                Err(err) => FilterSearchResponse::Error(format!("decode error: {err}")),
+                                Err(err) => FilterSearchResponse::Error(None, format!("decode error: {err}")),
                             }
                         } else {
                             continue
                         },
-                        Err(err) => FilterSearchResponse::Error(format!("message error: {err}")),
+                        Err(err) => FilterSearchResponse::Error(None, format!("message error: {err}")),
                     };
-                    if let Err(err) = client_sender.send(message).await {
+                    if let Err(err) = client_sender.send((worker.clone(), message)).await {
                         error!("search worker connection error: {err}");
                     }
                 }
@@ -837,6 +837,8 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
     // Absorb messages from the workers until we have them all
     let mut errors = vec![];
+    let mut complete: HashMap<WorkerID, HashSet<FilterID>> = Default::default();
+    let mut initial: HashMap<WorkerID, Vec<FilterID>> = Default::default();
     let candidates = SqliteSet::<Sha256>::new_temp().await?;
     loop {
         tokio::select!{
@@ -849,6 +851,17 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
                 match message {
                     SearcherMessage::Status(response) => {
+                        // Collect our progress for each worker's filtering
+                        let mut workers = HashMap::new();
+                        for (worker, initial) in &initial {
+                            let complete = match complete.get(worker){
+                                Some(complete) => complete.len() as u32,
+                                None => 0,
+                            };
+                            workers.insert(worker.clone(), (complete, initial.len() as u32));
+                        }
+
+                        // Send a summary of our progress on this search
                         _ = response.send(InternalSearchStatus {
                             view: status.view.clone(),
                             resp: SearchRequestResponse {
@@ -856,22 +869,38 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 finished: false,
                                 errors: errors.clone(),
                                 hits: vec![],
-                                truncated: false
+                                truncated: false,
+                                progress: interface::SearchProgress::Filtering { workers }
                             }
                         });
                     },
                 }
             },
             message = result_stream.recv() => {
-                let message = match message {
+                let (worker, message) = match message {
                     Some(message) => message,
                     None => break,
                 };
 
                 info!("Search progress: {message:?}");
                 match message {
-                    FilterSearchResponse::Candidates(hashes) => { candidates.insert_batch(&hashes).await?; },
-                    FilterSearchResponse::Error(error) => { errors.push(error); },
+                    FilterSearchResponse::Filters(items) => { initial.insert(worker, items); },
+                    FilterSearchResponse::Candidates(filter, hashes) => {
+                        candidates.insert_batch(&hashes).await?;
+                        match complete.entry(worker) {
+                            hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(filter); },
+                            hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([filter])); },
+                        }
+                    },
+                    FilterSearchResponse::Error(filter, error) => {
+                        errors.push(error);
+                        if let Some(filter) = filter {
+                            match complete.entry(worker) {
+                                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(filter); },
+                                hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([filter])); },
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -879,6 +908,8 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
     // Run through yara jobs
     info!("Search {code}: Yara");
+    let initial_total = candidates.len().await? as u32;
+
     let mut hits: BTreeSet<Sha256> = Default::default();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
     let mut next_batch = None;
@@ -916,7 +947,11 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 finished: false,
                                 errors: errors.clone(),
                                 hits: hits.iter().cloned().map(|x|x.hex()).collect(),
-                                truncated: false
+                                truncated: false,
+                                progress: interface::SearchProgress::Yara {
+                                    total: initial_total,
+                                    queued: candidates.len().await? as u32
+                                }
                             }
                         });
                     },

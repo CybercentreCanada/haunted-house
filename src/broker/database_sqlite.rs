@@ -11,7 +11,7 @@ use crate::access::AccessControl;
 use crate::query::Query;
 use crate::types::{ExpiryGroup, Sha256};
 
-use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestResponse};
+use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestResponse, SearchProgress};
 
 pub struct SQLiteInterface {
     db: SqlitePool,
@@ -188,6 +188,11 @@ impl SQLiteInterface {
                 resp: SearchRequestResponse {
                     code: record.code,
                     finished: record.finished,
+                    progress: if record.finished {
+                        SearchProgress::Finished
+                    } else {
+                        SearchProgress::Unknown
+                    },
                     errors: record.errors,
                     hits: record.hit_files.into_iter().map(|hash|hash.hex()).collect(),
                     truncated: record.truncated,

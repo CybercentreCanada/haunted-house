@@ -34,6 +34,7 @@ async def main(yara_file, access, verify):
         while not search_status.finished:
             await asyncio.sleep(1)
             search_status = await client.search_status(search_status.code, access)
+            print(search_status.progress)
 
         if search_status.errors:
             print(search_status.errors)

@@ -15,9 +15,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::{Python, PyAny, Py, FromPyObject};
 #[cfg(feature = "python")]
 use pyo3::types::{PyTuple, PyBytes};
-use reqwest_middleware::ClientWithMiddleware;
-use reqwest_retry::RetryTransientMiddleware;
-use reqwest_retry::policies::ExponentialBackoff;
+// use reqwest_middleware::ClientWithMiddleware;
+// use reqwest_retry::RetryTransientMiddleware;
+// use reqwest_retry::policies::ExponentialBackoff;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;

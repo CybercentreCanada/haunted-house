@@ -147,6 +147,19 @@ impl IngestInterface {
     }
 }
 
+#[derive(Serialize)]
+pub enum SearchProgress {
+    Unknown,
+    Filtering {
+        workers: HashMap<WorkerID, (u32, u32)>
+    },
+    Yara {
+        total: u32,
+        queued: u32,
+    },
+    Finished
+}
+
 
 #[serde_as]
 #[derive(Deserialize)]
@@ -171,9 +184,7 @@ pub struct SearchRequestResponse {
     pub code: String,
     pub finished: bool,
     pub errors: Vec<String>,
-    // pub total_indices: u64,
-    // pub pending_indices: u64,
-    // pub pending_candidates: u64,
+    pub progress: SearchProgress,
     pub hits: Vec<String>,
     pub truncated: bool,
 }

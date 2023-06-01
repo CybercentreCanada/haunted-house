@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+import typing
 
 import arrow
 import aiohttp
@@ -26,14 +27,11 @@ class DuplicateToken(KeyError):
 
 class SearchStatus(pydantic.BaseModel):
     code: str
-    # group: str
     finished: bool
     errors: list[str]
-    # total_indices: int
-    # pending_indices: int
-    # pending_candidates: int
     hits: list[str]
     truncated: bool
+    progress: typing.Any
 
 
 class Client:

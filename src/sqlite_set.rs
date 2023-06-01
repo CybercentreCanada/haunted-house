@@ -126,6 +126,12 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         }
         return Ok(output);
     }
+
+    pub async fn len(&self) -> Result<u64> {
+        let query_str = "SELECT count(1) FROM dataset";
+        let (hits, ): (i64, ) = sqlx::query_as(&query_str).fetch_one(&self.db).await?;
+        return Ok(hits as u64)
+    }
 }
 
 #[cfg(test)]
