@@ -14,7 +14,7 @@ use super::YaraTask;
 use super::database::{IngestStatus, Database, IngestStatusBundle};
 use super::filter::ExtensibleTrigramFile;
 use super::filter_worker::{FilterWorker, WriterCommand};
-use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse};
+use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse, StorageStatus};
 use super::trigram_cache::TrigramCache;
 
 pub struct WorkerState {
@@ -128,6 +128,11 @@ impl WorkerState {
     }
 
     pub async fn check_storage_pressure(&self) -> Result<bool> {
+        let total = self.get_used_storage().await?;
+        return Ok(total >= self.config.data_limit - self.config.data_reserve)
+    }
+
+    pub async fn get_used_storage(&self) -> Result<u64> {
         let mut total = 0u64;
         let mut dirs = vec![self.config.data_path.clone()];
         while let Some(dir) = dirs.pop() {
@@ -146,7 +151,15 @@ impl WorkerState {
             }
         }
 
-        return Ok(total >= self.config.data_limit - self.config.data_reserve)
+        return Ok(total)
+    }
+
+    pub (crate) async fn storage_status(&self) -> Result<StorageStatus> {
+        Ok(StorageStatus{
+            capacity: self.config.data_limit,
+            high_water: self.config.data_limit - self.config.data_reserve,
+            used: self.get_used_storage().await?,
+        })
     }
 
     pub async fn ingest_file(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {

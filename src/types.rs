@@ -155,7 +155,7 @@ impl FilterID {
 // }
 
 
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 pub struct WorkerID(String);
 
 impl From<String> for WorkerID {

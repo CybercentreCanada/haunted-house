@@ -26,6 +26,7 @@ use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
 use crate::query::Query;
 use crate::types::{FileInfo, Sha256, ExpiryGroup, WorkerID, FilterID};
+use crate::worker::interface::StorageStatus;
 
 use super::{HouseCore, IngestTask, IngestCheckStatus, IngestWatchStatus};
 use super::auth::Role;
@@ -364,11 +365,13 @@ async fn get_status() -> Result<()> {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct StatusReport {
+pub (crate) struct StatusReport {
     pub ingest_check: IngestCheckStatus,
     pub ingest_watchers: HashMap<WorkerID, HashMap<FilterID, IngestWatchStatus>>,
     pub active_searches: u32,
     pub pending_tasks: HashMap<String, u32>,
+    pub filters: Vec<(String, WorkerID, FilterID, u64)>,
+    pub storage: HashMap<WorkerID, StorageStatus>,
 }
 
 #[handler]

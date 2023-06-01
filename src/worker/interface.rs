@@ -217,16 +217,16 @@ async fn get_ready_status(state: Data<&Arc<WorkerState>>) -> poem::http::StatusC
 }
 
 #[derive(Serialize, Deserialize)]
-struct StorageStatus {
-    capacity: u64,
-    high_water: u64,
-    used: u64,
+pub (crate) struct StorageStatus {
+    pub capacity: u64,
+    pub high_water: u64,
+    pub used: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct DetailedStatus {
-    filters: Vec<(FilterID, ExpiryGroup, u64)>,
-    storage: StorageStatus
+pub (crate) struct DetailedStatus {
+    pub filters: Vec<(ExpiryGroup, FilterID, u64)>,
+    pub storage: StorageStatus
 }
 
 #[handler]
@@ -236,7 +236,7 @@ async fn get_detail_status(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
     let filter_size = state.database.filter_sizes().await?;
     let mut filters = vec![];
     for (filter, expiry) in filter_expiry {
-        filters.push((filter, expiry, *filter_size.get(&filter).unwrap_or(&0)));
+        filters.push((expiry, filter, *filter_size.get(&filter).unwrap_or(&0)));
     }
 
     Ok(Json(DetailedStatus {

@@ -252,7 +252,19 @@ impl HouseCore {
         self.database.search_status(&code).await
     }
 
-    pub async fn status(self: &Arc<Self>) -> Result<StatusReport> {
+    pub (crate) async fn status(self: &Arc<Self>) -> Result<StatusReport> {
+        // Send requests to workers for details we want from them
+        let mut queries = JoinSet::new();
+        for (worker, worker_address) in self.config.workers.clone() {
+            let request = self.client.get(worker_address.http("/status/detail")?)
+            .header("Content-Type", "application/json")
+            .send();
+            queries.spawn(async move {
+                (worker, request.await)
+            });
+        }
+
+        // Request data from internal components
         let (ingest_send, ingest_recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::Status(ingest_send))?;
 
@@ -271,6 +283,7 @@ impl HouseCore {
             }
         }
 
+        // Read out data from the directly reachable data tables
         let active_searches = {
             self.running_searches.read().await.len() as u32
         };
@@ -280,11 +293,28 @@ impl HouseCore {
             pending_tasks.insert(group.to_string(), queue.len() as u32);
         }
 
+        // gather responses from the workers
+        let mut filters = vec![];
+        let mut storage = HashMap::new();
+        while let Some(response) = queries.join_next().await {
+            let (worker, response) = response?;
+            let response = response?;
+            let body: crate::worker::interface::DetailedStatus = response.json().await?;
+            storage.insert(worker.clone(), body.storage);
+            for (expiry, filter, size) in body.filters {
+                filters.push((expiry.to_string(), worker.clone(), filter, size));
+            }
+        }
+        filters.sort_unstable();
+
+        // combine info
         Ok(StatusReport{
             pending_tasks,
             ingest_check: ingest_recv.await?,
             active_searches,
-            ingest_watchers
+            ingest_watchers,
+            filters,
+            storage,
         })
     }
 
