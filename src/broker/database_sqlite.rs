@@ -188,11 +188,8 @@ impl SQLiteInterface {
                 resp: SearchRequestResponse {
                     code: record.code,
                     finished: record.finished,
-                    progress: if record.finished {
-                        SearchProgress::Finished
-                    } else {
-                        SearchProgress::Unknown
-                    },
+                    phase: if record.finished { SearchProgress::Finished } else { SearchProgress::Unknown },
+                    progress: (0, 1),
                     errors: record.errors,
                     hits: record.hit_files.into_iter().map(|hash|hash.hex()).collect(),
                     truncated: record.truncated,

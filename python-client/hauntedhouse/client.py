@@ -7,7 +7,6 @@ import typing
 import arrow
 import aiohttp
 import requests
-import json
 import pydantic
 from assemblyline.common.classification import Classification
 from mquery_query_lib import yaraparse
@@ -21,6 +20,10 @@ class IngestError(RuntimeError):
     ...
 
 
+class CouldNotParseRule(ValueError):
+    ...
+
+
 class DuplicateToken(KeyError):
     ...
 
@@ -31,7 +34,8 @@ class SearchStatus(pydantic.BaseModel):
     errors: list[str]
     hits: list[str]
     truncated: bool
-    progress: typing.Any
+    phase: str
+    progress: tuple[int, int]
 
 
 class Client:
@@ -263,7 +267,9 @@ def query_from_yara(yara_rule: str) -> str:
     if len(rules) == 0:
         raise ValueError("A yara rule couldn't be found")
     elif len(rules) == 1:
-        return rules[0].parse().query
+        query = rules[0].parse().query
+        if not query or query == '{}':
+            raise CouldNotParseRule()
+        return query
     else:
         raise ValueError("Only a single yara rule expected")
-

@@ -21,7 +21,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::broker::interface::SearchRequestResponse;
+use crate::broker::interface::{SearchRequestResponse, SearchProgress};
 use crate::config::{CoreConfig, WorkerAddress, WorkerTLSConfig};
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
@@ -852,13 +852,15 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                 match message {
                     SearcherMessage::Status(response) => {
                         // Collect our progress for each worker's filtering
-                        let mut workers = HashMap::new();
+                        // let mut workers = HashMap::new();
+                        let mut total: u64 = 0;
+                        let mut done: u64 = 0;
                         for (worker, initial) in &initial {
-                            let complete = match complete.get(worker){
-                                Some(complete) => complete.len() as u32,
+                            done += match complete.get(worker){
+                                Some(complete) => complete.len() as u64,
                                 None => 0,
                             };
-                            workers.insert(worker.clone(), (complete, initial.len() as u32));
+                            total += initial.len() as u64;
                         }
 
                         // Send a summary of our progress on this search
@@ -870,7 +872,8 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 errors: errors.clone(),
                                 hits: vec![],
                                 truncated: false,
-                                progress: interface::SearchProgress::Filtering { workers }
+                                progress: (done, total),
+                                phase: SearchProgress::Filtering,
                             }
                         });
                     },
@@ -908,7 +911,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
     // Run through yara jobs
     info!("Search {code}: Yara");
-    let initial_total = candidates.len().await? as u32;
+    let initial_total = candidates.len().await? as u64;
 
     let mut hits: BTreeSet<Sha256> = Default::default();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
@@ -948,10 +951,8 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 errors: errors.clone(),
                                 hits: hits.iter().cloned().map(|x|x.hex()).collect(),
                                 truncated: false,
-                                progress: interface::SearchProgress::Yara {
-                                    total: initial_total,
-                                    queued: candidates.len().await? as u32
-                                }
+                                progress: (initial_total, candidates.len().await? as u64),
+                                phase: SearchProgress::Yara,
                             }
                         });
                     },
