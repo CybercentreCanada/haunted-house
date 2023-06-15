@@ -72,12 +72,14 @@ enum Commands {
 fn load_config(path: Option<PathBuf>) -> Result<crate::config::Config> {
     let config = path.unwrap_or(PathBuf::from("./config.json"));
     let config_body = std::fs::read_to_string(config)?;
+    let config_body = config::apply_env(&config_body)?;
     Ok(serde_json::from_str(&config_body)?)
 }
 
 fn load_worker_config(path: Option<PathBuf>) -> Result<crate::config::WorkerConfig> {
     let config = path.unwrap_or(PathBuf::from("./config.json"));
     let config_body = std::fs::read_to_string(config)?;
+    let config_body = config::apply_env(&config_body)?;
     Ok(serde_json::from_str(&config_body)?)
 }
 

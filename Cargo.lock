@@ -1617,6 +1617,7 @@ dependencies = [
  "pyo3-asyncio",
  "pyo3-log",
  "rand 0.8.5",
+ "regex",
  "reqwest",
  "reqwest-middleware",
  "reqwest-retry",
