@@ -15,7 +15,7 @@ async def main(verify):
     async with aiohttp.ClientSession(headers={'Authorization': 'Bearer ' + HAUNTED_HOUSE_API_KEY}) as session:
         async with session.get(HAUNTED_HOUSE_URL + "/status/detailed", verify_ssl=verify) as resp:
             resp.raise_for_status()
-            pprint(await resp.json())
+            pprint(await resp.json(), width=100)
 
 
 if __name__ == '__main__':

@@ -38,9 +38,9 @@ impl BlobHandle {
         &self.data.id
     }
 
-    pub fn open(&self) -> Result<std::fs::File> {
-        Ok(self.data.file.reopen()?)
-    }
+    // pub fn open(&self) -> Result<std::fs::File> {
+    //     Ok(self.data.file.reopen()?)
+    // }
 
     #[cfg(test)]
     pub async fn read_all(&self) -> Result<Vec<u8>> {
@@ -51,23 +51,23 @@ impl BlobHandle {
         Arc::strong_count(&self.data)
     }
 
-    pub async fn resize(&self, new_size: u64) -> Result<u64> {
-        let (send, recv) = oneshot::channel();
-        _ = self.data.connection.send(BlobCacheCommand::Resize(self.data.id.clone(), new_size, send)).await;
-        return Ok(recv.await??)
-    }
+    // pub async fn resize(&self, new_size: u64) -> Result<u64> {
+    //     let (send, recv) = oneshot::channel();
+    //     _ = self.data.connection.send(BlobCacheCommand::Resize(self.data.id.clone(), new_size, send)).await;
+    //     return Ok(recv.await??)
+    // }
 
-    pub async fn size_to_fit(&self) -> Result<u64> {
-        self.resize(self.size().await?).await
-    }
+    // pub async fn size_to_fit(&self) -> Result<u64> {
+    //     self.resize(self.size().await?).await
+    // }
 
-    pub async fn size(&self) -> Result<u64> {
-        let handle = self.open()?;
-        let meta = tokio::task::spawn_blocking(move ||{
-            handle.metadata()
-        }).await??;
-        return Ok(meta.len())
-    }
+    // pub async fn size(&self) -> Result<u64> {
+    //     let handle = self.open()?;
+    //     let meta = tokio::task::spawn_blocking(move ||{
+    //         handle.metadata()
+    //     }).await??;
+    //     return Ok(meta.len())
+    // }
 }
 
 impl Drop for BlobHandle {
@@ -88,10 +88,11 @@ struct CacheEntry {
 
 
 enum BlobCacheCommand {
+    #[cfg(test)]
     ListBlobs(oneshot::Sender<Vec<String>>),
     Open(String, oneshot::Sender<Result<BlobHandle>>),
-    OpenNew(String, u64, oneshot::Sender<Result<BlobHandle>>),
-    Resize(String, u64, oneshot::Sender<Result<u64>>),
+    // OpenNew(String, u64, oneshot::Sender<Result<BlobHandle>>),
+    // Resize(String, u64, oneshot::Sender<Result<u64>>),
     #[cfg(test)]
     Capacity(oneshot::Sender<(u64, u64)>),
     #[cfg(test)]
@@ -129,12 +130,13 @@ impl BlobCache {
         Ok(recv.await??)
     }
 
-    pub async fn open_new(&self, id: String, size: u64) -> Result<BlobHandle> {
-        let (send, recv) = oneshot::channel();
-        _ = self.connection.send(BlobCacheCommand::OpenNew(id, size, send)).await;
-        Ok(recv.await??)
-    }
+    // pub async fn open_new(&self, id: String, size: u64) -> Result<BlobHandle> {
+    //     let (send, recv) = oneshot::channel();
+    //     _ = self.connection.send(BlobCacheCommand::OpenNew(id, size, send)).await;
+    //     Ok(recv.await??)
+    // }
 
+    #[cfg(test)]
     pub async fn current_open(&self) -> Result<Vec<String>> {
         let (send, recv) = oneshot::channel();
         _ = self.connection.send(BlobCacheCommand::ListBlobs(send)).await;
@@ -178,11 +180,11 @@ struct WaitingForSpace {
 
 enum WaitingOperation {
     Open,
-    OpenNew,
-    Resize{
-        new_size: u64,
-        responders: oneshot::Sender<Result<u64>>
-    }
+    // OpenNew,
+    // Resize{
+    //     new_size: u64,
+    //     responders: oneshot::Sender<Result<u64>>
+    // }
 }
 
 impl Inner {
@@ -218,6 +220,7 @@ impl Inner {
 
     async fn handle_process(&mut self, message: BlobCacheCommand) -> Result<()> {
         match message {
+            #[cfg(test)]
             BlobCacheCommand::ListBlobs(respond) => {
                 let mut found: Vec<String> = self.open.keys().cloned().collect();
                 found.extend(self.pending.keys().cloned());
@@ -287,81 +290,81 @@ impl Inner {
                     });
                 }
             },
-            BlobCacheCommand::OpenNew(id, size, respond) => {
-                // If the blob is already open, attach to that
-                if let Some(entry) = self.open.get_mut(&id) {
-                    entry.access_time = chrono::Utc::now();
-                    _ = respond.send(Ok(entry.handle.clone()));
-                    return Ok(())
-                }
+            // BlobCacheCommand::OpenNew(id, size, respond) => {
+            //     // If the blob is already open, attach to that
+            //     if let Some(entry) = self.open.get_mut(&id) {
+            //         entry.access_time = chrono::Utc::now();
+            //         _ = respond.send(Ok(entry.handle.clone()));
+            //         return Ok(())
+            //     }
 
-                if size > self.capacity {
-                    _ = respond.send(Err(crate::error::ErrorKinds::BlobTooLargeForCache.into()));
-                    return Ok(())
-                }
+            //     if size > self.capacity {
+            //         _ = respond.send(Err(crate::error::ErrorKinds::BlobTooLargeForCache.into()));
+            //         return Ok(())
+            //     }
 
-                // if we don't have enough room try to free it up
-                if self.free_space(size) {
-                    self.open_empty(id, vec![respond], size)?;
-                } else {
-                    // Mark this as something we will need to download later
-                    for wait in self.waiting_for_space.iter_mut() {
-                        if wait.id == id {
-                            wait.responders.push(respond);
-                            return Ok(())
-                        }
-                    }
-                    self.waiting_for_space.push_back(WaitingForSpace {
-                        id,
-                        additional_local_bytes: size,
-                        responders: vec![respond],
-                        act: WaitingOperation::OpenNew
-                    });
-                }
-            },
-            BlobCacheCommand::Resize(id, new_size, respond) => {
-                // Make sure the requested size is at least possible to satisfy
-                if new_size > self.capacity {
-                    _ = respond.send(Err(crate::error::ErrorKinds::BlobTooLargeForCache.into()));
-                    return Ok(())
-                }
+            //     // if we don't have enough room try to free it up
+            //     if self.free_space(size) {
+            //         self.open_empty(id, vec![respond], size)?;
+            //     } else {
+            //         // Mark this as something we will need to download later
+            //         for wait in self.waiting_for_space.iter_mut() {
+            //             if wait.id == id {
+            //                 wait.responders.push(respond);
+            //                 return Ok(())
+            //             }
+            //         }
+            //         self.waiting_for_space.push_back(WaitingForSpace {
+            //             id,
+            //             additional_local_bytes: size,
+            //             responders: vec![respond],
+            //             act: WaitingOperation::OpenNew
+            //         });
+            //     }
+            // },
+            // BlobCacheCommand::Resize(id, new_size, respond) => {
+            //     // Make sure the requested size is at least possible to satisfy
+            //     if new_size > self.capacity {
+            //         _ = respond.send(Err(crate::error::ErrorKinds::BlobTooLargeForCache.into()));
+            //         return Ok(())
+            //     }
 
-                let old_size = {
-                    let handle = match self.open.get_mut(&id) {
-                        Some(handle) => handle,
-                        None => {
-                            _ = respond.send(Err(anyhow::anyhow!("Bad handle")));
-                            return Ok(())
-                        },
-                    };
+            //     let old_size = {
+            //         let handle = match self.open.get_mut(&id) {
+            //             Some(handle) => handle,
+            //             None => {
+            //                 _ = respond.send(Err(anyhow::anyhow!("Bad handle")));
+            //                 return Ok(())
+            //             },
+            //         };
 
-                    if new_size <= handle.size {
-                        let freed = handle.size - new_size;
-                        self.committed_capacity -= freed;
-                        handle.size = new_size;
-                        _ = respond.send(Ok(new_size));
-                        return Ok(())
-                    }
+            //         if new_size <= handle.size {
+            //             let freed = handle.size - new_size;
+            //             self.committed_capacity -= freed;
+            //             handle.size = new_size;
+            //             _ = respond.send(Ok(new_size));
+            //             return Ok(())
+            //         }
 
-                    handle.size
-                };
+            //         handle.size
+            //     };
 
-                // if we don't have enough room try to free it up
-                if self.free_space(new_size - old_size) {
-                    self.do_resize(id, new_size, respond)?;
-                } else {
-                    // Mark this as something we will need to download later
-                    self.waiting_for_space.push_back(WaitingForSpace {
-                        id,
-                        additional_local_bytes: new_size - old_size,
-                        responders: vec![],
-                        act: WaitingOperation::Resize {
-                            new_size,
-                            responders: respond
-                        }
-                    });
-                }
-            }
+            //     // if we don't have enough room try to free it up
+            //     if self.free_space(new_size - old_size) {
+            //         self.do_resize(id, new_size, respond)?;
+            //     } else {
+            //         // Mark this as something we will need to download later
+            //         self.waiting_for_space.push_back(WaitingForSpace {
+            //             id,
+            //             additional_local_bytes: new_size - old_size,
+            //             responders: vec![],
+            //             act: WaitingOperation::Resize {
+            //                 new_size,
+            //                 responders: respond
+            //             }
+            //         });
+            //     }
+            // }
             BlobCacheCommand::LoadFinished(id) => {
                 if let Some(entry) = self.pending.remove(&id) {
                     if let Some(entry) = &*entry.borrow() {
@@ -402,12 +405,12 @@ impl Inner {
                         WaitingOperation::Open => {
                             self.start_download(waiting.id, waiting.responders, waiting.additional_local_bytes)?;
                         },
-                        WaitingOperation::OpenNew => {
-                            self.open_empty(waiting.id, waiting.responders, waiting.additional_local_bytes)?;
-                        },
-                        WaitingOperation::Resize { new_size, responders } => {
-                            self.do_resize(waiting.id, new_size, responders)?;
-                        },
+                        // WaitingOperation::OpenNew => {
+                        //     self.open_empty(waiting.id, waiting.responders, waiting.additional_local_bytes)?;
+                        // },
+                        // WaitingOperation::Resize { new_size, responders } => {
+                        //     self.do_resize(waiting.id, new_size, responders)?;
+                        // },
                     };
                     continue;
                 } else {
@@ -457,41 +460,41 @@ impl Inner {
         return Ok(())
     }
 
-    fn do_resize(&mut self, id: String, new_size: u64, respond: oneshot::Sender<Result<u64>>) -> Result<()> {
-        let handle = match self.open.get_mut(&id) {
-            Some(handle) => handle,
-            None => {
-                _ = respond.send(Err(anyhow::anyhow!("Bad handle")));
-                return Ok(())
-            },
-        };
+    // fn do_resize(&mut self, id: String, new_size: u64, respond: oneshot::Sender<Result<u64>>) -> Result<()> {
+    //     let handle = match self.open.get_mut(&id) {
+    //         Some(handle) => handle,
+    //         None => {
+    //             _ = respond.send(Err(anyhow::anyhow!("Bad handle")));
+    //             return Ok(())
+    //         },
+    //     };
 
-        self.committed_capacity += new_size - handle.size;
-        handle.size = new_size;
-        _ = respond.send(Ok(new_size));
-        return Ok(())
-    }
+    //     self.committed_capacity += new_size - handle.size;
+    //     handle.size = new_size;
+    //     _ = respond.send(Ok(new_size));
+    //     return Ok(())
+    // }
 
-    fn open_empty(&mut self, id: String, responses: Vec<oneshot::Sender<Result<BlobHandle>>>, new_size: u64) -> Result<()> {
-        let sender = match self.sender.upgrade() {
-            Some(sender) => sender,
-            None => return Err(anyhow::format_err!("Cache disconnected.")),
-        };
+    // fn open_empty(&mut self, id: String, responses: Vec<oneshot::Sender<Result<BlobHandle>>>, new_size: u64) -> Result<()> {
+    //     let sender = match self.sender.upgrade() {
+    //         Some(sender) => sender,
+    //         None => return Err(anyhow::format_err!("Cache disconnected.")),
+    //     };
 
-        let temp = NamedTempFile::new_in(&self.path)?;
-        let handle = BlobHandle::new(id.clone(), temp, sender);
-        let entry = CacheEntry{
-            access_time: chrono::Utc::now(),
-            handle: handle.clone(),
-            size: new_size
-        };
-        self.open.insert(id, entry);
-        self.committed_capacity += new_size;
-        for respond in responses {
-            _ = respond.send(Ok(handle.clone()));
-        }
-        return Ok(())
-    }
+    //     let temp = NamedTempFile::new_in(&self.path)?;
+    //     let handle = BlobHandle::new(id.clone(), temp, sender);
+    //     let entry = CacheEntry{
+    //         access_time: chrono::Utc::now(),
+    //         handle: handle.clone(),
+    //         size: new_size
+    //     };
+    //     self.open.insert(id, entry);
+    //     self.committed_capacity += new_size;
+    //     for respond in responses {
+    //         _ = respond.send(Ok(handle.clone()));
+    //     }
+    //     return Ok(())
+    // }
 
     fn free_space(&mut self, size: u64) -> bool {
         while self.capacity - self.committed_capacity < size {

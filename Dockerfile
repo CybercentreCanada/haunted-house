@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -yy libclang-dev
 # Copy in the source to build
 WORKDIR /usr/src/haunted-house
 COPY ./src ./src
-COPY Cargo.lock Cargo.toml .
+COPY Cargo.lock Cargo.toml ./
 
 # Build the executable
 RUN cargo build --release --target-dir /out/
@@ -30,4 +30,5 @@ USER user
 
 # Copy in the executable for this container
 COPY --from=builder /out/release/haunted-house /usr/bin/haunted-house
+RUN ulimit -n 262144
 CMD ["/usr/bin/haunted-house"]

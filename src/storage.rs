@@ -15,10 +15,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::{Python, PyAny, Py, FromPyObject};
 #[cfg(feature = "python")]
 use pyo3::types::{PyTuple, PyBytes};
+// use reqwest_middleware::ClientWithMiddleware;
+// use reqwest_retry::RetryTransientMiddleware;
+// use reqwest_retry::policies::ExponentialBackoff;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+
+use crate::error::ErrorKinds;
 
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,7 +119,7 @@ impl BlobStorage {
             BlobStorage::S3(obj) => obj.size(label).await,
         }
     }
-    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         match self {
             BlobStorage::Local(obj) => obj.stream(label).await,
             #[cfg(feature = "python")]
@@ -240,7 +245,7 @@ impl LocalDirectory {
         }
     }
 
-    async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+    async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         let path = self.get_path(label);
         return Ok(read_chunks(path))
     }
@@ -498,6 +503,7 @@ impl std::io::Read for PythonStream {
 #[derive(Clone)]
 pub struct AzureBlobStore {
     // config: AzureBlobConfig,
+    // http_client: ClientWithMiddleware,
     http_client: reqwest::Client,
     client: ContainerClient,
 }
@@ -547,7 +553,12 @@ impl AzureBlobStore {
                 }
             };
         }
-        let http_client = reqwest::ClientBuilder::new().build()?;
+
+        // let retry_policy = ExponentialBackoff::builder().build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
+        // let http_client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        //     .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        //     .build();
+        let http_client = reqwest::Client::new();
 
         Ok(Self{ http_client, client })
     }
@@ -586,7 +597,7 @@ impl AzureBlobStore {
         Ok(Some(data.blob.properties.content_length))
     }
 
-    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         let mut stream = self.client.blob_client(label).get().into_stream();
         let (send, recv) = mpsc::channel(8);
         tokio::spawn(async move {
@@ -833,7 +844,7 @@ impl S3BlobStore {
         return Ok(Some(res.content_length() as u64))
     }
 
-    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         let mut request = self.client
             .get_object()
             .bucket(&self.bucket)

@@ -2,11 +2,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+import typing
 
 import arrow
 import aiohttp
 import requests
-import json
 import pydantic
 from assemblyline.common.classification import Classification
 from mquery_query_lib import yaraparse
@@ -20,20 +20,22 @@ class IngestError(RuntimeError):
     ...
 
 
+class CouldNotParseRule(ValueError):
+    ...
+
+
 class DuplicateToken(KeyError):
     ...
 
 
 class SearchStatus(pydantic.BaseModel):
     code: str
-    group: str
     finished: bool
     errors: list[str]
-    total_indices: int
-    pending_indices: int
-    pending_candidates: int
     hits: list[str]
     truncated: bool
+    phase: str
+    progress: tuple[int, int]
 
 
 class Client:
@@ -202,10 +204,10 @@ class Client:
 
         future: asyncio.Future[str] = asyncio.Future()
         try:
-            self.ingest_futures[token] = future
             if expiry is not None:
                 expiry = arrow.get(expiry).int_timestamp
             ws = await self._get_ingest_socket()
+            self.ingest_futures[token] = future
 
             body = {
                 'token': token,
@@ -226,6 +228,7 @@ class Client:
             if self.ingest_connection is None:
                 self.ingest_connection = await self.session.ws_connect("/ingest/stream/", protocols=['ingest-stream'])
                 self.ingest_task = asyncio.create_task(self._socket_listener(self.ingest_connection))
+                self.ingest_futures = {}
             return self.ingest_connection
 
     async def _socket_listener(self, ws: aiohttp.ClientWebSocketResponse):
@@ -253,6 +256,10 @@ class Client:
                 logger.exception("Error in receiveed message")
         self.ingest_connection = None
 
+        # Clear futures wating on this socket to complete
+        for future in self.ingest_futures.values():
+            future.cancel()
+
 
 def query_from_yara(yara_rule: str) -> str:
     rules = yaraparse.parse_yara(yara_rule)
@@ -260,7 +267,9 @@ def query_from_yara(yara_rule: str) -> str:
     if len(rules) == 0:
         raise ValueError("A yara rule couldn't be found")
     elif len(rules) == 1:
-        return rules[0].parse().query
+        query = rules[0].parse().query
+        if not query or query == '{}':
+            raise CouldNotParseRule()
+        return query
     else:
         raise ValueError("Only a single yara rule expected")
-
