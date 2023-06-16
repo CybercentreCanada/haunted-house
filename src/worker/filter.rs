@@ -12,7 +12,6 @@ use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
-// use crate::mark;
 use crate::query::Query;
 use crate::timing::{TimingCapture, mark, NullCapture};
 use crate::types::FilterID;
@@ -29,175 +28,6 @@ const HEADER_MAGIC: u32 = 0x0e3d9def;
 const POINTER_SIZE: u64 = 4;
 
 
-struct TrigramCursor<'a> {
-    host: &'a ExtensibleTrigramFile,
-    current: Vec<u64>,
-    offset: usize,
-    next: Option<u32>
-}
-
-impl<'a> TrigramCursor<'a> {
-    pub fn new(host: &'a ExtensibleTrigramFile, trigram: u32) -> Result<Self> {
-        let mut buffer = vec![];
-        let segment = host.read_initial_segment(trigram)?;
-        let next = segment.extension();
-        segment.decode_into(&mut buffer);
-
-        Ok(Self {
-            host,
-            current: buffer,
-            offset: 0,
-            next
-        })
-    }
-}
-
-impl<'a> Iterator for TrigramCursor<'a> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset < self.current.len() {
-            self.offset += 1;
-            return Some(self.current[self.offset-1])
-        }
-
-        match self.next {
-            Some(address) => {
-                let segment = match self.host.read_extended_segment(address) {
-                    Ok(segment) => segment,
-                    Err(_) => return None
-                };
-
-                self.current.clear();
-                segment.decode_into(&mut self.current);
-                self.next = segment.extension();
-                self.offset = 1;
-                match self.current.get(0) {
-                    Some(val) => Some(*val),
-                    None => None,
-                }
-            },
-            None => None,
-        }
-    }
-}
-
-fn into_trigrams(bytes: &Vec<u8>) -> Vec<u32> {
-    if bytes.len() < 3 {
-        return vec![];
-    }
-    let mut trigrams = vec![];
-    let mut trigram: u32 = (bytes[0] as u32) << 8 | (bytes[1] as u32);
-
-    for index in 2..bytes.len() {
-        trigram = (trigram & 0x00FFFF) << 8 | (bytes[index] as u32);
-        trigrams.push(trigram);
-    }
-
-    return trigrams;
-}
-
-fn union(base: &mut Vec<u64>, other: &Vec<u64>) {
-    base.extend(other);
-    base.sort_unstable();
-    base.dedup();
-}
-
-fn intersection(base: &mut Vec<u64>, other: &Vec<u64>) {
-
-    let mut base_read_index = 0;
-    let mut base_write_index = 0;
-    let mut other_index = 0;
-
-    while base_read_index < base.len() && other_index < other.len() {
-        match base[base_read_index].cmp(&other[other_index]) {
-            std::cmp::Ordering::Less => { base_read_index += 1},
-            std::cmp::Ordering::Equal => {
-                base[base_write_index] = base[base_read_index];
-                base_write_index += 1;
-                base_read_index += 1;
-                other_index += 1;
-            },
-            std::cmp::Ordering::Greater => {other_index += 1},
-        }
-    }
-
-    base.truncate(base_write_index);
-}
-
-fn get_next_journal(directory: &Path, id: FilterID) -> (File, PathBuf, u64) {
-    loop {
-        let next_id = match get_operation_journals(directory, id) {
-            Ok(journals) => match journals.last() {
-                Some((num, _)) => *num + 1,
-                None => 0,
-            },
-            Err(err) => {
-                error!("{err}");
-                continue;
-            },
-        };
-        let name = format!("{id}.{next_id:08}");
-        let location = directory.join(name);
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&location);
-        match file {
-            Ok(file) => return (file, location, next_id),
-            Err(_) => continue,
-        }
-    }
-}
-
-fn get_operation_journals(directory: &Path, id: FilterID) -> Result<Vec<(u64, PathBuf)>> {
-    let id_str = format!("{id}");
-    let mut listing = std::fs::read_dir(directory)?;
-    let mut found = vec![];
-    while let Some(file) = listing.next() {
-        let file = match file {
-            Ok(file) => file,
-            _ => continue
-        };
-
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            _ => continue
-        };
-
-        if !metadata.is_file() {
-            continue
-        }
-
-        let name = file.file_name();
-        let name = match name.to_str() {
-            Some(name) => name,
-            _ => continue
-        };
-
-        let mut parts = name.split(".");
-        let owner = match parts.next() {
-            Some(owner) => owner,
-            None => continue,
-        };
-        if owner != &id_str {
-            continue
-        }
-
-        let code = match parts.next() {
-            Some(owner) => owner,
-            None => continue,
-        };
-
-        let counter: u64 = match code.parse() {
-            Ok(counter) => counter,
-            Err(_) => continue,
-        };
-
-        found.push((counter, file.path()));
-    }
-
-    found.sort_unstable();
-    return Ok(found)
-}
-
 pub struct ExtensibleTrigramFile {
     initial_segment_size: u32,
     extended_segment_size: u32,
@@ -207,16 +37,6 @@ pub struct ExtensibleTrigramFile {
     location: PathBuf,
     id: FilterID,
 }
-
-// impl std::fmt::Debug for ExtensibleTrigramFile {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         f.debug_struct("ExtensibleTrigramFile")
-//             .field("initial_segment_size", &self.initial_segment_size)
-//             .field("extended_segment_size", &self.extended_segment_size)
-//             .field("data_location", &self.data_location)
-//             .field("extended_segments", &self.extended_segments).finish()
-//     }
-// }
 
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,15 +50,6 @@ enum UpdateOperations<'a> {
     WriteSegment{segment: SegmentAddress, data: &'a[u8]},
     ExtendSegment{trigram: u32, segment: SegmentAddress, new_segment: u32},
 }
-
-// impl std::fmt::Debug for UpdateOperations {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match self {
-//             Self::WriteSegment { segment, data } => f.debug_struct("WriteSegment").field("segment", segment).field("data_len", &data.len()).finish(),
-//             Self::ExtendSegment { segment, new_segment } => f.debug_struct("ExtendSegment").field("segment", segment).field("new_segment", new_segment).finish(),
-//         }
-//     }
-// }
 
 struct RawSegmentInfo<'a> {
     data: &'a [u8],
@@ -911,7 +722,7 @@ struct IdCollector<'a> {
     iterators: Vec<(u64, Peekable<SparseIterator<'a>>)>
 }
 
-impl<'a> IdCollector<'a> {
+impl IdCollector<'_> {
     fn next(&mut self, hits: &mut Vec<u64>) -> Option<u32> {
         // hits.clear();
 
@@ -946,6 +757,175 @@ impl<'a> IdCollector<'a> {
             Some(selected_trigram)
         }
     }
+}
+
+struct TrigramCursor<'a> {
+    host: &'a ExtensibleTrigramFile,
+    current: Vec<u64>,
+    offset: usize,
+    next: Option<u32>
+}
+
+impl<'a> TrigramCursor<'a> {
+    pub fn new(host: &'a ExtensibleTrigramFile, trigram: u32) -> Result<Self> {
+        let mut buffer = vec![];
+        let segment = host.read_initial_segment(trigram)?;
+        let next = segment.extension();
+        segment.decode_into(&mut buffer);
+
+        Ok(Self {
+            host,
+            current: buffer,
+            offset: 0,
+            next
+        })
+    }
+}
+
+impl Iterator for TrigramCursor<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset < self.current.len() {
+            self.offset += 1;
+            return Some(self.current[self.offset-1])
+        }
+
+        match self.next {
+            Some(address) => {
+                let segment = match self.host.read_extended_segment(address) {
+                    Ok(segment) => segment,
+                    Err(_) => return None
+                };
+
+                self.current.clear();
+                segment.decode_into(&mut self.current);
+                self.next = segment.extension();
+                self.offset = 1;
+                match self.current.get(0) {
+                    Some(val) => Some(*val),
+                    None => None,
+                }
+            },
+            None => None,
+        }
+    }
+}
+
+fn into_trigrams(bytes: &Vec<u8>) -> Vec<u32> {
+    if bytes.len() < 3 {
+        return vec![];
+    }
+    let mut trigrams = vec![];
+    let mut trigram: u32 = (bytes[0] as u32) << 8 | (bytes[1] as u32);
+
+    for index in 2..bytes.len() {
+        trigram = (trigram & 0x00FFFF) << 8 | (bytes[index] as u32);
+        trigrams.push(trigram);
+    }
+
+    return trigrams;
+}
+
+fn union(base: &mut Vec<u64>, other: &Vec<u64>) {
+    base.extend(other);
+    base.sort_unstable();
+    base.dedup();
+}
+
+fn intersection(base: &mut Vec<u64>, other: &Vec<u64>) {
+
+    let mut base_read_index = 0;
+    let mut base_write_index = 0;
+    let mut other_index = 0;
+
+    while base_read_index < base.len() && other_index < other.len() {
+        match base[base_read_index].cmp(&other[other_index]) {
+            std::cmp::Ordering::Less => { base_read_index += 1},
+            std::cmp::Ordering::Equal => {
+                base[base_write_index] = base[base_read_index];
+                base_write_index += 1;
+                base_read_index += 1;
+                other_index += 1;
+            },
+            std::cmp::Ordering::Greater => {other_index += 1},
+        }
+    }
+
+    base.truncate(base_write_index);
+}
+
+fn get_next_journal(directory: &Path, id: FilterID) -> (File, PathBuf, u64) {
+    loop {
+        let next_id = match get_operation_journals(directory, id) {
+            Ok(journals) => match journals.last() {
+                Some((num, _)) => *num + 1,
+                None => 0,
+            },
+            Err(err) => {
+                error!("{err}");
+                continue;
+            },
+        };
+        let name = format!("{id}.{next_id:08}");
+        let location = directory.join(name);
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&location);
+        match file {
+            Ok(file) => return (file, location, next_id),
+            Err(_) => continue,
+        }
+    }
+}
+
+fn get_operation_journals(directory: &Path, id: FilterID) -> Result<Vec<(u64, PathBuf)>> {
+    let id_str = format!("{id}");
+    let mut listing = std::fs::read_dir(directory)?;
+    let mut found = vec![];
+    while let Some(file) = listing.next() {
+        let file = match file {
+            Ok(file) => file,
+            _ => continue
+        };
+
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            _ => continue
+        };
+
+        if !metadata.is_file() {
+            continue
+        }
+
+        let name = file.file_name();
+        let name = match name.to_str() {
+            Some(name) => name,
+            _ => continue
+        };
+
+        let mut parts = name.split(".");
+        let owner = match parts.next() {
+            Some(owner) => owner,
+            None => continue,
+        };
+        if owner != &id_str {
+            continue
+        }
+
+        let code = match parts.next() {
+            Some(owner) => owner,
+            None => continue,
+        };
+
+        let counter: u64 = match code.parse() {
+            Ok(counter) => counter,
+            Err(_) => continue,
+        };
+
+        found.push((counter, file.path()));
+    }
+
+    found.sort_unstable();
+    return Ok(found)
 }
 
 #[cfg(test)]
@@ -1103,11 +1083,11 @@ mod test {
                 recreated.push(SparseBits::new())
             }
 
-            let file = ExtensibleTrigramFile::open(location.clone(), id)?;
+            let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 for index in values {
-                    recreated[index as usize - 1].insert(trigram as u32 & 0xFFFFFF);
+                    recreated[index as usize - 1].insert(trigram & 0xFFFFFF);
                 }
             }
 

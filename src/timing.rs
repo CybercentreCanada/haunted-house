@@ -201,7 +201,7 @@ pub struct Mark<'a> {
     index: usize,
 }
 
-impl<'a> Drop for Mark<'a> {
+impl Drop for Mark<'_> {
     fn drop(&mut self) {
         self.capture.add(self.index, self.time.elapsed().as_secs_f64());
     }

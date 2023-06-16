@@ -15,7 +15,7 @@ pub struct SparseIterator<'a> {
     current: Iter<'a>
 }
 
-impl<'a> Iterator for SparseIterator<'a> {
+impl Iterator for SparseIterator<'_> {
     type Item = u32;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -58,7 +58,7 @@ impl Eq for SparseBits {
 
 impl Serialize for SparseBits {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer 
+    where S: serde::Serializer
     {
         let mut chunks = vec![];
         for item in self.chunks.iter() {
@@ -84,8 +84,8 @@ impl<'de> Deserialize<'de> for SparseBits {
 impl SparseBits {
     pub fn new() -> Self {
         const EMPTY_CHUNK: Chunk = Chunk::empty();
-        SparseBits { 
-            chunks: Box::new([EMPTY_CHUNK; 256]) 
+        SparseBits {
+            chunks: Box::new([EMPTY_CHUNK; 256])
         }
     }
 
@@ -93,7 +93,7 @@ impl SparseBits {
         let mut iter = self.chunks.iter();
         let current = iter.next().unwrap();
         SparseIterator { iter, current_index: 0, current: current.iter() }
-    } 
+    }
 
     // #[cfg(test)]
     // pub fn memory(&self) -> usize {
@@ -173,7 +173,7 @@ enum Iter<'a> {
     Removed(std::ops::Range<u16>, Peekable<std::slice::Iter<'a, u16>>)
 }
 
-impl<'a> Iterator for Iter<'a> {
+impl Iterator for Iter<'_> {
     type Item = u16;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -232,7 +232,7 @@ impl Chunk {
                 }
                 items.set(item as usize, true);
             },
-            Chunk::Removed(items) => { 
+            Chunk::Removed(items) => {
                 for (index, value) in items.iter().enumerate() {
                     if item == *value {
                         items.remove(index);
@@ -245,7 +245,7 @@ impl Chunk {
 
     pub fn compact(&mut self) {
         match self {
-            Chunk::Added(items) => {                
+            Chunk::Added(items) => {
                 items.sort_unstable();
                 items.dedup();
 

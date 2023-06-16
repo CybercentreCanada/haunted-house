@@ -34,7 +34,7 @@ impl FromStr for AccessControl {
     type Err = ErrorKinds;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(parse::access(s)?)
+        parse::access(s)
     }
 }
 
@@ -98,7 +98,7 @@ impl core::ops::BitOr<&AccessControl> for AccessControl {
     type Output = AccessControl;
 
     fn bitor(self, rhs: &AccessControl) -> Self::Output {
-        self.or(&rhs)
+        self.or(rhs)
     }
 }
 
@@ -230,16 +230,16 @@ impl AccessControl {
 
                 let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(AccessControl::into_and).collect();
 
-                if common.len() == 0 {
+                if common.is_empty() {
                     return AccessControl::into_or(unfactored);
                 }
 
                 let common = AccessControl::set_into_and(common);
 
-                if unfactored.len() == 0 {
+                if unfactored.is_empty() {
                     return common;
                 } else if unfactored.len() == 1 {
-                    return unfactored.pop().unwrap() | common
+                    return unfactored.pop().unwrap() | common;
                 } else {
                     let unfactored = AccessControl::into_or(unfactored);
                     let temp = unfactored.and(&common);

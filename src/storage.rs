@@ -633,7 +633,7 @@ impl AzureBlobStore {
         Ok(tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::options().write(true).open(path)?;
             while let Some(data) = recv.blocking_recv() {
-                file.write(&data?)?;
+                file.write_all(&data?)?;
             }
             return anyhow::Ok(())
         }).await??)

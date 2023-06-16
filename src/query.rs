@@ -3,15 +3,17 @@ use std::str::FromStr;
 
 use itertools::Itertools;
 use serde::{Serialize, Deserialize};
-// use anyhow::Result;
 
-
+/// A query that can be run against the trigram filters.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub enum Query {
-    // Not(Box<Query>),
+    /// Only include files that satisify all of the listed queries.
     And(Vec<Query>),
+    /// Include files if they satisify any of the listed queries.
     Or(Vec<Query>),
+    /// A literal binary blob we are looking for
     Literal(Vec<u8>),
+    /// Include files only if they satisify enough of the listed queries.
     MinOf(i32, Vec<Query>)
 }
 
@@ -35,6 +37,8 @@ impl Display for Query {
     }
 }
 
+/// Submodule containing the logic for deserilazing a query from the mquery format.
+/// A rough grammar for what the parser is doing is included as comments
 mod parse_ursa {
     use nom::branch::alt;
     use nom::bytes::complete::{tag, is_not, is_a};
@@ -43,9 +47,10 @@ mod parse_ursa {
     use nom::error::ParseError;
     use nom::multi::{many1, separated_list1};
     use nom::sequence::{delimited, tuple, preceded};
-    use nom::{IResult};
+    use nom::IResult;
     use super::Query;
 
+    /// Load a query consuming the entire string or error
     pub fn query(input: &str) -> anyhow::Result<Query> {
         let (remain, query) = match parse_query(input) {
             Ok(result) => result,
@@ -57,37 +62,33 @@ mod parse_ursa {
         return Ok(query)
     }
 
+    /// a wrapper to strip whitespace from before and after the combinator
     fn ws<'a, F, O, E: ParseError<&'a str>>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O, E>
     where
     F: FnMut(&'a str) -> IResult<&'a str, O, E>,
     {
-        delimited(
-        multispace0,
-        inner,
-        multispace0
-        )
+        delimited(multispace0, inner, multispace0)
     }
 
-    fn parse_query<'a>(input: &'a str) -> IResult<&'a str, Query> {
+    /// parse_query: parse_sequence
+    fn parse_query(input: &str) -> IResult<&str, Query> {
         let (remain, query) = ws(parse_sequence)(input)?;
         return Ok((remain, query))
     }
 
+    /// parse_brackets: "(" (parse_of | parse_query) ")"
     fn parse_brackets(input: &str) -> IResult<&str, Query> {
         let (remain, query) = delimited(ws(tag("(")), alt((parse_of, parse_query)), ws(tag(")")))(input)?;
         return Ok((remain, query))
     }
 
-    // fn parse_not(input: &str) -> IResult<&str, Query> {
-    //     let (remain, query) = delimited(pair(ws(tag_no_case("not")), ws(tag("("))), parse_query, ws(tag(")")))(input)?;
-    //     return Ok((remain, Query::Not(Box::new(query))))
-    // }
-
+    /// parse_of: "min" number "of" "(" parse_atom ("," parse_atom)* ")"
     fn parse_of(input: &str) -> IResult<&str, Query> {
         let (remain, (_, _, _, num, _, _, items, _)) = tuple((multispace0, tag("min"), multispace1, map_res(digit1, |s: &str| s.parse::<i32>()), ws(tag("of")), ws(tag("(")), separated_list1(ws(tag(",")), parse_atom), ws(tag(")"))))(input)?;
         return Ok((remain, Query::MinOf(num, items)))
     }
 
+    /// A hex value between {}
     fn parse_hex(input: &str) -> IResult<&str, Query> {
         let (remain, value) = delimited(tag("{"), many1(is_a("0123456789abcdefABCDEF")), tag("}"))(input)?;
         let value = value.join("");
@@ -95,18 +96,21 @@ mod parse_ursa {
         return Ok((remain, Query::Literal(value)))
     }
 
+    /// A quoted utf-8 string
     fn parse_string(input: &str) -> IResult<&str, Query> {
         let (remain, (_, value, _)) = ws(tuple((tag("\""), many1(alt((tag("\\\\"), tag("\\\""), is_not("\"")))), tag("\""))))(input)?;
         let literal = value.join("");
         return Ok((remain, Query::Literal(literal.into_bytes())));
     }
 
-    fn parse_atom<'a>(input: &'a str) -> IResult<&'a str, Query> {
-        let (remain, query) = delimited(multispace0, alt((parse_brackets, parse_hex, parse_string/* , parse_not*/)), multispace0)(input)?;
+    /// parse_atom: parse_brackets | parse_hex | parse_string
+    fn parse_atom(input: &str) -> IResult<&str, Query> {
+        let (remain, query) = ws(alt((parse_brackets, parse_hex, parse_string)))(input)?;
         return Ok((remain, query))
     }
 
-    fn parse_sequence<'a>(input: &'a str) -> IResult<&'a str, Query> {
+    /// parse_sequence: parse_atom [and_tail | or_tail]
+    fn parse_sequence(input: &str) -> IResult<&str, Query> {
         let (remain, (query, ops)) = tuple((parse_atom, opt(alt((and_tail, or_tail)))))(input)?;
 
         // This should only match on operations that are written as suffixes
@@ -129,17 +133,17 @@ mod parse_ursa {
         return Ok((remain, query))
     }
 
+    /// and_tail: ("&" parse_atom)+
     fn and_tail(input: &str) -> IResult<&str, Query> {
         let (remain, query) = many1(preceded(ws(tag("&")), parse_atom))(input)?;
         return Ok((remain, Query::And(query)))
     }
 
+    /// or_tail: ("|" parse_atom)+
     fn or_tail(input: &str) -> IResult<&str, Query> {
         let (remain, query) = many1(preceded(ws(tag("|")), parse_atom))(input)?;
         return Ok((remain, Query::Or(query)))
     }
-
-
 }
 
 

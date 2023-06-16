@@ -1,3 +1,15 @@
+#![warn(missing_docs, non_ascii_idents, trivial_numeric_casts,
+    unused_crate_dependencies, noop_method_call, single_use_lifetimes, trivial_casts,
+    unused_lifetimes, nonstandard_style, variant_size_differences)]
+#![deny(keyword_idents)]
+#![warn(clippy::missing_docs_in_private_items)]
+#![allow(clippy::needless_return)]
+
+//!
+//! Haunted house is a microservice designed to sit behind Assemblyline malware triage systems
+//! to provide retrohunting capabilities.
+//!
+
 mod config;
 mod storage;
 mod timing;

@@ -504,10 +504,7 @@ impl Inner {
                 if value.handle.count() > 1 {
                     continue;
                 }
-                if candidate.is_none() {
-                    candidate = Some(id);
-                    candidate_changed = value.access_time;
-                } else if value.access_time < candidate_changed {
+                if candidate.is_none() || value.access_time < candidate_changed {
                     candidate = Some(id);
                     candidate_changed = value.access_time;
                 }

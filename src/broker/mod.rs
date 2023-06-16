@@ -911,7 +911,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
 
     // Run through yara jobs
     info!("Search {code}: Yara");
-    let initial_total = candidates.len().await? as u64;
+    let initial_total: u64 = candidates.len().await?;
 
     let mut hits: BTreeSet<Sha256> = Default::default();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
@@ -951,7 +951,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 errors: errors.clone(),
                                 hits: hits.iter().cloned().map(|x|x.hex()).collect(),
                                 truncated: false,
-                                progress: (initial_total, candidates.len().await? as u64),
+                                progress: (initial_total, candidates.len().await?),
                                 phase: SearchProgress::Yara,
                             }
                         });

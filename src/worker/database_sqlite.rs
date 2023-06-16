@@ -155,7 +155,7 @@ impl BufferedSQLite {
             SQLiteCommand::FilterSizes { response } => { _ = response.send(self.filter_sizes().await); },
             // BSQLCommand::FilterPendingCount { response } => { _ = response.send(self.filter_pending_count().await); },
             SQLiteCommand::FilterPending { response } => { _ = response.send(self.filter_pending().await); },
-            SQLiteCommand::UpdateFileAccess { files, response } => { 
+            SQLiteCommand::UpdateFileAccess { files, response } => {
                 // Ask all the filters if they know anything about these files
                 let mut sub_results = vec![];
                 for channel in self.workers.values() {
