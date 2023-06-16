@@ -20,8 +20,10 @@ pub enum AccessControl {
 impl Display for AccessControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AccessControl::Or(items) => f.write_fmt(format_args!("Or({})", items.iter().map(|x|x.to_string()).collect::<Vec<String>>().join(", "))),
-            AccessControl::And(items) => f.write_fmt(format_args!("And({})", items.iter().map(|x|x.to_string()).collect::<Vec<String>>().join(", "))),
+            AccessControl::Or(items) => f.write_fmt(format_args!("Or({})",
+                items.iter().map(AccessControl::to_string).collect::<Vec<String>>().join(", "))),
+            AccessControl::And(items) => f.write_fmt(format_args!("And({})",
+                items.iter().map(|x|x.to_string()).collect::<Vec<String>>().join(", "))),
             AccessControl::Token(value) => f.write_fmt(format_args!("\"{value}\"")),
             AccessControl::Always => f.write_str("Always"),
         }

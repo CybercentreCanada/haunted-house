@@ -545,7 +545,7 @@ impl AzureBlobStore {
             if let Err(err) = client.create().await {
                 let http_error = err.as_http_error();
                 let ignore = match http_error {
-                    Some(http) => http.error_code() == Some("ContainerAlreadyExists"),
+                    Some(http) => http.error_code() == Some("ContainerAlreadyExists") || http.error_code() == Some("BucketAlreadyOwnedByYou"),
                     None => false,
                 };
                 if !ignore {
