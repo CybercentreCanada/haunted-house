@@ -1,3 +1,22 @@
+//! A trigram index format that favours ingestion speed over searching speed
+//! while still providing fairly good search speed.
+//!
+//! The index file contains four parts:
+//!  - A fixed length header identifiying the format and describing parameters required to parse the rest of the file.
+//!  - A hint table of segment ids letting writers jump to the last active segment for a given trigram.
+//!  - A fixed size table of segments, one for each possible trigram.
+//!  - A dynamic table of segments that can be used to extend the file quickly.
+//!
+//! Writes to the index file are done via a two stage commit where:
+//!  - The set of all change to be made are written to a journal file which is then synced.
+//!  - The changes are then applied to the memory map of the index file.
+//!  - When convinent (or when triggered explicitly, controlled externally by a timeout) the
+//!    memory map is flushed and the journal files are erased.
+//!
+//! This file defines access to the file format using syncronous apis.
+//! The async interface is defined in filter_worker.rs
+//!
+
 use anyhow::{Result, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
@@ -20,54 +39,89 @@ use crate::worker::sparse::SparseIterator;
 use super::encoding::{cost_to_add, encode_into, decode_into, encoded_number_size};
 use super::sparse::SparseBits;
 
-
+/// A convinence constant defining how many possible trigrams exist
 const TRIGRAM_RANGE: u64 = 1 << 24;
-const HEADER_SIZE: u64 = 4 + 4 + 4 + 4;
-const PREFIX_SIZE: u64 = TRIGRAM_RANGE * 4;
-const HEADER_MAGIC: u32 = 0x0e3d9def;
+/// Number of bytes used for each segment id
 const POINTER_SIZE: u64 = 4;
+/// Size of the fixed length header
+const HEADER_SIZE: u64 = 4 + 4 + 4 + 4;
+/// Size of segment id table identifying the last segment in use for each trigram
+const PREFIX_SIZE: u64 = TRIGRAM_RANGE * POINTER_SIZE;
+/// A magic number used in the header, generated randomly once.
+const HEADER_MAGIC: u32 = 0x0e3d9def;
 
-
+/// Encapsulates a single filter file.
 pub struct ExtensibleTrigramFile {
+    /// How large are the manditory segments
     initial_segment_size: u32,
+    /// How large are the extension segments
     extended_segment_size: u32,
+    /// Memory map of the trigram index
     data: memmap2::MmapMut,
+    /// How many extension segments are there
     extended_segments: u32,
+    /// Directory where the index file and all journals are stored, may be shared with other files.
     directory: PathBuf,
+    /// Path to the index file
     location: PathBuf,
+    /// Id used to map this filter file to the corresponding database with file data
     id: FilterID,
 }
 
-
+/// Label that can reference any segment, both manditory and extension
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 enum SegmentAddress {
+    /// Describes a manditory segment, value inside is the trigram value
     Trigram(u32),
+    /// Describes an extended segment, value inside is the id of the segment
     Segment(u32),
 }
 
+/// An entry in the operation journal
 #[derive(Serialize, Deserialize)]
 enum UpdateOperations<'a> {
-    WriteSegment{segment: SegmentAddress, data: &'a[u8]},
-    ExtendSegment{trigram: u32, segment: SegmentAddress, new_segment: u32},
+    /// Overwrite the content of a segment
+    WriteSegment{
+        /// Which segment should be overwritten
+        segment: SegmentAddress,
+        /// The data to write (not copied, stored as a reference to the external buffer for efficency)
+        data: &'a[u8]
+    },
+    /// Extend the chain of segments for this trigram into this new segment
+    ExtendSegment{
+        /// Which trigram is getting an additional segment
+        trigram: u32,
+        /// The last segment currently assigned to that trigram
+        segment: SegmentAddress,
+        /// ID of the new segment to be assigned
+        new_segment: u32
+    },
 }
 
+/// A wrapper for a pointer to a segment of memmapped data that provides
+/// methods for parsing the content of the buffer
 struct RawSegmentInfo<'a> {
+    /// Underlying pointer
     data: &'a [u8],
 }
 
 impl<'a> RawSegmentInfo<'a> {
+    /// Wrap pointer in this struct
     fn new(data: &'a [u8]) -> Self {
         RawSegmentInfo { data }
     }
 
+    /// How much of the buffer is used for payload
     fn payload_bytes(&self) -> u32 {
         self.data.len() as u32 - POINTER_SIZE as u32
     }
 
+    /// Parse encoded data into a provided buffer
     fn decode_into(&self, buffer: &mut Vec<u64>) -> u32 {
         decode_into(&self.data[0..self.data.len() - POINTER_SIZE as usize], buffer)
     }
 
+    /// Read the extension pointer at the end of this segment if set
     fn extension(&self) -> Option<u32> {
         let bytes = self.data[self.data.len() - POINTER_SIZE as usize..self.data.len()].try_into().unwrap();
         let num = u32::from_le_bytes(bytes);
@@ -80,7 +134,9 @@ impl<'a> RawSegmentInfo<'a> {
 }
 
 impl ExtensibleTrigramFile {
-
+    /// Create a new trigram index file.
+    ///
+    /// Fails if this trigram file already exists.
     pub fn new(directory: PathBuf, id: FilterID, initial_segment_size: u32, extended_segment_size: u32) -> Result<Self> {
         // prepare file
         let location = directory.join(format!("{id}"));
@@ -100,6 +156,9 @@ impl ExtensibleTrigramFile {
         Ok(Self { initial_segment_size, extended_segment_size, data, extended_segments: 0, directory, location, id })
     }
 
+    /// Open an existing trigram file.
+    ///
+    /// Applies any outstanding operation journals.
     pub fn open(directory: PathBuf, id: FilterID) -> Result<Self> {
         // Open the file
         let location = directory.join(format!("{id}"));
@@ -146,6 +205,7 @@ impl ExtensibleTrigramFile {
         return Ok(filter);
     }
 
+    /// Delete the indicated trigram file and all related journal files.
     pub fn delete(directory: PathBuf, id: FilterID) -> Result<()> {
         let journals = get_operation_journals(&directory, id)?;
         for (_, path) in journals {
@@ -155,10 +215,13 @@ impl ExtensibleTrigramFile {
         return Ok(())
     }
 
+    /// Read the file list for a single trigram
     pub fn read_trigram(&self, trigram: u32) -> Result<Vec<u64>> {
         let mut output = vec![];
+        // Get and parse the manditory segment for this trigram
         let mut segment = self.read_initial_segment(trigram).context("reading initial segment")?;
         segment.decode_into(&mut output);
+        // Continue parsing segments until there are no more linked
         while let Some(extension) = segment.extension() {
             segment = self.read_extended_segment(extension).context("reading extended segment")?;
             segment.decode_into(&mut output);
@@ -166,54 +229,79 @@ impl ExtensibleTrigramFile {
         return Ok(output);
     }
 
+    /// Calculate the intersection of the file lists for all the given trigrams
     pub fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
         // Handle corner cases
-        if trigrams.len() == 0 {
+        if trigrams.is_empty() {
             return Ok(vec![])
         }
         if trigrams.len() == 1 {
             return self.read_trigram(trigrams[0])
         }
 
-        let mut output = vec![];
+        // build a collection if iterators that will navigate the linked list of segments
+        // yielding file ids in order. They will only read segments when the current one is
+        // exhausted, this potentially lets us avoid loading unused memory pages.
         let mut sources = vec![];
         for trigram in trigrams {
             sources.push(TrigramCursor::new(self, trigram)?.peekable());
         }
 
+        // Get the first file that might be in all the file lists
         let mut candidate = match sources[0].peek() {
             Some(item) => *item,
             None => return Ok(vec![]),
         };
 
+        // Loop over all the cursors until all files have been considered
+        let mut output = vec![];
         'next_candidate: loop {
+            // For the current candidate value check all the file lists to see if they all have it
             'next_cursor: for cursor in &mut sources {
+                // This loop iterates through values in the current cursor until we catch up with the candidate value
                 loop {
                     let next = match cursor.peek() {
                         Some(next) => *next,
+                        // if we have reached the end of any of the cursors we can terminate this
+                        // search and return whatever we have found up until now
                         None => break 'next_candidate,
                     };
 
                     match next.cmp(&candidate) {
+                        // if the current value on this cursor is behind the candidate keep
+                        // moving forward until we catch up with the candidate, all the values we are skipping
+                        // over must be missing in at least one other cursor for this to happen
                         std::cmp::Ordering::Less => { cursor.next(); continue },
+                        // If this cursor has the candidate in it, move to the next cursor, candidate is still valid
                         std::cmp::Ordering::Equal => { continue 'next_cursor },
+                        // If this cursor has passed the candidate the candidate is invalid (it needs to be
+                        // in all of the cursors) take the current value as the new candidate and restart
+                        // the loop over the cursors
                         std::cmp::Ordering::Greater => { candidate = next; continue 'next_candidate },
                     }
                 }
             }
 
+            // If we have checked all the cursors and haven't skipped to the next iteration
+            // of the 'next_candidate loop then we have found this candidates in all the cursors
             output.push(candidate);
+
+            // advance to the next file ID as a candidate. It doesn't matter if the cursors don't
+            // actually have this value, since we are about to check them.
             candidate += 1;
         }
         return Ok(output)
     }
 
+    /// Run a query over the trigram table.
+    /// Setup a hash table as a cache, so that we don't search the same literal repeatedly.
     pub fn query(&self, query: &Query) -> Result<Vec<u64>> {
         let mut cache = Default::default();
         self._query(query, &mut cache)
     }
 
-    pub fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {
+    /// Actual logic for the 'query' methods
+    fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {
         match query {
             Query::And(items) => {
                 let mut base = self._query(&items[0], cache)?;
@@ -263,6 +351,7 @@ impl ExtensibleTrigramFile {
         }
     }
 
+    /// Get the offset within the file map for a segment start
     fn get_segment_offset(&self, address: SegmentAddress) -> u64 {
         match address {
             SegmentAddress::Trigram(address) => self.get_initial_segment_offset(address),
@@ -270,18 +359,22 @@ impl ExtensibleTrigramFile {
         }
     }
 
-    fn get_initial_segment_offset(&self, address: u32) -> u64 {
-        HEADER_SIZE + PREFIX_SIZE + address as u64 * self.initial_segment_size as u64
+    /// Get the memory offset for the start of a manditory segment by trigram
+    fn get_initial_segment_offset(&self, trigram: u32) -> u64 {
+        HEADER_SIZE + PREFIX_SIZE + trigram as u64 * self.initial_segment_size as u64
     }
 
+    /// Get the memory offset for the start of an extended segment
     fn get_extended_segment_offset(&self, address: u32) -> u64 {
         HEADER_SIZE + PREFIX_SIZE + TRIGRAM_RANGE * self.initial_segment_size as u64 + (address - 1) as u64 * self.extended_segment_size as u64
     }
 
+    /// Get the raw location in the hint table that holds the pointer to the last segment for the given trigram
     fn get_tail_hint_offset(&self, trigram: u32) -> u64 {
         HEADER_SIZE + trigram as u64 * 4
     }
 
+    /// Get the value of the hint table for the given trigram
     fn get_tail_hint(&self, trigram: u32) -> SegmentAddress {
         // let data = self.data.blocking_read();
         let address = self.get_tail_hint_offset(trigram) as usize;
@@ -293,20 +386,21 @@ impl ExtensibleTrigramFile {
         }
     }
 
+    /// Read the content of the manditory initial segment for a trigram
     fn read_initial_segment(&self, trigram: u32) -> Result<RawSegmentInfo> {
         let location = self.get_initial_segment_offset(trigram) as usize;
-        // let data = self.data.blocking_read();
         let data = &self.data[location..location+self.initial_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
+    /// Read the content of an extended segment
     fn read_extended_segment(&self, segment: u32) -> Result<RawSegmentInfo> {
         let location = self.get_extended_segment_offset(segment) as usize;
-        // let data = self.data.blocking_read();
         let data = &self.data[location..location+self.extended_segment_size as usize];
         return Ok(RawSegmentInfo::new(data))
     }
 
+    /// Read the content of a segment
     fn read_segment(&self, segment: SegmentAddress) -> Result<RawSegmentInfo> {
         match segment {
             SegmentAddress::Trigram(trigram) => self.read_initial_segment(trigram),
@@ -314,7 +408,7 @@ impl ExtensibleTrigramFile {
         }
     }
 
-    // #[instrument]
+    //
     pub fn write_batch(&self, files: &mut [(u64, SparseBits)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations

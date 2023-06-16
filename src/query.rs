@@ -1,3 +1,5 @@
+//! Definition and parsing for trigram filter queries
+
 use std::fmt::Display;
 use std::str::FromStr;
 

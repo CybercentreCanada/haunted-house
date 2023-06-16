@@ -84,8 +84,8 @@ aws-types = "0.54"
 aws-smithy-client = "0.54"
 
 
-#kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
-#k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
+kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
+k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
 
 [dev-dependencies]
 assertor = "*"
@@ -93,6 +93,6 @@ assertor = "*"
 [features]
 #python = ["pyo3", "dep:pyo3-asyncio", "dep:pyo3-log"]
 #extension-module = ["python", "pyo3/extension-module"]
-#operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
+operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
 #default = ["extension-module"]
-#default = []
+default = []

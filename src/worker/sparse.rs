@@ -1,17 +1,29 @@
+//! A helper class for storing a trigram bitmask as a set of sparse values.
+//!
+//! In the worst case this just falls back into a dense bitmap. For many small files however
+//! the dense bitmap uses far more memory than just storing a list of trigrams directly.
+
 use std::iter::Peekable;
 
 use bitvec::{bitarr, BitArr};
 use bitvec::prelude::BitArray;
 use serde::{Serialize, Deserialize, de::Error};
 
+/// Store a set of trigrams using a sparse layout.
 #[derive(Debug, Clone)]
 pub struct SparseBits {
+    /// A list of chunks of the bitmap addressed by the highest 8 bits of the trigram.
+    /// This lets each chunk choose the storage method that suits it best.
     chunks: Box<[Chunk; 256]>
 }
 
+/// An iterator over the trigrams in a SparseBits struct
 pub struct SparseIterator<'a> {
+    /// Iterator over chunks in the struct being traversed
     iter: std::slice::Iter<'a, Chunk>,
+    /// Index of the current chunk
     current_index: u32,
+    /// Iterator of values within the current chunk
     current: Iter<'a>
 }
 
@@ -35,26 +47,13 @@ impl Iterator for SparseIterator<'_> {
     }
 }
 
-// impl Ord for SparseBits {
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         self.chunks.iter().cmp(other.chunks.iter())
-//     }
-// }
-
-// impl PartialOrd for SparseBits {
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         Some(self.chunks.iter().cmp(other.chunks.iter()))
-//     }
-// }
-
 impl PartialEq for SparseBits {
     fn eq(&self, other: &Self) -> bool {
         self.chunks == other.chunks
     }
 }
 
-impl Eq for SparseBits {
-}
+impl Eq for SparseBits {}
 
 impl Serialize for SparseBits {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -82,27 +81,19 @@ impl<'de> Deserialize<'de> for SparseBits {
 }
 
 impl SparseBits {
+    /// Create an empty bitset
     pub fn new() -> Self {
-        const EMPTY_CHUNK: Chunk = Chunk::empty();
         SparseBits {
-            chunks: Box::new([EMPTY_CHUNK; 256])
+            chunks: Box::new([Chunk::EMPTY; 256])
         }
     }
 
+    /// Create an iterator over
     pub fn iter(&self) -> SparseIterator {
         let mut iter = self.chunks.iter();
         let current = iter.next().unwrap();
         SparseIterator { iter, current_index: 0, current: current.iter() }
     }
-
-    // #[cfg(test)]
-    // pub fn memory(&self) -> usize {
-    //     let mut memory = core::mem::size_of::<Self>();
-    //     for part in self.chunks.iter() {
-    //         memory += part.memory();
-    //     }
-    //     memory
-    // }
 
     pub fn insert(&mut self, item: u32) {
         let bin = (item >> 16) as usize;
@@ -114,15 +105,6 @@ impl SparseBits {
             part.compact();
         }
     }
-
-    // pub fn has(&self, index: usize) -> bool {
-    //     let chunk = &self.chunks[index >> 16];
-    //     match chunk {
-    //         Chunk::Added(items) => items.binary_search(&(index as u16)).is_ok(),
-    //         Chunk::Mask(_, items) => unsafe {*items.get_unchecked(index & 0xFFFF)},
-    //         Chunk::Removed(items) => !items.binary_search(&(index as u16)).is_ok(),
-    //     }
-    // }
 
     #[cfg(test)]
     pub fn random(seed: u64) -> Self {
@@ -170,7 +152,7 @@ impl Eq for Chunk {
 enum Iter<'a> {
     Added(std::slice::Iter<'a, u16>),
     Mask(bitvec::slice::IterOnes<'a, u64, bitvec::prelude::Lsb0>),
-    Removed(std::ops::Range<u16>, Peekable<std::slice::Iter<'a, u16>>)
+    Removed(std::ops::RangeInclusive<u16>, Peekable<std::slice::Iter<'a, u16>>)
 }
 
 impl Iterator for Iter<'_> {
@@ -202,15 +184,14 @@ impl Iterator for Iter<'_> {
 
 
 impl Chunk {
-    pub const fn empty() -> Self {
-        Self::Added(vec![])
-    }
+    const EMPTY: Self = Self::Added(vec![]);
+    pub fn empty() -> Self { Self::EMPTY.clone() }
 
     pub fn iter(&self) -> Iter {
         match self {
             Chunk::Added(items) => Iter::Added(items.iter()),
             Chunk::Mask(_, mask) => Iter::Mask(mask.iter_ones()),
-            Chunk::Removed(items) => Iter::Removed(0..u16::MAX, items.iter().peekable()),
+            Chunk::Removed(items) => Iter::Removed(0..=u16::MAX, items.iter().peekable()),
         }
     }
 
@@ -296,7 +277,7 @@ impl Chunk {
 
 #[cfg(test)]
 mod test {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use itertools::Itertools;
     use rand::{thread_rng, Rng};
@@ -331,5 +312,25 @@ mod test {
             assert!(bits.iter().eq([ii].iter().cloned()))
         }
     }
+
+    #[test]
+    fn adding_values() {
+        // Have the first chunk of this map get fully saturated plus a little more
+        let mut bits = SparseBits::new();
+        let mut values = vec![];
+        for ii in 0..=0x01FFFF {
+            bits.insert(ii);
+            bits.compact();
+            values.push(ii);
+            if bits.iter().ne(values.iter().cloned()) {
+                let a: HashSet<u32> = bits.iter().collect();
+                let b: HashSet<u32> = values.iter().cloned().collect();
+                println!("Extra {:?}", a.difference(&b));
+                println!("Missing {:?}", b.difference(&a));
+                panic!();
+            }
+        }
+    }
+
 
 }

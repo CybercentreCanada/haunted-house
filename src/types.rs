@@ -1,6 +1,6 @@
-///
-/// Module containing simple types used throughout the crate.
-///
+//!
+//! Module containing simple types used throughout the crate.
+//!
 
 use chrono::{DateTime, Utc, Datelike};
 use serde::{Serialize, Deserialize};
