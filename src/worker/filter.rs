@@ -34,10 +34,9 @@ use std::thread::JoinHandle;
 use crate::query::Query;
 use crate::timing::{TimingCapture, mark, NullCapture};
 use crate::types::FilterID;
-use crate::worker::sparse::SparseIterator;
 
 use super::encoding::{cost_to_add, encode_into, decode_into, encoded_number_size};
-use super::sparse::SparseBits;
+use super::trigrams::{TrigramSet, TrigramIterator};
 
 /// A convinence constant defining how many possible trigrams exist
 const TRIGRAM_RANGE: u64 = 1 << 24;
@@ -409,7 +408,7 @@ impl ExtensibleTrigramFile {
     }
 
     //
-    pub fn write_batch(&self, files: &mut [(u64, SparseBits)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
+    pub fn write_batch(&self, files: &mut [(u64, TrigramSet)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations
         let (write_buffer, _buffer_location, buffer_counter) = {
@@ -448,12 +447,10 @@ impl ExtensibleTrigramFile {
             let trigram = {
                 let _mark = mark!(capture, "invert");
                 // Invert batch into REVERSED index lists
-                let trigram = match collector.next(&mut file_ids) {
+                match collector.next(&mut file_ids) {
                     Some(trigram) => trigram,
                     None => break,
-                };
-
-                trigram
+                }
             };
 
             let operations_span = mark!(capture, "build_ops");
@@ -484,7 +481,7 @@ impl ExtensibleTrigramFile {
                 // we have to. Once current segments are full, merge the lists and fall through
                 // to adding new segments
                 file_ids.extend(self.read_trigram(trigram)?);
-                file_ids.sort_unstable_by(|a, b| b.cmp(&a));
+                file_ids.sort_unstable_by(|a, b| b.cmp(a));
                 file_ids.dedup();
 
                 // Move to the first segment
@@ -523,7 +520,7 @@ impl ExtensibleTrigramFile {
                         encode_into(&new_content, &mut encode_data_buffer);
                         encode_data_buffer.resize(active_segment.payload_bytes() as usize, 0);
                         write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                        writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                        writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                     }
 
                     // point to next segment
@@ -582,7 +579,7 @@ impl ExtensibleTrigramFile {
                         encode_data_buffer.push(0);
                     }
                     write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                    writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                    writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                 }
             }
 
@@ -609,11 +606,11 @@ impl ExtensibleTrigramFile {
 
                 let new_address = SegmentAddress::Segment(new_segment);
                 let _span = mark!(operations_span, "write_operation");
-                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { trigram, segment: address, new_segment }, &mut extend_data_buffer)?)?;
+                writer.write_all(postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { trigram, segment: address, new_segment }, &mut extend_data_buffer)?)?;
                 encode_data_buffer.clear();
                 encode_into(&content, &mut encode_data_buffer);
                 write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                writer.write_all(&postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
                 address = new_address;
             }
         }
@@ -624,7 +621,7 @@ impl ExtensibleTrigramFile {
 
         // Write where the finalization is
         let mut write_buffer = writer.into_inner()?;
-        let ending_offset = write_buffer.seek(SeekFrom::Current(0))?;
+        let ending_offset = write_buffer.stream_position()?;
         write_buffer.seek(SeekFrom::Start(0))?;
         write_buffer.write_u64::<LittleEndian>(ending_offset)?;
 
@@ -719,7 +716,7 @@ impl ExtensibleTrigramFile {
                     match operation {
                         UpdateOperations::WriteSegment { segment, data } => {
                             let segment_offset = self.get_segment_offset(segment) as usize;
-                            self.data[segment_offset..segment_offset + data.len()].copy_from_slice(&data[..]);
+                            self.data[segment_offset..segment_offset + data.len()].copy_from_slice(data);
                         },
                         UpdateOperations::ExtendSegment { trigram, segment, new_segment } => {
                             // Write the new segment value into the segment being extended for forward reading
@@ -763,7 +760,7 @@ impl ExtensibleTrigramFile {
         // Commit operations
         let handle = std::thread::spawn({
             let directory = self.directory.clone();
-            let id = self.id.clone();
+            let id = self.id;
             move || {
                 // Wait until all outstanding data has flushed
                 {
@@ -813,7 +810,7 @@ impl ExtensibleTrigramFile {
 // A helper to collect file ids for each trigram
 struct IdCollector<'a> {
     acceptable: u32,
-    iterators: Vec<(u64, Peekable<SparseIterator<'a>>)>
+    iterators: Vec<(u64, Peekable<TrigramIterator<'a>>)>
 }
 
 impl IdCollector<'_> {
@@ -896,10 +893,7 @@ impl Iterator for TrigramCursor<'_> {
                 segment.decode_into(&mut self.current);
                 self.next = segment.extension();
                 self.offset = 1;
-                match self.current.get(0) {
-                    Some(val) => Some(*val),
-                    None => None,
-                }
+                self.current.first().copied()
             },
             None => None,
         }
@@ -996,12 +990,12 @@ fn get_operation_journals(directory: &Path, id: FilterID) -> Result<Vec<(u64, Pa
             _ => continue
         };
 
-        let mut parts = name.split(".");
+        let mut parts = name.split('.');
         let owner = match parts.next() {
             Some(owner) => owner,
             None => continue,
         };
-        if owner != &id_str {
+        if owner != id_str {
             continue
         }
 
@@ -1034,8 +1028,7 @@ mod test {
     use crate::timing::{NullCapture, Capture};
     use crate::types::FilterID;
     use crate::worker::filter::ExtensibleTrigramFile;
-    use crate::worker::sparse::SparseBits;
-    use crate::worker::trigram_cache::build_buffer;
+    use crate::worker::trigrams::{build_buffer, TrigramSet};
 
     use super::{TRIGRAM_RANGE, IdCollector};
 
@@ -1044,7 +1037,7 @@ mod test {
         // build test data
         let mut trigrams = vec![];
         for ii in 1..102 {
-            let mut data = SparseBits::new();
+            let mut data = TrigramSet::new();
             data.insert(500);
             if ii < 50 {
                 data.insert(0);
@@ -1090,7 +1083,7 @@ mod test {
         // build test data
         let mut trigrams = vec![];
         for ii in 1..102 {
-            let mut data = SparseBits::new();
+            let mut data = TrigramSet::new();
             data.insert(500);
             if ii < 50 {
                 data.insert(0);
@@ -1140,7 +1133,7 @@ mod test {
         let mut trigrams = vec![];
 
         for ii in (1..21).rev() {
-            trigrams.push((ii, SparseBits::random(ii)));
+            trigrams.push((ii, TrigramSet::random(ii)));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
 
@@ -1172,9 +1165,9 @@ mod test {
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let mut recreated: Vec<SparseBits> = vec![];
+            let mut recreated: Vec<TrigramSet> = vec![];
             for _ in 0..20 {
-                recreated.push(SparseBits::new())
+                recreated.push(TrigramSet::new())
             }
 
             let file = ExtensibleTrigramFile::open(location, id)?;
@@ -1185,7 +1178,7 @@ mod test {
                 }
             }
 
-            let trigrams: HashMap<u64, SparseBits> = trigrams.into_iter().collect();
+            let trigrams: HashMap<u64, TrigramSet> = trigrams.into_iter().collect();
 
             for (index, values) in recreated.into_iter().enumerate() {
                 assert!(*trigrams.get(&(index as u64+1)).unwrap() == values, "{index}")
@@ -1197,7 +1190,7 @@ mod test {
 
     #[test]
     fn duplicate_batch() -> Result<()> {
-        let data = SparseBits::random(thread_rng().gen());
+        let data = TrigramSet::random(thread_rng().gen());
 
         let tempdir = tempfile::tempdir()?;
         let id = FilterID::from(1);
@@ -1221,7 +1214,7 @@ mod test {
         }
 
         {
-            let mut recreated = SparseBits::new();
+            let mut recreated = TrigramSet::new();
 
             let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
@@ -1243,7 +1236,7 @@ mod test {
 
     #[test]
     fn out_of_order_batch() -> Result<()> {
-        let mut bits = SparseBits::new();
+        let mut bits = TrigramSet::new();
         bits.insert(0);
 
         let mut trigrams_a = vec![];
@@ -1283,7 +1276,7 @@ mod test {
 
     #[test]
     fn out_of_order_batch_reversed() -> Result<()> {
-        let mut bits = SparseBits::new();
+        let mut bits = TrigramSet::new();
         bits.insert(0);
 
         let mut trigrams_a = vec![];
@@ -1371,7 +1364,7 @@ mod test {
     fn collector() {
         let mut objects = vec![];
         for ii in 0..256 {
-            let mut abc = SparseBits::new();
+            let mut abc = TrigramSet::new();
             for jj in 0..=0xFFFF {
                 abc.insert(ii << 16 | jj);
             }
@@ -1403,7 +1396,7 @@ mod test {
         let tempdir = tempfile::tempdir()?;
         let id = FilterID::from(1);
         let location = tempdir.path().to_path_buf();
-        let mut file = ExtensibleTrigramFile::new(location.clone(), id, 16, 16)?;
+        let mut file = ExtensibleTrigramFile::new(location, id, 16, 16)?;
         let x = file.write_batch(&mut [(1, trigrams)], NullCapture::new())?;
         file.apply_operations(x.0, x.1, x.2, NullCapture::new())?;
 

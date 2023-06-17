@@ -32,7 +32,7 @@ pub enum Database {
 impl Database {
 
     pub async fn new_sqlite(directory: PathBuf) -> Result<Self> {
-        Ok(Database::SQLite(BufferedSQLite::new(directory).await?))
+        Ok(Database::SQLite(BufferedSQLite::start(directory).await?))
     }
 
     pub async fn create_filter(&self, id: FilterID, expiry: &ExpiryGroup) -> Result<()> {

@@ -120,7 +120,7 @@ fn format_time(seconds: f64) -> String {
     // } else if seconds*1_000_000_000.0 > 1.0 {
     //     format!("{:.0}ns", (seconds*1_000_000_000.0))
     } else {
-        format!("0s")
+        String::from("0s")
     }
 }
 

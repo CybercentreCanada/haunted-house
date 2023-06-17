@@ -281,10 +281,7 @@ pub fn apply_variables(data: &str, vars: &HashMap<String, String>) -> Result<Str
         }
 
         let name = capture.get(2).unwrap().as_str();
-        let default = match capture.get(3) {
-            Some(val) => Some(val.as_str()),
-            None => None,
-        };
+        let default = capture.get(3).map(|val| val.as_str());
 
         // Get the variable form the map
         if let Some(value) = vars.get(name) {

@@ -18,7 +18,7 @@ pub struct SqliteSet<Item: Serialize + DeserializeOwned> {
 impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
     pub async fn new(url: &str) -> Result<Self> {
         let url = if url == "memory" {
-            format!("sqlite::memory:")
+            String::from("sqlite::memory:")
         } else {
             let path = Path::new(url);
 
@@ -64,9 +64,9 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
 
         sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
 
-        sqlx::query(&format!("create table if not exists dataset (
+        sqlx::query("create table if not exists dataset (
             data BLOB NOT NULL PRIMARY KEY
-        )")).execute(&mut con).await.context("error creating table for set")?;
+        )").execute(&mut con).await.context("error creating table for set")?;
 
         return Ok(())
     }
@@ -129,7 +129,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
 
     pub async fn len(&self) -> Result<u64> {
         let query_str = "SELECT count(1) FROM dataset";
-        let (hits, ): (i64, ) = sqlx::query_as(&query_str).fetch_one(&self.db).await?;
+        let (hits, ): (i64, ) = sqlx::query_as(query_str).fetch_one(&self.db).await?;
         return Ok(hits as u64)
     }
 }

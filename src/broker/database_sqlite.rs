@@ -49,7 +49,7 @@ impl SQLiteInterface {
     pub async fn new(url: &str) -> Result<Self> {
 
         let url = if url == "memory" {
-            format!("sqlite::memory:")
+            String::from("sqlite::memory:")
         } else {
             let path = Path::new(url);
 
@@ -97,13 +97,13 @@ impl SQLiteInterface {
         sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
         sqlx::query("PRAGMA busy_timeout=600000").execute(&mut *con).await?;
 
-        sqlx::query(&format!("create table if not exists searches (
+        sqlx::query("create table if not exists searches (
             code TEXT PRIMARY KEY,
             data BLOB NOT NULL,
             finished BOOLEAN NOT NULL,
             start_time TEXT
-        )")).execute(&mut con).await.context("error creating table searches")?;
-        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS searches_finished ON searches(finished)")).execute(&mut con).await?;
+        )").execute(&mut con).await.context("error creating table searches")?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS searches_finished ON searches(finished)").execute(&mut con).await?;
 
         return Ok(())
     }
@@ -127,7 +127,7 @@ impl SQLiteInterface {
 
         // Add operation to the search table
         sqlx::query("INSERT INTO searches(code, data, start_time, finished) VALUES(?, ?, ?, FALSE)")
-            .bind(&code)
+            .bind(code)
             .bind(&postcard::to_allocvec(&SearchRecord{
                 code: code.to_owned(),
                 yara_signature: req.yara_signature.clone(),
@@ -163,7 +163,7 @@ impl SQLiteInterface {
 
         sqlx::query("UPDATE searches SET data = ?, finished = TRUE WHERE code = ?")
             .bind(&postcard::to_allocvec(&record)?)
-            .bind(&code)
+            .bind(code)
             .execute(&self.db).await?;
 
         return Ok(())
@@ -171,7 +171,7 @@ impl SQLiteInterface {
 
     pub async fn search_record(&self, code: &str) -> Result<Option<SearchRecord>> {
         let row: Option<(Vec<u8>, )> = sqlx::query_as("SELECT data FROM searches WHERE code = ?")
-            .bind(&code)
+            .bind(code)
             .fetch_optional(&self.db).await?;
 
         Ok(match row {

@@ -63,6 +63,7 @@ pub async fn main(config: crate::config::Config) -> Result<()> {
 }
 
 
+type SearchInfo = (JoinHandle<()>, mpsc::Sender<SearcherMessage>);
 
 pub struct HouseCore {
     pub database: Database,
@@ -75,7 +76,7 @@ pub struct HouseCore {
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     pub pending_assignments: RwLock<HashMap<ExpiryGroup, VecDeque<IngestTask>>>,
     pub worker_ingest: RwLock<HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>>,
-    pub running_searches: RwLock<HashMap<String, (JoinHandle<()>, mpsc::Sender<SearcherMessage>)>>,
+    pub running_searches: RwLock<HashMap<String, SearchInfo>>,
     pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, WorkerAddress)>,
 }
 
@@ -242,12 +243,11 @@ impl HouseCore {
             }
         };
 
-        match channel {
-            Some(recv) => match recv.await {
+        if let Some(recv) = channel {
+            match recv.await {
                 Ok(status) => return Ok(Some(status)),
                 Err(err) => { error!("{err}"); },
-            },
-            None => {}
+            }
         }
         self.database.search_status(&code).await
     }
@@ -701,7 +701,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 }
 
                 let mut last_id = FilterID::NULL;
-                for (_, ids) in &response.expiry_groups {
+                for ids in response.expiry_groups.values() {
                     for id in ids {
                         last_id = last_id.max(*id);
                     }
@@ -773,11 +773,8 @@ pub enum SearcherMessage {
 }
 
 async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherMessage>, code: String) {
-    loop {
-        match _search_worker(core.clone(), &mut input, &code).await {
-            Err(err) => error!("Crash in search: {err}"),
-            Ok(()) => break,
-        }
+    while let Err(err) = _search_worker(core.clone(), &mut input, &code).await {
+        error!("Crash in search: {err}")
     }
 }
 
@@ -810,7 +807,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
             let worker = worker.clone();
             tokio::spawn(async move {
                 if let Err(err) = socket.send(tokio_tungstenite::tungstenite::Message::Text(request_body)).await {
-                    _ = client_sender.send((worker.clone(), FilterSearchResponse::Error(None, format!("connection error: {err}"))));
+                    _ = client_sender.send((worker.clone(), FilterSearchResponse::Error(None, format!("connection error: {err}")))).await;
                 }
 
                 while let Some(message) = socket.next().await {

@@ -69,15 +69,14 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
     ws.on_upgrade(|mut socket| async move {
         // wait for our filter command
         let request: FilterSearchRequest = match socket.next().await {
-            Some(Ok(request)) => if let Message::Text(text) = request {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(request) = serde_json::from_str(&text) {
                     request
                 } else {
                     return
                 }
-            } else {
-                return
-            },
+            }
+            Some(Ok(_)) => return,
             Some(Err(err)) => {
                 error!("Bad filter command: {err}");
                 return
@@ -203,8 +202,8 @@ async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
 }
 
 #[handler]
-fn get_online_status() -> () {
-    return ()
+fn get_online_status() {
+    return
 }
 
 #[handler]

@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
 
-use super::sparse::SparseBits;
+use super::trigrams::TrigramSet;
 
 #[derive(Debug)]
 enum ReaderCommand {
@@ -19,7 +19,7 @@ enum ReaderCommand {
 
 #[derive(Debug)]
 pub enum WriterCommand {
-    Ingest(Vec<(u64, SparseBits)>, oneshot::Sender<()>),
+    Ingest(Vec<(u64, TrigramSet)>, oneshot::Sender<()>),
     Flush
 }
 

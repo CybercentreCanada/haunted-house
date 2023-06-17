@@ -39,7 +39,7 @@ impl RateCounter {
 
     fn clean(&mut self) {
         let oldest = chrono::Utc::now().timestamp() - self.window;
-        while let Some((&time, &count)) = self.buffer.first_key_value().clone() {
+        while let Some((&time, &count)) = self.buffer.first_key_value() {
             if time < oldest {
                 self.count -= count;
                 self.buffer.remove(&time);

@@ -16,7 +16,7 @@ use super::database::{IngestStatus, Database, IngestStatusBundle};
 use super::filter::ExtensibleTrigramFile;
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse, StorageStatus};
-use super::trigram_cache::TrigramCache;
+use super::trigrams::TrigramCache;
 
 pub struct WorkerState {
     pub database: Database,
@@ -283,7 +283,7 @@ impl WorkerState {
             let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
             let time_get_batch = stamp.elapsed().as_secs_f64();
             if batch.is_empty() {
-                if let Err(_) = tokio::time::timeout(tokio::time::Duration::from_secs(600), notify.notified()).await {
+                if tokio::time::timeout(tokio::time::Duration::from_secs(600), notify.notified()).await.is_err() {
                     writer.send(WriterCommand::Flush).await?;
                 }
                 continue
@@ -369,7 +369,7 @@ impl WorkerState {
                         Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())).await; }
                     };
                 }
-                Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())); },
+                Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())).await; },
             };
         }
     }

@@ -100,7 +100,7 @@ impl StatusInterface {
     }
 
     pub async fn get_status(&self) -> Result<StatusReport> {
-        Ok(self.core.status().await?)
+        self.core.status().await
     }
 }
 

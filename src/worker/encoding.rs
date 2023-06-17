@@ -35,7 +35,7 @@ pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
 }
 
 pub fn encode_into(indices: &Vec<u64>, buffer: &mut Vec<u8>) {
-    if indices.len() == 0 {
+    if indices.is_empty() {
         return;
     }
     if indices.len() == 1 {

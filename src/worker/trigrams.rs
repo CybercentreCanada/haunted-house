@@ -1,33 +1,255 @@
-//! A helper class for storing a set of trigrams efficently.
-//!
-//! In the worst case this just falls back into a dense bitmap. For many small files however
-//! the dense bitmap uses far more memory than just storing a list of trigrams directly.
+//! Tools for handling the trigram sets from files.
 
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::iter::Peekable;
 
+use anyhow::Result;
+use log::error;
+use tokio::sync::{Semaphore, RwLock};
+use tokio::task::JoinHandle;
 use bitvec::{bitarr, BitArr};
 use bitvec::prelude::BitArray;
 use serde::{Serialize, Deserialize, de::Error};
 
-/// Store a set of trigrams using a sparse layout.
+use crate::config::WorkerSettings;
+use crate::storage::BlobStorage;
+use crate::types::{Sha256, FilterID, FileInfo};
+
+/// A manager for a directory holding the trigram sets yet to be written to filters.
+pub struct TrigramCache {
+    /// Directory for the trigrams to be stored while waiting to be written
+    cache_dir: PathBuf,
+    /// A temporary directory used for files in the middle of writing (so they can be installed by atomic rename)
+    temp_dir: PathBuf,
+    /// A semaphore to track the number of trigram sets currently being calculated to limit resource consumption
+    permits: Semaphore,
+    /// List of jobs either building trigram sets or waiting for a permit
+    pending: RwLock<HashMap<(FilterID, Sha256), JoinHandle<()>>>,
+    /// A storage driver where the target files can be loaded from
+    files: BlobStorage
+}
+
+
+impl TrigramCache {
+
+    pub async fn new(config: &WorkerSettings, files: BlobStorage) -> Result<Arc<Self>> {
+        let temp_dir = config.get_trigram_cache_directory().join("temp");
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await?;
+        }
+        tokio::fs::create_dir_all(&temp_dir).await?;
+        Ok(Arc::new(Self {
+            cache_dir: config.get_trigram_cache_directory(),
+            temp_dir,
+            permits: Semaphore::new(config.parallel_file_downloads),
+            pending: RwLock::new(Default::default()),
+            files,
+        }))
+    }
+
+    pub async fn expire(&self, filter: FilterID) -> Result<()> {
+        // Flush out pending tasks
+        {
+            let mut pending = self.pending.write().await;
+            let mut remove = vec![];
+            for (key, task) in pending.iter() {
+                if key.0 == filter {
+                    remove.push(key.clone());
+                    task.abort();
+                }
+            }
+            for key in remove {
+                pending.remove(&key);
+            }
+        }
+
+        // Erase directory
+        return Ok(tokio::fs::remove_dir_all(self._filter_path(filter)).await?);
+    }
+
+    pub async fn start_fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
+        if self.is_ready(filter, &hash).await? {
+            return Ok(())
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.pending.write().await.entry((filter, hash.clone())) {
+            let core = self.clone();
+            entry.insert(tokio::spawn(async move {
+                if let Err(err) = core._fetch_file(filter, &hash).await {
+                    error!("Fetch file error: {err}");
+                }
+                let mut pending = core.pending.write().await;
+                pending.remove(&(filter, hash));
+            }));
+        }
+        return Ok(())
+    }
+
+    async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
+        let _permit = self.permits.acquire().await?;
+
+        // Gather the file content
+        let stream = self.files.stream(&hash.hex()).await?;
+        let trigrams = build_file(stream).await?;
+
+        // Store the trigrams
+        let cache_path = self._path(filter, hash);
+        let temp_dir = self.temp_dir.clone();
+        let filter_dir = self._filter_path(filter);
+        tokio::task::spawn_blocking(move ||{
+            let mut temp = tempfile::NamedTempFile::new_in(&temp_dir)?;
+            temp.write_all(&postcard::to_allocvec(&trigrams)?)?;
+            temp.flush()?;
+            std::fs::create_dir_all(filter_dir)?;
+            temp.persist(cache_path)?;
+            anyhow::Ok(())
+        }).await??;
+        return Ok(())
+    }
+
+    pub async fn strip_pending(&self, collection: &mut Vec<(FilterID, FileInfo)>) {
+        let workers = self.pending.read().await;
+        collection.retain(|(filter, info)|{
+            !workers.contains_key(&(*filter, info.hash.clone()))
+        });
+    }
+
+    pub async fn add_pending(&self, collection: &mut HashMap<FilterID, HashSet<Sha256>>) {
+        let workers = self.pending.read().await;
+        for (filter, sha) in workers.keys() {
+            match collection.entry(*filter) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(sha.clone()); },
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert([sha.clone()].into()); },
+            }
+        }
+    }
+
+    pub async fn is_ready(&self, filter: FilterID, hash: &Sha256) -> Result<bool> {
+        Ok(tokio::fs::try_exists(self._path(filter, hash)).await?)
+    }
+
+    pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<TrigramSet> {
+        let data = tokio::fs::read(self._path(filter, hash)).await?;
+        Ok(postcard::from_bytes(&data)?)
+    }
+
+    pub async fn release(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
+        let path = self._path(filter, hash);
+        match tokio::fs::remove_file(&path).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if !tokio::fs::try_exists(path).await? {
+                    Ok(())
+                } else {
+                    Err(err.into())
+                }
+            },
+        }
+    }
+
+    pub fn _filter_path(&self, filter: FilterID) -> PathBuf {
+        self.cache_dir.join(filter.to_string())
+    }
+
+    pub fn _path(&self, filter: FilterID, hash: &Sha256) -> PathBuf {
+        self._filter_path(filter).join(hash.to_string())
+    }
+}
+
+#[cfg(test)]
+pub (crate) fn build_buffer(data: &[u8]) -> Result<TrigramSet> {
+    // Prepare accumulators
+    let mut output = TrigramSet::new();
+
+    if data.len() < 3 {
+        return Ok(output)
+    }
+
+    // Initialize trigram
+    let mut trigram: u32 = (data[0] as u32) << 8 | (data[1] as u32);
+
+    for (byte_index, byte) in data[2..].iter().enumerate() {
+        trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+        output.insert(trigram);
+        if byte_index % 16000 == 0 {
+            output.compact();
+        }
+    }
+    output.compact();
+
+    return Ok(output)
+}
+
+/// Convert a stream of buffers into a trigram set
+async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>) -> Result<TrigramSet> {
+    // Prepare accumulators
+    let mut output = TrigramSet::new();
+
+    // Read the initial block
+    let mut buffer = vec![];
+    while buffer.len() <= 2 {
+        let sub_buffer = match input.recv().await {
+            Some(sub_buffer) => sub_buffer?,
+            None => return Ok(output),
+        };
+
+        buffer.extend(sub_buffer);
+    }
+
+    // Initialize with first 2/3rds of first trigram
+    let mut trigram: u32 = (buffer[0] as u32) << 8 | (buffer[1] as u32);
+    let mut index_start = 2;
+
+    'outer: loop {
+        for _ in 0..1<<16 {
+            for byte in &buffer[index_start..] {
+                trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+                output.insert(trigram);
+            }
+
+            buffer = match input.recv().await {
+                Some(buffer) => buffer?,
+                None => break 'outer,
+            };
+            if buffer.is_empty() {
+                break 'outer;
+            }
+            index_start = 0;
+        }
+        output.compact();
+    }
+    output.compact();
+
+    return Ok(output)
+}
+
+
+/// A helper class for storing a set of trigrams efficently.
+///
+/// The trigrams are stored using a dynamic encoding where each block of 
+/// 2^16 trigrams are each encoded separatly.
+/// For small sets of trigrams explicit lists of trigrams are used, for dense sets it 
+/// falls back into a bitmap. 
 #[derive(Debug, Clone)]
-pub struct SparseBits {
+pub struct TrigramSet {
     /// A list of chunks of the bitmap addressed by the highest 8 bits of the trigram.
     /// This lets each chunk choose the storage method that suits it best.
     chunks: Box<[Chunk; 256]>
 }
 
 /// An iterator over the trigrams in a SparseBits struct
-pub struct SparseIterator<'a> {
+pub struct TrigramIterator<'a> {
     /// Iterator over chunks in the struct being traversed
     iter: std::slice::Iter<'a, Chunk>,
     /// Index of the current chunk
     current_index: u32,
     /// Iterator of values within the current chunk
-    current: Iter<'a>
+    current: ChunkIter<'a>
 }
 
-impl Iterator for SparseIterator<'_> {
+impl Iterator for TrigramIterator<'_> {
     type Item = u32;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -47,15 +269,15 @@ impl Iterator for SparseIterator<'_> {
     }
 }
 
-impl PartialEq for SparseBits {
+impl PartialEq for TrigramSet {
     fn eq(&self, other: &Self) -> bool {
         self.chunks == other.chunks
     }
 }
 
-impl Eq for SparseBits {}
+impl Eq for TrigramSet {}
 
-impl Serialize for SparseBits {
+impl Serialize for TrigramSet {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer
     {
@@ -67,7 +289,7 @@ impl Serialize for SparseBits {
     }
 }
 
-impl<'de> Deserialize<'de> for SparseBits {
+impl<'de> Deserialize<'de> for TrigramSet {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: serde::Deserializer<'de> {
         let chunks = Vec::<Chunk>::deserialize(deserializer)?;
@@ -80,19 +302,19 @@ impl<'de> Deserialize<'de> for SparseBits {
     }
 }
 
-impl SparseBits {
+impl TrigramSet {
     /// Create an empty bitset
     pub fn new() -> Self {
-        SparseBits {
+        TrigramSet {
             chunks: Box::new([Chunk::EMPTY; 256])
         }
     }
 
     /// Create an iterator over the indices of the set bits 
-    pub fn iter(&self) -> SparseIterator {
+    pub fn iter(&self) -> TrigramIterator {
         let mut iter = self.chunks.iter();
         let current = iter.next().unwrap();
-        SparseIterator { iter, current_index: 0, current: current.iter() }
+        TrigramIterator { iter, current_index: 0, current: current.iter() }
     }
 
     /// Add a trigram to the bitset
@@ -155,7 +377,7 @@ impl Eq for Chunk {
 }
 
 /// Iterator over the set indices in the bitset chunk
-enum Iter<'a> {
+enum ChunkIter<'a> {
     /// Iterate over encoded indices directly
     Added(std::slice::Iter<'a, u16>),
     /// Use bitset set bit index iterator directly
@@ -165,14 +387,14 @@ enum Iter<'a> {
     Removed(std::ops::RangeInclusive<u16>, Peekable<std::slice::Iter<'a, u16>>)
 }
 
-impl Iterator for Iter<'_> {
+impl Iterator for ChunkIter<'_> {
     type Item = u16;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Iter::Added(iter) => iter.next().copied(),
-            Iter::Mask(iter) => iter.next().map(|v|v as u16),
-            Iter::Removed(iter, skip_list) => {
+            ChunkIter::Added(iter) => iter.next().copied(),
+            ChunkIter::Mask(iter) => iter.next().map(|v|v as u16),
+            ChunkIter::Removed(iter, skip_list) => {
                 while let Some(next) = iter.next() {
                     match skip_list.peek() {
                         Some(skip) => match next.cmp(skip) {
@@ -198,11 +420,11 @@ impl Chunk {
     pub fn empty() -> Self { Self::EMPTY }
 
     /// Create an iterator over the indices of set bits
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> ChunkIter {
         match self {
-            Chunk::Added(items) => Iter::Added(items.iter()),
-            Chunk::Mask(_, mask) => Iter::Mask(mask.iter_ones()),
-            Chunk::Removed(items) => Iter::Removed(0..=u16::MAX, items.iter().peekable()),
+            Chunk::Added(items) => ChunkIter::Added(items.iter()),
+            Chunk::Mask(_, mask) => ChunkIter::Mask(mask.iter_ones()),
+            Chunk::Removed(items) => ChunkIter::Removed(0..=u16::MAX, items.iter().peekable()),
         }
     }
 
@@ -295,7 +517,7 @@ mod test {
     use itertools::Itertools;
     use rand::{thread_rng, Rng};
 
-    use super::{Chunk, SparseBits};
+    use super::{Chunk, TrigramSet};
 
 
     #[test]
@@ -320,7 +542,7 @@ mod test {
     #[test]
     fn single_values() {
         for ii in 0..=0xFFFFFF {
-            let mut bits = SparseBits::new();
+            let mut bits = TrigramSet::new();
             bits.insert(ii);
             assert!(bits.iter().eq([ii].iter().cloned()))
         }
@@ -329,7 +551,7 @@ mod test {
     #[test]
     fn adding_values() {
         // Have the first chunk of this map get fully saturated plus a little more
-        let mut bits = SparseBits::new();
+        let mut bits = TrigramSet::new();
         let mut values = vec![];
         for ii in 0..=0x01FFFF {
             bits.insert(ii);

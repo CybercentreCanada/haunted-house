@@ -269,7 +269,7 @@ impl AccessControl {
                 if common.len() == 0 {
                     return AccessControl::into_and(unfactored);
                 }
-                let common = AccessControl::into_or(common.clone().into_iter().collect());
+                let common = AccessControl::into_or(common.into_iter().collect());
 
                 if unfactored.len() == 0 {
                     return common;
@@ -333,7 +333,7 @@ mod parse {
         return Ok(access)
     }
 
-    fn parse_access<'a>(input: &'a str) -> IResult<&'a str, AccessControl> {
+    fn parse_access(input: &str) -> IResult<&str, AccessControl> {
         let (remain, access) = delimited(multispace0, alt((parse_literal, parse_and, parse_or, parse_always)), multispace0)(input)?;
         return Ok((remain, access))
     }
