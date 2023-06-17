@@ -127,7 +127,7 @@ impl BlobCache {
     pub async fn open(&self, id: String) -> Result<BlobHandle> {
         let (send, recv) = oneshot::channel();
         _ = self.connection.send(BlobCacheCommand::Open(id, send)).await;
-        Ok(recv.await??)
+        recv.await?
     }
 
     // pub async fn open_new(&self, id: String, size: u64) -> Result<BlobHandle> {
@@ -247,7 +247,7 @@ impl Inner {
                 if let Some(loaded) = self.pending.get(&id) {
                     let mut loaded = loaded.clone();
                     tokio::spawn(async move {
-                        while let Ok(_) = loaded.changed().await {
+                        while loaded.changed().await.is_ok() {
                             let entry = loaded.borrow();
                             if let Some(entry) = &*entry {
                                 if let Ok(entry) = entry {
@@ -378,7 +378,7 @@ impl Inner {
                 }
             },
             BlobCacheCommand::HandleDropped(id) => {
-                if self.waiting_for_space.len() > 0 {
+                if !self.waiting_for_space.is_empty() {
                     if let Entry::Occupied(entry) = self.open.entry(id) {
                         if entry.get().handle.count() == 1 {
                             self.committed_capacity -= entry.get().size;

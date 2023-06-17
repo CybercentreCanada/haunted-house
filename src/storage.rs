@@ -619,7 +619,7 @@ impl AzureBlobStore {
                             return;
                         },
                     };
-                    if let Err(_) = send.send(anyhow::Ok(data.to_vec())).await {
+                    if send.send(anyhow::Ok(data.to_vec())).await.is_err() {
                         return;
                     }
                 };
@@ -630,13 +630,13 @@ impl AzureBlobStore {
 
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         let mut recv = self.stream(label).await?;
-        Ok(tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::options().write(true).open(path)?;
             while let Some(data) = recv.blocking_recv() {
                 file.write_all(&data?)?;
             }
             return anyhow::Ok(())
-        }).await??)
+        }).await?
     }
 
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {

@@ -123,7 +123,7 @@ impl AccessControl {
         collected.sort();
         collected.dedup();
 
-        if collected.len() == 0 {
+        if collected.is_empty() {
             AccessControl::Always
         } else if collected.len() == 1 {
             collected.pop().unwrap()
@@ -163,7 +163,7 @@ impl AccessControl {
     }
 
     fn into_and(mut items: Vec<AccessControl>) -> AccessControl {
-        assert!(items.len() > 0);
+        assert!(!items.is_empty());
         items.sort();
         items.dedup();
         if items.len() == 1 {
@@ -173,7 +173,7 @@ impl AccessControl {
     }
 
     pub fn into_or(mut items: Vec<AccessControl>) -> AccessControl {
-        assert!(items.len() > 0);
+        assert!(!items.is_empty());
         items.sort();
         items.dedup();
         if items.len() == 1 {
@@ -192,7 +192,7 @@ impl AccessControl {
             let mut x = Vec::from_iter(op.difference(&common).cloned());
             x.sort();
             x.dedup();
-            if x.len() > 0 {
+            if !x.is_empty() {
                 unfactored.push(x)
             } else {
                 has_fallthrough = true;
@@ -266,12 +266,12 @@ impl AccessControl {
 
                 let mut unfactored: Vec<AccessControl> = unfactored.into_iter().map(AccessControl::into_or).collect();
 
-                if common.len() == 0 {
+                if common.is_empty() {
                     return AccessControl::into_and(unfactored);
                 }
                 let common = AccessControl::into_or(common.into_iter().collect());
 
-                if unfactored.len() == 0 {
+                if unfactored.is_empty() {
                     return common;
                 } else if unfactored.len() == 1 {
                     return unfactored.pop().unwrap() & common;

@@ -193,11 +193,11 @@ impl Database {
         }
     }
 
-    pub async fn select_file_hashes(&self, id: FilterID, file_indices: &Vec<u64>, access: &HashSet<String>) -> Result<Vec<Sha256>> {
+    pub async fn select_file_hashes(&self, id: FilterID, file_indices: &[u64], access: &HashSet<String>) -> Result<Vec<Sha256>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(SQLiteCommand::SelectFileHashes { id, file_indices: file_indices.clone(), access: access.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::SelectFileHashes { id, file_indices: file_indices.to_owned(), access: access.clone(), response: send }).await?;
                 resp.await?
             }
         }

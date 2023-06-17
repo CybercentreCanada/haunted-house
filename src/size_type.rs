@@ -8,7 +8,7 @@ pub fn deserialize_size<'de, D>(de: D) -> Result<u64, D::Error> where D: serde::
     match String::deserialize(de) {
         Ok(string) => {
             // Ok(parse_size::parse_size(&string)?)
-            match parse_size::parse_size(&string) {
+            match parse_size::parse_size(string) {
                 Ok(value) => Ok(value),
                 Err(err) => Err(D::Error::custom(err.to_string()))
             }
