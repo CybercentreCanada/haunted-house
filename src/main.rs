@@ -3,7 +3,7 @@
     unused_lifetimes, nonstandard_style, variant_size_differences)]
 #![deny(keyword_idents)]
 #![warn(clippy::missing_docs_in_private_items)]
-#![allow(clippy::needless_return)]
+#![allow(clippy::needless_return, clippy::while_let_on_iterator)]
 
 //!
 //! Haunted house is a microservice designed to sit behind Assemblyline malware triage systems

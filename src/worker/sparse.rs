@@ -1,4 +1,4 @@
-//! A helper class for storing a trigram bitmask as a set of sparse values.
+//! A helper class for storing a set of trigrams efficently.
 //!
 //! In the worst case this just falls back into a dense bitmap. For many small files however
 //! the dense bitmap uses far more memory than just storing a list of trigrams directly.
@@ -88,18 +88,20 @@ impl SparseBits {
         }
     }
 
-    /// Create an iterator over
+    /// Create an iterator over the indices of the set bits 
     pub fn iter(&self) -> SparseIterator {
         let mut iter = self.chunks.iter();
         let current = iter.next().unwrap();
         SparseIterator { iter, current_index: 0, current: current.iter() }
     }
 
+    /// Add a trigram to the bitset
     pub fn insert(&mut self, item: u32) {
         let bin = (item >> 16) as usize;
         self.chunks[bin].insert(item as u16);
     }
 
+    /// Adjust the encoding methods to suit the current content
     pub fn compact(&mut self) {
         for part in self.chunks.iter_mut() {
             part.compact();
@@ -119,11 +121,14 @@ impl SparseBits {
     }
 }
 
-
+/// A bitset over 2^16 values
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Chunk {
+    /// Bitset encoded as indices of each set bit
     Added(Vec<u16>),
+    /// Bitset incoded as a literal bit flag per value
     Mask(u16, Box<BitArray<[u64; 1024]>>),
+    /// Bitset encoded as indices of each unset bit
     Removed(Vec<u16>)
 }
 
@@ -149,9 +154,14 @@ impl Eq for Chunk {
 
 }
 
+/// Iterator over the set indices in the bitset chunk
 enum Iter<'a> {
+    /// Iterate over encoded indices directly
     Added(std::slice::Iter<'a, u16>),
+    /// Use bitset set bit index iterator directly
     Mask(bitvec::slice::IterOnes<'a, u64, bitvec::prelude::Lsb0>),
+    /// Iterate over exastive set of ranges, selecting the ones not set in the second iterartor 
+    /// over the list of unset bits
     Removed(std::ops::RangeInclusive<u16>, Peekable<std::slice::Iter<'a, u16>>)
 }
 
@@ -160,11 +170,8 @@ impl Iterator for Iter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Iter::Added(iter) => iter.next().as_deref().copied(),
-            Iter::Mask(iter) => match iter.next() {
-                Some(val) => Some(val as u16),
-                None => None,
-            },
+            Iter::Added(iter) => iter.next().copied(),
+            Iter::Mask(iter) => iter.next().map(|v|v as u16),
             Iter::Removed(iter, skip_list) => {
                 while let Some(next) = iter.next() {
                     match skip_list.peek() {
@@ -184,9 +191,13 @@ impl Iterator for Iter<'_> {
 
 
 impl Chunk {
+    /// Default empty chunk
     const EMPTY: Self = Self::Added(vec![]);
-    pub fn empty() -> Self { Self::EMPTY.clone() }
 
+    #[cfg(test)]
+    pub fn empty() -> Self { Self::EMPTY }
+
+    /// Create an iterator over the indices of set bits
     pub fn iter(&self) -> Iter {
         match self {
             Chunk::Added(items) => Iter::Added(items.iter()),
@@ -204,6 +215,7 @@ impl Chunk {
         }
     }
 
+    /// Add a value to the bitset
     pub fn insert(&mut self, item: u16) {
         match self {
             Chunk::Added(items) => { items.push(item); },
@@ -224,6 +236,7 @@ impl Chunk {
         }
     }
 
+    /// Adjust the encoding to suit the current content
     pub fn compact(&mut self) {
         match self {
             Chunk::Added(items) => {
