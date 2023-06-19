@@ -67,7 +67,11 @@ impl TrigramCache {
         }
 
         // Erase directory
-        return Ok(tokio::fs::remove_dir_all(self._filter_path(filter)).await?);
+        let dir = self._filter_path(filter);
+        if dir.exists() {
+            tokio::fs::remove_dir_all(dir).await?;
+        }
+        return Ok(())
     }
 
     pub async fn start_fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
@@ -228,10 +232,10 @@ async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>) -> 
 
 /// A helper class for storing a set of trigrams efficently.
 ///
-/// The trigrams are stored using a dynamic encoding where each block of 
+/// The trigrams are stored using a dynamic encoding where each block of
 /// 2^16 trigrams are each encoded separatly.
-/// For small sets of trigrams explicit lists of trigrams are used, for dense sets it 
-/// falls back into a bitmap. 
+/// For small sets of trigrams explicit lists of trigrams are used, for dense sets it
+/// falls back into a bitmap.
 #[derive(Debug, Clone)]
 pub struct TrigramSet {
     /// A list of chunks of the bitmap addressed by the highest 8 bits of the trigram.
@@ -310,7 +314,7 @@ impl TrigramSet {
         }
     }
 
-    /// Create an iterator over the indices of the set bits 
+    /// Create an iterator over the indices of the set bits
     pub fn iter(&self) -> TrigramIterator {
         let mut iter = self.chunks.iter();
         let current = iter.next().unwrap();
@@ -382,7 +386,7 @@ enum ChunkIter<'a> {
     Added(std::slice::Iter<'a, u16>),
     /// Use bitset set bit index iterator directly
     Mask(bitvec::slice::IterOnes<'a, u64, bitvec::prelude::Lsb0>),
-    /// Iterate over exastive set of ranges, selecting the ones not set in the second iterartor 
+    /// Iterate over exastive set of ranges, selecting the ones not set in the second iterartor
     /// over the list of unset bits
     Removed(std::ops::RangeInclusive<u16>, Peekable<std::slice::Iter<'a, u16>>)
 }

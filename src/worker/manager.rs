@@ -130,13 +130,13 @@ impl WorkerState {
         }
 
         // Delete data behind the worker
-        ExtensibleTrigramFile::delete(self.config.get_filter_directory(), id)?;
+        ExtensibleTrigramFile::delete(self.config.get_filter_directory(), id).context("Delete trigram index")?;
 
         // Delete the trigram cache data
-        self.trigrams.expire(id).await?;
+        self.trigrams.expire(id).await.context("flush trigram cache")?;
 
         // Delete the database info
-        self.database.delete_filter(id).await?;
+        self.database.delete_filter(id).await.context("Delete file info database")?;
         return Ok(())
     }
 

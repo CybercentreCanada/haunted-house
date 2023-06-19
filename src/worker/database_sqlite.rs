@@ -262,14 +262,14 @@ impl BufferedSQLite {
         rows.into_iter().map(|(id, expiry)|Ok((FilterID::from(id), ExpiryGroup::from(expiry)))).collect()
     }
 
-    pub async fn delete_filter(&mut self, name: FilterID) -> Result<()> {
+    pub async fn delete_filter(&mut self, id: FilterID) -> Result<()> {
         let mut con = self.db.begin().await?;
 
-        sqlx::query("DELETE FROM filters WHERE name = ?")
-            .bind(name.to_string())
+        sqlx::query("DELETE FROM filters WHERE id = ?")
+            .bind(id.to_string())
             .execute(&mut con).await?;
 
-        if let Some(channel) = self.workers.remove(&name) {
+        if let Some(channel) = self.workers.remove(&id) {
             let (send, recv) = oneshot::channel();
             channel.send(FilterCommand::DeleteFilter { response: send }).await?;
             recv.await??;
@@ -277,8 +277,8 @@ impl BufferedSQLite {
 
         con.commit().await?;
 
-        self.filter_sizes.write().await.remove(&name);
-        self.filter_pending.write().await.remove(&name);
+        self.filter_sizes.write().await.remove(&id);
+        self.filter_pending.write().await.remove(&id);
 
         return Ok(())
     }

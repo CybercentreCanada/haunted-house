@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "haunted-house"
-version = "0.0.20"
+version = "0.0.23"
 dependencies = [
  "anyhow",
  "assertor",
