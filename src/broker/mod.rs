@@ -379,7 +379,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     let mut unchecked_buffer = VecDeque::<IngestTask>::new();
     let mut check_worker: JoinSet<Result<()>> = JoinSet::new();
     let mut active_batch_size = 0;
-    let mut counter = crate::counters::RateCounter::new(60);
+    let mut counter = crate::counters::WindowCounter::new(60);
 
     loop {
         // Restart the check worker
@@ -549,7 +549,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
     let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
     let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
     query_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut counters = HashMap::<FilterID, crate::counters::RateCounter>::new();
+    let mut counters = HashMap::<FilterID, crate::counters::WindowCounter>::new();
     let start = std::time::Instant::now();
 
     {
@@ -645,7 +645,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         match counters.entry(filter) {
                             hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
                             hash_map::Entry::Vacant(entry) => {
-                                let mut counter = crate::counters::RateCounter::new(60 * 60);
+                                let mut counter = crate::counters::WindowCounter::new(60 * 60);
                                 counter.increment(1);
                                 entry.insert(counter);
                             },

@@ -1,9 +1,15 @@
+//!
+//! Utilities for logging.
+//!
 use std::time::Instant;
 
 use log::{debug, error};
 use poem::{Endpoint, Middleware, Request};
 
-
+/// Middleware for poem http server to add query logging
+///
+/// Successful queries are logged at the debug level. Errors at the error level.
+/// All logs include the time elapsed processing the request.
 pub struct LoggerMiddleware;
 
 impl<E: Endpoint> Middleware<E> for LoggerMiddleware {
@@ -14,7 +20,9 @@ impl<E: Endpoint> Middleware<E> for LoggerMiddleware {
     }
 }
 
+/// Endpoint wrapper that implements the details of `LoggerMiddleware`
 pub struct LoggerMiddlewareImpl<E> {
+    /// Inner endpoint wrapped by this object
     ep: E,
 }
 
