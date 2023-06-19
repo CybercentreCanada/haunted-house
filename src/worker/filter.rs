@@ -132,6 +132,15 @@ impl<'a> RawSegmentInfo<'a> {
     }
 }
 
+fn remove_file(path: &Path) -> Result<()> {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err.into());
+        }
+    };
+    return Ok(())
+}
+
 impl ExtensibleTrigramFile {
     /// Create a new trigram index file.
     ///
@@ -208,9 +217,9 @@ impl ExtensibleTrigramFile {
     pub fn delete(directory: PathBuf, id: FilterID) -> Result<()> {
         let journals = get_operation_journals(&directory, id)?;
         for (_, path) in journals {
-            std::fs::remove_file(&path)?;
+            remove_file(&path)?;
         }
-        std::fs::remove_file(directory.join(format!("{id}")))?;
+        remove_file(&directory.join(format!("{id}")))?;
         return Ok(())
     }
 
