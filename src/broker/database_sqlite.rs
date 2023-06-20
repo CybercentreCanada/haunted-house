@@ -15,19 +15,8 @@ use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestRespons
 
 pub struct SQLiteInterface {
     db: SqlitePool,
-    // work_notification: tokio::sync::Notify,
     _temp_dir: Option<tempfile::TempDir>,
 }
-
-// #[derive(Serialize, Deserialize)]
-// struct FileEntry {
-//     access: AccessControl,
-//     hash: Vec<u8>
-// }
-
-// fn filter_table_name(name: &IndexID) -> String {
-//     format!("filter_{name}")
-// }
 
 #[derive(Serialize, Deserialize)]
 pub struct SearchRecord {

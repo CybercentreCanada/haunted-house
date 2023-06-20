@@ -1,3 +1,6 @@
+//!
+//! Tool for handing data access control restrictions.
+//!
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -7,15 +10,21 @@ use anyhow::Result;
 
 use crate::error::ErrorKinds;
 
-
+/// An object describing who can access a given item
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub enum AccessControl {
+    /// Allow access when any of the sub-controls allow access
     Or(Vec<AccessControl>),
+    /// Allow access only when all of the sub-controls allow access
     And(Vec<AccessControl>),
+    /// Allow access when the user has this token in their permissions
     Token(String),
+    /// Always allow access to the given resource
     Always,
-    // Never,
 }
+
+/// An object describing what assets a user can access
+pub type ViewControl = HashSet<String>;
 
 impl Display for AccessControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -103,6 +112,7 @@ impl core::ops::BitOr<&AccessControl> for AccessControl {
 }
 
 impl AccessControl {
+    /// Combine this access controls with another, joined by an 'or' operation.
     pub fn or(&self, other: &AccessControl) -> AccessControl {
         let mut collected = vec![];
         match self {
@@ -110,14 +120,12 @@ impl AccessControl {
             AccessControl::And(values) => collected.push(AccessControl::And(values.clone())),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
             AccessControl::Always => return AccessControl::Always,
-            // AccessControl::Never => {},
         }
         match other {
             AccessControl::Or(values) => collected.extend(values.clone()),
             AccessControl::And(values) => collected.push(AccessControl::And(values.clone())),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
             AccessControl::Always => return AccessControl::Always,
-            // AccessControl::Never => {},
         }
 
         collected.sort();
@@ -132,6 +140,7 @@ impl AccessControl {
         }
     }
 
+    /// Combine this access controls with another, joined by an 'and' operation.
     pub fn and(&self, other: &AccessControl) -> AccessControl {
         let mut collected = vec![];
         match self {
@@ -139,14 +148,12 @@ impl AccessControl {
             AccessControl::And(values) => collected.extend(values.clone()),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
             AccessControl::Always => {},
-            // AccessControl::Never => return AccessControl::Never,
         }
         match other {
             AccessControl::Or(values) => collected.push(AccessControl::Or(values.clone())),
             AccessControl::And(values) => collected.extend(values.clone()),
             AccessControl::Token(token) => collected.push(AccessControl::Token(token.clone())),
             AccessControl::Always => {},
-            // AccessControl::Never => return AccessControl::Never,
         }
 
         collected.sort();
@@ -158,10 +165,12 @@ impl AccessControl {
         return AccessControl::And(collected);
     }
 
+    /// Combine a set of access controls under an 'and' operation
     fn set_into_and(items: HashSet<AccessControl>) -> AccessControl {
         return AccessControl::into_and(items.into_iter().collect())
     }
 
+    /// Combine a list of access controls under an 'and' operation
     fn into_and(mut items: Vec<AccessControl>) -> AccessControl {
         assert!(!items.is_empty());
         items.sort();
@@ -172,6 +181,7 @@ impl AccessControl {
         return AccessControl::And(items);
     }
 
+    /// Combine a list of access controls under an 'or' operation
     pub fn into_or(mut items: Vec<AccessControl>) -> AccessControl {
         assert!(!items.is_empty());
         items.sort();
@@ -182,6 +192,7 @@ impl AccessControl {
         return AccessControl::Or(items);
     }
 
+    /// Simplify the set of access control objects by factoring out common terms.
     pub fn factor(items: Vec<HashSet<AccessControl>>) -> (HashSet<AccessControl>, Vec<Vec<AccessControl>>, bool) {
         let common = items.iter().cloned().reduce(|a, b| HashSet::from_iter(a.intersection(&b).cloned())).unwrap();
 
@@ -205,6 +216,7 @@ impl AccessControl {
         return (common, unfactored, has_fallthrough)
     }
 
+    /// Try to simplify the access control object through some simple and greedy transforms.
     pub fn simplify(self) -> AccessControl {
         match self {
             AccessControl::Or(items) => {
@@ -285,7 +297,8 @@ impl AccessControl {
         };
     }
 
-    pub fn can_access(&self, fields: &HashSet<String>) -> bool {
+    /// Check whether a given viewer can access the controlled data
+    pub fn can_access(&self, fields: &ViewControl) -> bool {
         match self {
             AccessControl::Or(sub) => {
                 for ac in sub {
@@ -309,7 +322,7 @@ impl AccessControl {
     }
 }
 
-
+/// Parse access control information from a string
 mod parse {
 
     use nom::branch::alt;
@@ -322,6 +335,7 @@ mod parse {
 
     use super::AccessControl;
 
+    /// Root parse function, consumes all input
     pub fn access(input: &str) -> Result<AccessControl, ErrorKinds> {
         let (remain, access) = match parse_access(input) {
             Ok(result) => result,
@@ -333,29 +347,34 @@ mod parse {
         return Ok(access)
     }
 
+    /// parse_access: parse_literal | parse_and | parse_or | parse_always
     fn parse_access(input: &str) -> IResult<&str, AccessControl> {
         let (remain, access) = delimited(multispace0, alt((parse_literal, parse_and, parse_or, parse_always)), multispace0)(input)?;
         return Ok((remain, access))
     }
 
+    /// parse_and: "and" "(" parse_access ("," parse_access)* ")"
     fn parse_and(input: &str) -> IResult<&str, AccessControl> {
         let (remain, (_, _, _, mut inner, _)) = tuple((tag_no_case("and"), multispace0, tag("("), separated_list1(tag(","), parse_access), tag(")")))(input)?;
         inner.sort();
         return Ok((remain, AccessControl::And(inner)))
     }
 
+    /// parse_or: "or" "(" parse_access ("," parse_access)* ")"
     fn parse_or(input: &str) -> IResult<&str, AccessControl> {
         let (remain, (_, _, _, mut inner, _)) = tuple((tag_no_case("or"), multispace0, tag("("), separated_list1(tag(","), parse_access), tag(")")))(input)?;
         inner.sort();
         return Ok((remain, AccessControl::Or(inner)))
     }
 
+    /// A quoted alphanumeric access token
     fn parse_literal(input: &str) -> IResult<&str, AccessControl> {
         let (remain, (_, value, _)) = tuple((tag("\""), many1(alt((tag("\\\\"), tag("\\\""), is_not("\"")))), tag("\"")))(input)?;
         let literal = value.join("");
         return Ok((remain, AccessControl::Token(literal)));
     }
 
+    /// A keyword to always allow access (not quoted, won't be confused with parse_literal)
     fn parse_always(input: &str) -> IResult<&str, AccessControl> {
         let (remain, _) = tag_no_case("always")(input)?;
         return Ok((remain, AccessControl::Always))
