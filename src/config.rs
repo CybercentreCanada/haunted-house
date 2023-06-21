@@ -1,12 +1,11 @@
-
+//! Layout and parsing tools for server configuration
 use std::collections::HashMap;
 use std::path::PathBuf;
 use anyhow::Result;
 
 use serde::{Serialize, Deserialize};
 use crate::broker::auth::Role;
-use crate::size_type::{deserialize_size, serialize_size};
-use crate::types::WorkerID;
+use crate::types::{WorkerID, serialize_size, deserialize_size};
 
 
 #[derive(Debug, Serialize, Deserialize)]

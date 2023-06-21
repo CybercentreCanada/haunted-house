@@ -1,10 +1,12 @@
+//! Error handling tools. Mostly methods to transform library errors into a common enum type.
 use crate::types::FilterID;
 
-
-
+/// enumeration of all error codes
 #[derive(Debug, PartialEq)]
 pub enum ErrorKinds {
+    /// A requested blob won't fit within the limit specified for a cache
     BlobTooLargeForCache,
+    /// A blob which does not exist was requested.
     BlobNotFound,
     // InvalidHashProduced,
     // IndexHasInvalidMagic,
@@ -12,17 +14,28 @@ pub enum ErrorKinds {
     // IndexHasUnsupportedType,
     // IndexCorruptTable,
     // VarintIncomplete,
+    /// A filter was requested which does not exist
     FilterUnknown(FilterID),
+    /// An otherwise not distinguished error occurred with S3
     OtherS3Error(String),
     // CorruptFilterID,
+    /// An otherwise not distinguished error occurred with database access
     DatabaseError(String),
+    /// Invalid data was provided for a sha256
     Sha256Corrupt,
+    /// An error occurred trying to collect and build the trigram set for a file
     UnableToBuildTrigrams,
+    /// An otherwise not distinguished error occurred serializing data
     Serialization(String),
+    /// A tokio error occurred trying to join a task
     JoinError,
+    /// An otherwise not distinguished IO error
     IOError(String),
+    /// An error occurred within the tokio channels
     ChannelError(String),
+    /// An access control could not be parsed from the given string
     CouldNotParseAccessString(String, String),
+    /// An access control could not be parsed from the given string because part of the string couldn't be consumed
     CouldNotParseAccessStringTrailing(String, String),
 }
 

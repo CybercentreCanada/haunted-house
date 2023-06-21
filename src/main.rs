@@ -13,7 +13,6 @@
 mod config;
 mod storage;
 mod timing;
-mod size_type;
 mod query;
 mod error;
 mod access;

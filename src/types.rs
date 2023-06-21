@@ -3,7 +3,8 @@
 //!
 
 use chrono::{DateTime, Utc, Datelike};
-use serde::{Serialize, Deserialize};
+use serde::Serializer;
+use serde::{Serialize, Deserialize, de::Error};
 use serde_with::{SerializeDisplay, DeserializeFromStr};
 
 use crate::access::AccessControl;
@@ -190,4 +191,26 @@ impl std::fmt::Display for WorkerID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+
+/// A helper function for deserializing human readable qualtities (10k 10m 10g)
+pub fn deserialize_size<'de, D>(de: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
+    // de.deserialize_u64(SizeVisitor)
+    // de.deserialize(SizeVisitor)
+    match String::deserialize(de) {
+        Ok(string) => {
+            // Ok(parse_size::parse_size(&string)?)
+            match parse_size::parse_size(string) {
+                Ok(value) => Ok(value),
+                Err(err) => Err(D::Error::custom(err.to_string()))
+            }
+        },
+        Err(err) => Err(err),
+    }
+}
+
+/// A helper functino for serializing human readable quantities
+pub fn serialize_size<S>(value: &u64, ser: S) -> Result<S::Ok, S::Error> where S: Serializer {
+    ser.serialize_str(&value.to_string())
 }

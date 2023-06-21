@@ -1,21 +1,27 @@
+//! A tool for creating temporary sets of unique data backed by sqlite
+
 use std::marker::PhantomData;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
-use serde::{Serialize};
+use serde::Serialize;
 use sqlx::SqlitePool;
 use anyhow::{Result, Context};
 use sqlx::pool::PoolOptions;
 
-
+/// A set of unique objects, backed by sqlite
 pub struct SqliteSet<Item: Serialize + DeserializeOwned> {
+    /// Sqlite connection
     db: SqlitePool,
+    /// A scope guard making sure a temporary directory holding this set gets cleaned up on drop
     _temp_dir: Option<tempfile::TempDir>,
+    /// A symbol tying the Item type to this struct forcing all items in a set to be that type
     _item_type: PhantomData<Item>
 }
 
 
 impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
+    /// Construct a file backed set at the given path
     pub async fn new(url: &str) -> Result<Self> {
         let url = if url == "memory" {
             String::from("sqlite::memory:")
@@ -49,6 +55,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         })
     }
 
+    /// Create a file backed set in a temporary directory
     pub async fn new_temp() -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let path = tempdir.path().join("set.db");
@@ -59,6 +66,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         Ok(obj)
     }
 
+    /// Setup the database
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;
 
@@ -71,26 +79,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         return Ok(())
     }
 
-    // #[cfg(test)]
-    // pub async fn insert(&self, item: &Item) -> Result<bool> {
-    //     // Insert file entry
-    //     let result = sqlx::query(&format!("INSERT INTO dataset(data) VALUES(?)"))
-    //     .bind(postcard::to_allocvec(&item)?)
-    //     .execute(&self.db).await;
-    //     match result {
-    //         Ok(_) => return Ok(true),
-    //         Err(err) => {
-    //             let constraint_failed = err.to_string().contains("UNIQUE constraint failed")
-    //                 || err.to_string().contains("1062 (23000)");
-
-    //             if constraint_failed {
-    //                 return Ok(false)
-    //             }
-    //             return Err(err.into())
-    //         },
-    //     };
-    // }
-
+    /// Insert a batch objects
     pub async fn insert_batch(&self, items: &[Item]) -> Result<()> {
         let mut trans = self.db.begin().await?;
 
@@ -117,6 +106,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         return Ok(())
     }
 
+    /// Pop up to limit items from the set
     pub async fn pop_batch(&self, limit: u32) -> Result<Vec<Item>> {
         let query_str = format!("DELETE FROM dataset WHERE data IN (SELECT data FROM dataset LIMIT {limit}) RETURNING data");
         let data: Vec<(Vec<u8>, )> = sqlx::query_as(&query_str).fetch_all(&self.db).await?;
@@ -127,6 +117,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
         return Ok(output);
     }
 
+    /// Get how many items are in the set
     pub async fn len(&self) -> Result<u64> {
         let query_str = "SELECT count(1) FROM dataset";
         let (hits, ): (i64, ) = sqlx::query_as(query_str).fetch_one(&self.db).await?;

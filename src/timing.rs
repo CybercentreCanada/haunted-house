@@ -1,5 +1,10 @@
+//!
+//! Tools used to capture timing information when profiling.
+//!
+
 use std::cell::RefCell;
 use std::collections::HashSet;
+use itertools::Itertools;
 
 use lazy_static::lazy_static;
 
@@ -8,36 +13,42 @@ lazy_static! {
     static ref HERITAGE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Default::default());
 }
 
+/// Trait that describes an object that can be used to capture timing spans
 pub trait TimingCapture {
+    /// Type used as a scope guard in the timing capture
     type Mark: TimingCapture;
-
+    /// Create an id identifying a capture span
     fn new_id(&self, label: &str) -> usize;
-    // fn child_id(&self, parent: usize) -> usize;
+    /// Add time to the capture for the given span
     fn add(&self, index: usize, value: f64);
+    /// Build a scope guard object for the given span
     fn build(&self, index: usize) -> Self::Mark;
 }
 
-struct Inner {
-    times: Vec<f64>,
-    calls: Vec<u64>,
-    // heritage: Vec<(usize, usize)>,
-    // labels: Vec<String>,
-}
-
+/// A capture of timing information for single invocation of timed code
 pub struct Capture {
+    /// runtime checked mutable inner data pointer
     data: RefCell<Inner>
 }
 
+/// Data for a capture
+struct Inner {
+    /// Accumulated time for each span encountered
+    times: Vec<f64>,
+    /// Invocation count for each span encountered
+    calls: Vec<u64>,
+}
+
 impl Capture {
+    /// Create a new capture object
     pub fn new() -> Self {
         Self{data: RefCell::new(Inner {
             times: vec![],
             calls: vec![],
-            // heritage: vec![],
-            // labels: vec![],
         })}
     }
 
+    /// Allocate a new span id
     fn child_id(&self, parent: usize, label: &str) -> usize {
         let new_index = self.new_id(label);
         let mut heritage = HERITAGE.lock().unwrap();
@@ -50,6 +61,7 @@ impl Capture {
         println!("{}", self.format())
     }
 
+    /// Print the information captured by the span
     pub fn format(&self) -> String {
         let mut parents = HashSet::new();
         let mut children = HashSet::new();
@@ -84,6 +96,7 @@ impl Capture {
         return lines.into_iter().join("\n")
     }
 
+    /// helper function for 'format'
     fn format_item(&self, index: usize, prefix: &str, heritage: &Vec<(usize, usize)>, labels: &Vec<String>, out: &mut Vec<String>) {
         // Gather children
         let mut children = vec![];
@@ -110,6 +123,7 @@ impl Capture {
     }
 }
 
+/// Format a span in seconds into human readable units
 fn format_time(seconds: f64) -> String {
     if seconds > 0.1 {
         format!("{seconds:.2}s")
@@ -123,44 +137,6 @@ fn format_time(seconds: f64) -> String {
         String::from("0s")
     }
 }
-
-// impl<'a> TimingCapture for Capture {
-//     type Mark = Mark<'a>;
-
-//     fn new_id(&self, label: &str) -> usize {
-//         let mut data = self.data.borrow_mut();
-//         let new_index = data.times.len();
-//         let new_len = data.times.len() + 1;
-//         data.times.resize(new_len, 0.0);
-//         data.calls.resize(new_len, 0);
-//         data.labels.push(label.to_owned());
-//         new_index
-//     }
-
-//     fn add(&self, index: usize, value: f64) {
-//         let mut data = self.data.borrow_mut();
-//         data.times[index] += value;
-//         data.calls[index] += 1;
-//     }
-
-//     fn build<'a>(&'a self, index: usize) -> Mark<'a> {
-//         Mark{time: std::time::Instant::now(), capture: self, index}
-//     }
-// }
-
-// static mut LABELS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Default::default());
-
-
-
-// lazy_static! {
-//     static ref HASHMAP: HashMap<u32, &'static str> = {
-//         let mut m = HashMap::new();
-//         m.insert(0, "foo");
-//         m.insert(1, "bar");
-//         m.insert(2, "baz");
-//         m
-//     };
-// }
 
 impl<'a> TimingCapture for &'a Capture {
     type Mark = Mark<'a>;
@@ -194,10 +170,13 @@ impl<'a> TimingCapture for &'a Capture {
     }
 }
 
-
+/// A span marker scope guard to capture the time spent in a given span
 pub struct Mark<'a> {
+    /// Time that the span was entered
     time: std::time::Instant,
+    /// The capture to store runtime information into when this span exits
     capture: &'a Capture,
+    /// Id of the span
     index: usize,
 }
 
@@ -223,6 +202,7 @@ impl<'a> TimingCapture for Mark<'a> {
     }
 }
 
+/// Helper macro to indicate timing capture sites
 macro_rules! mark {
     ($capture:ident) => {
         {
@@ -251,12 +231,13 @@ macro_rules! mark {
         }
     }
 }
-use itertools::Itertools;
 pub(crate) use mark;
 
+/// A null capture object that doesn't actually do anything
 pub struct NullCapture {}
 
 impl NullCapture {
+    /// Create a non-capturing drop in
     pub fn new() -> Self {
         Self{}
     }
@@ -269,33 +250,3 @@ impl TimingCapture for NullCapture {
     fn add(&self, _index: usize, _value: f64) { }
     fn build(&self, _index: usize) -> Self::Mark { Self::new() }
 }
-
-// macro_rules! measure {
-//     ($capture:ident,$label:expr,$code:block) => {
-//         {
-
-//         }
-//     }
-// }
-
-
-// fn do_nothing<T: TimingCapture>(capture: T) {
-//     measure!(capture, "do_nothing", {
-//         for _ii in 0 .. 2 {
-//             let _inside = mark!(outside, "iteration");
-//             println!("hello");
-//         }
-//         {
-//             let _other = mark!(outside, "slow");
-//             std::thread::sleep(std::time::Duration::from_secs_f64(0.4));
-//         }
-//     })
-// }
-
-
-// fn main() {
-//     let capture = Capture::new();
-//     do_nothing(&capture);
-//     capture.print();
-// }
-
