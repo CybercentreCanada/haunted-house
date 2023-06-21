@@ -1,5 +1,6 @@
+//! An implementation of the broker database in sqlite.
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path};
+use std::path::Path;
 
 use anyhow::{Result, Context};
 use itertools::Itertools;
@@ -13,28 +14,45 @@ use crate::types::{ExpiryGroup, Sha256};
 
 use super::interface::{SearchRequest, InternalSearchStatus, SearchRequestResponse, SearchProgress};
 
+
+/// An implementation of the broker database in sqlite.
 pub struct SQLiteInterface {
+    /// sqlite database connection pool
     db: SqlitePool,
+    /// optionally a scope guard ensuring that any temporary directories are deleted on exit
     _temp_dir: Option<tempfile::TempDir>,
 }
 
+/// Database record describing a search, either in progress or completed.
 #[derive(Serialize, Deserialize)]
 pub struct SearchRecord {
+    /// ID code that identifies a search 
     pub code: String,
+    /// Signature that is being run for this search
     pub yara_signature: String,
+    /// The filter query derived from the yara signature
     pub query: Query,
+    /// control describing what permissions are required to view this search
     pub view: AccessControl,
+    /// permissions describing what files can be seen by by this search
     pub access: HashSet<String>,
+    /// List of errors encountered by running this search
     pub errors: Vec<String>,
+    /// Earliest expiry group this search will include
     pub start_date: ExpiryGroup,
+    /// Latest expiry group this search will include
     pub end_date: ExpiryGroup,
+    /// List of files hit on by this search
     pub hit_files: BTreeSet<Sha256>,
+    /// Is the list of hit_files truncated
     pub truncated: bool,
+    /// Is this search finished
     pub finished: bool,
 }
 
 
 impl SQLiteInterface {
+    /// Open or create the database at the given path.
     pub async fn new(url: &str) -> Result<Self> {
 
         let url = if url == "memory" {
@@ -69,6 +87,7 @@ impl SQLiteInterface {
         })
     }
 
+    /// Open a new database in a temporary directory
     pub async fn new_temp() -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let path = tempdir.path().join("house.db");
@@ -79,6 +98,7 @@ impl SQLiteInterface {
         Ok(obj)
     }
 
+    /// Setup the tables and configuration of the database.
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;
 
@@ -97,12 +117,13 @@ impl SQLiteInterface {
         return Ok(())
     }
 
+    /// List all searches that aren't finished.
     pub async fn list_active_searches(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = query_as("SELECT code FROM searches WHERE finished IS FALSE").fetch_all(&self.db).await?;
         Ok(rows.into_iter().map(|(code, )|code).collect_vec())
     }
 
-
+    /// Store a search that has yet to run
     pub async fn initialize_search(&self, code: &str, req: &SearchRequest) -> Result<InternalSearchStatus> {
         // Turn the expiry dates into a group range
         let start = match req.start_date {
@@ -139,6 +160,7 @@ impl SQLiteInterface {
         }
     }
 
+    /// Save the results and complete a search
     pub async fn finalize_search(&self, code: &str, hits: BTreeSet<Sha256>, errors: Vec<String>, truncated: bool) -> Result<()> {
         let mut record = match self.search_record(code).await? {
             Some(record) => record,
@@ -158,6 +180,7 @@ impl SQLiteInterface {
         return Ok(())
     }
 
+    /// Get the system internal search record
     pub async fn search_record(&self, code: &str) -> Result<Option<SearchRecord>> {
         let row: Option<(Vec<u8>, )> = sqlx::query_as("SELECT data FROM searches WHERE code = ?")
             .bind(code)
@@ -169,6 +192,7 @@ impl SQLiteInterface {
         })
     }
 
+    /// Get the search status approprate for the API
     pub async fn search_status(&self, code: &str) -> Result<Option<InternalSearchStatus>> {
         let record = self.search_record(code).await?;
         Ok(match record {
