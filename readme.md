@@ -2,6 +2,8 @@
 
 # todo
 
+- also check maximum files per filter against the chunk size and chunk index limit
+
 ## Integration
 - documentation
 

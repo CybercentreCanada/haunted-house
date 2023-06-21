@@ -7,15 +7,19 @@ use serde::{Serialize, Deserialize};
 use crate::broker::auth::Role;
 use crate::types::{WorkerID, serialize_size, deserialize_size};
 
-
+/// Static assignment of an api key to a set of roles
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StaticKey {
+    /// API key to be assigned
     pub key: String,
+    /// Set of roles assigned to key
     pub roles: Vec<Role>
 }
 
+/// Configuration for authentication to the server's api
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Authentication {
+    /// Access granted via statically defined api keys
     pub static_keys: Vec<StaticKey>,
 }
 
@@ -33,11 +37,15 @@ impl Default for Authentication {
     }
 }
 
+/// Configuration of the server's database
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Database {
+    /// Server will use an sqlite database loaded on a fixed path
     SQLite {
+        /// directory where sqlite database can be written
         path: String,
     },
+    /// Server will use an squlite database loaded into a temporary directory
     SQLiteTemp,
 }
 
@@ -47,14 +55,20 @@ impl Default for Database {
     }
 }
 
+/// Configure directory to use as local cache for blob storage
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CacheConfig {
+    /// Use a system defined temporary directory 
     TempDir{
+        /// Number of bytes to let the cache occupy
         #[serde(deserialize_with="deserialize_size", serialize_with="serialize_size")]
         size: u64
     },
+    /// Use a fixed directory for the blob cache
     Directory {
+        /// Path to directory for blob cache
         path: String,
+        /// Number of bytes to let the cache occupy
         #[serde(deserialize_with="deserialize_size", serialize_with="serialize_size")]
         size: u64
     },
@@ -69,18 +83,25 @@ impl Default for CacheConfig {
     }
 }
 
+/// Information server can use to configure its tls binding
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TLSConfig {
+    /// Private key for the server certificate
     pub key_pem: String,
+    /// TLS certificate for the server to use 
     pub certificate_pem: String
 }
 
+/// Authentication information for broker's http client when connecting to workers
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerTLSConfig {
+    /// Accept whatever self signed certificate the worker presents
     AllowAll,
+    /// Only allow connections to workers presenting certificates signed by this CA
     Certificate(String)
 }
 
+/// hostname which can be used to locate a worker node
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkerAddress(String);
 
@@ -91,58 +112,104 @@ impl From<&str> for WorkerAddress {
 }
 
 impl WorkerAddress {
+    /// Build a url to access the worker via http
     pub fn http(&self, path: &str) -> anyhow::Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!("https://{}", self.0))?.join(path)?)
     }
+    /// Build a url to access the worker via websocket
     pub fn websocket(&self, path: &str) -> anyhow::Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!("wss://{}", self.0))?.join(path)?)
     }
 }
 
-enum IngestSource {
-    Elasticsearch {
-        url: String,
-        username: String,
-        password: String,
-        index: String,
-    }
+/// Path to use to extract data from a json document
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FieldExtractor(Vec<String>);
+
+/// Pull file information from an elasticsearch server
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ElasticsearchIngestSource {
+    /// Url to connect to elasticsearch server
+    url: String,
+    /// Username to authenticate with
+    username: String,
+    /// Password to authenticate with
+    password: String,
+    /// Index name to read files from
+    index: String,
+    /// How to extract the sha256 from a document returned by elasticsearch
+    #[serde(default="default_sha256_extractor")]
+    sha256_extractor: FieldExtractor,
+    /// How to extract the access control from a document returned by elasticsearch
+    #[serde(default="default_access_extractor")]
+    access_extractor: FieldExtractor,
+    /// How to extract the expiry from a document returned by elasticsearch
+    #[serde(default="default_expiry_extractor")]
+    expiry_extractor: FieldExtractor
 }
 
+/// Configure a source for file ingestion
+#[derive(Debug, Serialize, Deserialize)]
+pub enum IngestSource {
+    /// Pull file information from an elasticsearch server
+    Elasticsearch(ElasticsearchIngestSource)
+}
 
+/// Default field path to use reading sha256 for ingested file
+fn default_sha256_extractor() -> FieldExtractor { FieldExtractor(vec!["sha256".to_owned()]) }
+/// Default field path to use reading access control for ingested file
+fn default_access_extractor() -> FieldExtractor { FieldExtractor(vec!["classification".to_owned()]) }
+/// Default field path to use reading expiry for ingested file
+fn default_expiry_extractor() -> FieldExtractor { FieldExtractor(vec!["expiry_ts".to_owned()]) }
+
+/// broker server configuration details
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoreConfig {
+    /// List of workers controlled by the broker server
     pub workers: HashMap<WorkerID, WorkerAddress>,
+    /// Certificate used to secure connection with broker server
     pub worker_certificate: WorkerTLSConfig,
+    /// Maximum number of files that may be pending per filter file
     #[serde(default="default_per_filter_pending_limit")]
     pub per_filter_pending_limit: u64,
+    /// Maximum number of filter files belonging to the same expiry 
+    /// group that may be co-located on a single worker
     #[serde(default="default_per_worker_group_duplication")]
     pub per_worker_group_duplication: u32,
+    /// Maximum number of files that may be counted as hits for a single search
+    /// before the result set is truncated
     #[serde(default="default_search_hit_limit")]
     pub search_hit_limit: usize,
+    /// Maximum number of concurrent yara jobs assigned to a worker node
     #[serde(default="default_yara_jobs_per_worker")]
     pub yara_jobs_per_worker: usize,
+    /// Maximum number of files per yara job
     #[serde(default="default_yara_batch_size")]
     pub yara_batch_size: u32,
+    /// Maximum number of files in a single filter file
     #[serde(default="default_filter_item_limit")]
     pub filter_item_limit: u64,
 }
 
+/// default value for per_filter_pending_limit
 fn default_per_filter_pending_limit() -> u64 { 1000 }
+/// default value for per_worker_group_duplication
 fn default_per_worker_group_duplication() -> u32 { 2 }
+/// default value for search_hit_limit
 fn default_search_hit_limit() -> usize { 50000 }
+/// default value for yara_jobs_per_worker
 fn default_yara_jobs_per_worker() -> usize { 2 }
+/// default value for yara_batch_size
 fn default_yara_batch_size() -> u32 { 100 }
+/// default value for filter_item_limit
 fn default_filter_item_limit() -> u64 { 50_000_000 }
 
+/// Root configuration schema for broker server
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub authentication: Authentication,
     pub database: Database,
     pub core: CoreConfig,
-    // pub cache: CacheConfig,
-    // pub files: crate::storage::BlobStorageConfig,
-    // pub blobs: crate::storage::BlobStorageConfig,
-
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
 }
