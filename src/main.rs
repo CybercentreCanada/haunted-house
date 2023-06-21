@@ -14,6 +14,7 @@ mod config;
 mod storage;
 mod timing;
 mod query;
+mod classification;
 mod error;
 mod access;
 mod types;

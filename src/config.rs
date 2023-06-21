@@ -99,6 +99,15 @@ impl WorkerAddress {
     }
 }
 
+enum IngestSource {
+    Elasticsearch {
+        url: String,
+        username: String,
+        password: String,
+        index: String,
+    }
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoreConfig {
