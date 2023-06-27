@@ -1,3 +1,6 @@
+//!
+//! This module implements the broker that acts as the entry point to the system.
+//!
 pub mod interface;
 pub mod auth;
 mod database;
@@ -32,6 +35,7 @@ use self::auth::Authenticator;
 use self::database::Database;
 use self::interface::{InternalSearchStatus, SearchRequest, StatusReport};
 
+/// Entry point function to the broker
 pub async fn main(config: crate::config::Config) -> Result<()> {
     // Initialize authenticator
     info!("Initializing Authenticator");
@@ -62,21 +66,32 @@ pub async fn main(config: crate::config::Config) -> Result<()> {
     return Ok(())
 }
 
-
+/// Bundle of values tracking a search
+/// The handle for the search task
+/// the channel for communicating with that task
 type SearchInfo = (JoinHandle<()>, mpsc::Sender<SearcherMessage>);
 
+/// Information encapsulating the broker state
 pub struct HouseCore {
+    /// Connection to the database where searches are stored
     pub database: Database,
+    /// HTTP client for talking to workers
     pub client: ClientWithMiddleware,
+    /// Websocket connector info for connecting to workers
     pub ws_connector: tokio_tungstenite::Connector,
-//     // pub quit_trigger: tokio::sync::watch::Sender<bool>,
-//     // pub quit_signal: tokio::sync::watch::Receiver<bool>,
+    /// Authentication information controlling which api tokens have what roles
     pub authenticator: Authenticator,
+    /// configuration information tuning the system behaviour
     pub config: CoreConfig,
+    /// Queue of files waiting to be ingested
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
+    /// Set of files that couldn't be quickly accepted by any worker
     pub pending_assignments: RwLock<HashMap<ExpiryGroup, VecDeque<IngestTask>>>,
+    /// tasks pushing new files to the corresponding worker
     pub worker_ingest: RwLock<HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>>,
+    /// Set of running searches
     pub running_searches: RwLock<HashMap<String, SearchInfo>>,
+    /// Pool of permits limiting the assignment of yara tasks to a fixed number per worker
     pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, WorkerAddress)>,
 }
 
@@ -137,8 +152,6 @@ impl HouseCore {
         // Create core object
         let core = Arc::new(Self {
             database,
-            // quit_trigger,
-            // quit_signal,
             authenticator,
             ingest_queue: send_ingest,
             config,
@@ -148,8 +161,6 @@ impl HouseCore {
             pending_assignments: RwLock::new(Default::default()),
             running_searches: RwLock::new(Default::default()),
             yara_permits
-            // search_watchers: send_search,
-            // garbage_collection_notification: tokio::sync::Notify::new()
         });
 
         // Revive search workers for ongoing searches
@@ -192,44 +203,12 @@ impl HouseCore {
         return Ok(res)
     }
 
-    // pub async fn create_new_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup, filter_id: ) -> Result<FilterID> {
-    //     info!("Create new filter for worker {worker} in expiry group {expiry}");
-    //     // let filter_id = self.database.create_filter(&worker, &expiry).await?;
-    //     self.install_filter(worker, expiry, filter_id).await?;
-    //     return Ok(filter_id)
-    // }
-
-    // pub async fn install_filter(self: &Arc<Self>, worker: WorkerID, expiry: ExpiryGroup, filter_id: FilterID) -> Result<()> {
-    //     info!("Installing filter {filter_id} into worker {worker}");
-
-    //     return Ok(())
-    // }
-
     pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
         let workers = self.worker_ingest.read().await;
         let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
         channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)))?;
         return Ok(())
     }
-
-    // pub async fn get_ingest_pending(self: &Arc<Self>) -> HashMap<FilterID, Vec<Sha256>> {
-    //     let mut requests = vec![];
-    //     {
-    //         let workers = self.worker_ingest.read().await;
-    //         for (_worker, channel) in workers.iter() {
-    //             let (send, recv) = oneshot::channel();
-    //             _ = channel.send(WorkerIngestMessage::ListPending(send));
-    //             requests.push(recv);
-    //         }
-    //     }
-    //     let mut output = HashMap::<FilterID, Vec<Sha256>>::new();
-    //     for resp in requests {
-    //         if let Ok(resp) = resp.await {
-    //             output.extend(resp);
-    //         }
-    //     }
-    //     return output
-    // }
 
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         let channel = {
@@ -252,6 +231,7 @@ impl HouseCore {
         self.database.search_status(&code).await
     }
 
+    /// Read the status of the system including all workers
     pub (crate) async fn status(self: &Arc<Self>) -> Result<StatusReport> {
         // Send requests to workers for details we want from them
         let mut queries = JoinSet::new();
@@ -463,6 +443,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     }
 }
 
+/// Check a batch of hashes to see if they are already (or quickly) accomidated by a worker
 async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTask>) -> Result<()> {
     debug!("Ingest Check batch {}", tasks.len());
     // Turn the update tasks into a format for the worker
