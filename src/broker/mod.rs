@@ -1,7 +1,6 @@
 pub mod interface;
 pub mod auth;
 mod database;
-mod ingest;
 mod database_sqlite;
 
 use std::collections::{HashSet, HashMap, hash_map, BTreeSet, VecDeque};
