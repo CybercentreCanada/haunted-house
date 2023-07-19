@@ -1,7 +1,7 @@
 
 use std::io::{Read, Write};
-use std::path::{PathBuf};
-use std::sync::{Arc};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use aws_sdk_s3::types::ByteStream;
@@ -9,12 +9,6 @@ use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use futures::StreamExt;
 use log::error;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::{Python, PyAny, Py, FromPyObject};
-#[cfg(feature = "python")]
-use pyo3::types::{PyTuple, PyBytes};
 // use reqwest_middleware::ClientWithMiddleware;
 // use reqwest_retry::RetryTransientMiddleware;
 // use reqwest_retry::policies::ExponentialBackoff;
@@ -26,11 +20,24 @@ use tokio::sync::mpsc;
 use crate::error::ErrorKinds;
 
 
+/// Configures a blob storage location
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BlobStorageConfig {
-    TempDir{size: u64},
-    Directory {path: PathBuf, size: u64},
+    /// Store blobs in a local temporary directory
+    TempDir{
+        /// How much space to dedicate to the temporary directory
+        size: u64
+    },
+    /// Store blobs in a local directory
+    Directory {
+        /// Location on disk for the blob store
+        path: PathBuf,
+        /// How much space to dedicate to the blob store
+        size: u64
+    },
+    /// Use an azure blob storage account
     Azure (AzureBlobConfig),
+    /// Use an s3 server
     S3(S3Config),
 }
 
@@ -45,46 +52,7 @@ impl Default for BlobStorageConfig {
     }
 }
 
-#[cfg(feature = "python")]
-impl<'source> FromPyObject<'source> for BlobStorageConfig {
-    fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
-        todo!();
-        // Try to interpret it as a string
-        // if let Ok(value) = ob.extract::<String>() {
-        //     { // Check for keywords after lowercasing
-        //         let value = value.to_lowercase();
-        //         if value == "temp" || value == "temporary" {
-        //             return Ok(BlobStorageConfig::TempDir)
-        //         }
-        //     }
-
-        //     // Try interpreting it as a path
-        //     if value.starts_with("/") || value.starts_with("./") {
-        //         let path = PathBuf::from(value);
-        //         std::fs::create_dir_all(&path)?;
-        //         return Ok(BlobStorageConfig::Directory { path })
-        //     }
-        // }
-
-        // // Try interpreting it as an azure configuration
-        // else if let Ok(config) = ob.extract::<AzureBlobConfig>() {
-        //     return Ok(BlobStorageConfig::Azure(config))
-        // }
-
-        // // Try interpreting it as a dict
-        // else if let Ok(config) = ob.extract::<HashMap<String, String>>() {
-        //     if let Some(value) = config.get("path") {
-        //         let path = PathBuf::from(value);
-        //         std::fs::create_dir_all(&path)?;
-        //         return Ok(BlobStorageConfig::Directory { path })
-        //     }
-        // }
-
-        return Err(PyValueError::new_err("Provided blob storage configuration was not valid"));
-    }
-}
-
-
+/// Setup a blob storage
 pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
     match config {
         BlobStorageConfig::TempDir { .. } => {
@@ -100,48 +68,46 @@ pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
     }
 }
 
+/// A unified type holding a blob store
 #[derive(Clone)]
 pub enum BlobStorage {
+    /// A local file based storage
     Local(LocalDirectory),
-    #[cfg(feature = "python")]
-    Python(PythonBlobStore),
+    /// An Azure blob storage account
     Azure(AzureBlobStore),
+    /// An s3 server
     S3(S3BlobStore),
 }
 
 impl BlobStorage {
+    /// Fetch the size of a blob
     pub async fn size(&self, label: &str) -> Result<Option<u64>> {
         match self {
             BlobStorage::Local(obj) => obj.size(label).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.size(label).await,
             BlobStorage::Azure(obj) => obj.size(label).await,
             BlobStorage::S3(obj) => obj.size(label).await,
         }
     }
+    /// Download the blob as a stream of chunks
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         match self {
             BlobStorage::Local(obj) => obj.stream(label).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.stream(label).await,
             BlobStorage::Azure(obj) => obj.stream(label).await,
             BlobStorage::S3(obj) => obj.stream(label).await,
         }
     }
+    /// Download the blob into a local file
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.download(label, path).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.download(label, path).await,
             BlobStorage::Azure(obj) => obj.download(label, path).await,
             BlobStorage::S3(obj) => obj.download(label, path).await,
         }
     }
+    /// Upload a blob from a local file
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.upload(label, path).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.upload(label, path).await,
             BlobStorage::Azure(obj) => obj.upload(label, path).await,
             BlobStorage::S3(obj) => obj.upload(label, path).await,
         }
@@ -150,8 +116,6 @@ impl BlobStorage {
     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.put(label, &data).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.put(label, &data).await,
             BlobStorage::Azure(obj) => obj.put(label, data).await,
             BlobStorage::S3(obj) => obj.put(label, data).await,
         }
@@ -160,24 +124,22 @@ impl BlobStorage {
     pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
         match self {
             BlobStorage::Local(obj) => obj.get(label).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.get(label).await,
             BlobStorage::Azure(obj) => obj.get(label).await,
             BlobStorage::S3(obj) => obj.get(label).await,
         }
     }
+    /// Delete a blob from storage
     pub async fn delete(&self, label: &str) -> Result<()> {
         match self {
             BlobStorage::Local(obj) => obj.delete(label).await,
-            #[cfg(feature = "python")]
-            BlobStorage::Python(obj) => obj.delete(label).await,
             BlobStorage::Azure(obj) => obj.delete(label).await,
             BlobStorage::S3(obj) => obj.delete(label).await,
         }
     }
 }
 
-pub fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
+/// Helper function used in streaming data
+fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
     let (send, recv) = mpsc::channel::<Result<Vec<u8>>>(8);
     tokio::task::spawn_blocking(move ||{
         let mut file = match std::fs::File::open(path) {
@@ -199,7 +161,7 @@ pub fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
             };
 
             buffer.resize(bytes_read, 0);
-            if let Err(_) = send.blocking_send(Ok(buffer)) {
+            if send.blocking_send(Ok(buffer)).is_err() {
                 return;
             }
             if bytes_read == 0 {
@@ -210,6 +172,7 @@ pub fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
     return recv
 }
 
+/// A local storage directory, may or may not be temporary directory
 #[derive(Clone)]
 pub struct LocalDirectory {
     path: PathBuf,
@@ -286,220 +249,6 @@ impl LocalDirectory {
 }
 
 
-#[cfg(feature = "python")]
-#[derive(Clone)]
-pub struct PythonBlobStore {
-    object: Py<PyAny>
-}
-
-#[cfg(feature = "python")]
-impl PythonBlobStore {
-    pub fn new(object: Py<PyAny>) -> Self {
-        Self {object}
-    }
-
-    async fn size(&self, label: &str) -> Result<Option<u64>> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            // calling the py_sleep method like a normal function returns a coroutine
-            let args = PyTuple::new(py, &[label.to_string()]);
-            let coroutine = self.object.call_method1(py, "size", args)?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        // await the future
-        let result = future.await?;
-
-        // Convert the python value back to rust
-        return Python::with_gil(|py| {
-            let result: Option<u64> = result.extract(py)?;
-            Ok(result)
-        });
-    }
-
-    async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            let coroutine = self.object.call_method1(py, "stream", (label.to_string(),))?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        let result = future.await?;
-
-        // Convert the python value back to rust
-        let object: Result<Py<PyAny>> = Python::with_gil(|py| {
-            let result: Py<PyAny> = result.extract(py)?;
-            Ok(result)
-        });
-        let object = object?;
-
-        let (send, recv) = mpsc::channel::<Result<Vec<u8>>>(8);
-        tokio::spawn(async move {
-            loop {
-                let future = Python::with_gil(|py| {
-                    let args = PyTuple::new(py, &[1u64 << 20]);
-                    let coroutine = object.call_method1(py, "read", args)?;
-
-                    // convert the coroutine into a Rust future
-                    pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-                });
-                let future = match future {
-                    Ok(future) => future,
-                    Err(err) => {
-                        _ = send.send(Err(err.into())).await;
-                        break;
-                    },
-                };
-
-                let result = match future.await {
-                    Ok(future) => future,
-                    Err(err) => {
-                        _ = send.send(Err(err.into())).await;
-                        break;
-                    },
-                };
-
-                // Convert the python value back to rust
-                let outcome: Result<Vec<u8>> = Python::with_gil(|py| {
-                    let result: Vec<u8> = result.extract(py)?;
-                    Ok(result)
-                });
-
-                match outcome {
-                    Ok(buffer) => {
-                        let buffer_len = buffer.len();
-                        if let Err(_) = send.send(Ok(buffer)).await {
-                            break;
-                        }
-                        if buffer_len == 0 {
-                            break;
-                        }
-                    },
-                    Err(err) => {
-                        _ = send.send(Err(err.into())).await;
-                        break;
-                    },
-                };
-            }
-        });
-
-        return Ok(recv)
-    }
-
-    async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            // calling the py_sleep method like a normal function returns a coroutine
-            let coroutine = self.object.call_method1(py, "download", (label.to_string(), path))?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        // await the future
-        future.await?;
-        return Ok(())
-    }
-
-    async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            // calling the py_sleep method like a normal function returns a coroutine
-            let coroutine = self.object.call_method1(py, "upload", (label.to_string(), path))?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        // await the future
-        future.await?;
-        return Ok(())
-    }
-
-    async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            // calling the py_sleep method like a normal function returns a coroutine
-            let coroutine = self.object.call_method1(py, "put", (label.to_string(), data))?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        // await the future
-        future.await?;
-        return Ok(())
-    }
-
-    async fn get(&self, label: &str) -> Result<Vec<u8>> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            // calling the py_sleep method like a normal function returns a coroutine
-            let args = PyTuple::new(py, &[label.to_string()]);
-            let coroutine = self.object.call_method1(py, "get", args)?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        // await the future
-        let result = future.await?;
-
-        // Convert the python value back to rust
-        return Python::with_gil(|py| {
-            let result: Vec<u8> = result.extract(py)?;
-            Ok(result)
-        });
-    }
-
-    async fn delete(&self, label: &str) -> Result<()> {
-        // Invoke method
-        let future = Python::with_gil(|py| {
-            // calling the py_sleep method like a normal function returns a coroutine
-            let coroutine = self.object.call_method1(py, "delete", (label.to_string(), ))?;
-
-            // convert the coroutine into a Rust future
-            pyo3_asyncio::tokio::into_future(coroutine.as_ref(py))
-        })?;
-
-        // await the future
-        future.await?;
-        return Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-#[derive(Clone)]
-pub struct PythonStream {
-    object: Py<PyAny>
-}
-
-#[cfg(feature = "python")]
-impl std::io::Read for PythonStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let copied = Python::with_gil(|py| {
-            let args = PyTuple::new(py, &[buf.len()]);
-            let read_buf = self.object.call_method1(py, "read", args)?;
-            let read_buf: &PyBytes = read_buf.extract(py)?;
-            let read_buf_len = read_buf.len()?;
-            if read_buf_len > buf.len() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Python returned too many bytes for buffer read"))
-            } else if read_buf_len > 0 {
-                buf[0..read_buf_len].copy_from_slice(read_buf.as_bytes());
-            }
-
-            return Ok(read_buf_len)
-        })?;
-
-        return Ok(copied)
-    }
-}
-
-
 #[derive(Clone)]
 pub struct AzureBlobStore {
     // config: AzureBlobConfig,
@@ -515,27 +264,6 @@ pub struct AzureBlobConfig {
     pub container: String,
     #[serde(default)]
     pub use_emulator: bool,
-}
-
-#[cfg(feature = "python")]
-impl<'source> FromPyObject<'source> for AzureBlobConfig {
-    fn extract(ob: &'source PyAny) -> pyo3::PyResult<Self> {
-        Python::with_gil(|py| {
-            let use_emulator_key = pyo3::intern!(py, "use_emulator");
-            let use_emulator = if ob.hasattr(use_emulator_key)? {
-                ob.get_item(use_emulator_key)?.extract()?
-            } else {
-                false
-            };
-
-            Ok(AzureBlobConfig{
-                account: ob.get_item(pyo3::intern!(py, "account"))?.extract()?,
-                access_key: ob.get_item(pyo3::intern!(py, "access_key"))?.extract()?,
-                container: ob.get_item(pyo3::intern!(py, "container"))?.extract()?,
-                use_emulator,
-            })
-        })
-    }
 }
 
 impl AzureBlobStore {
