@@ -138,7 +138,7 @@ impl BlobStorage {
     }
 }
 
-/// Helper function used in streaming data
+/// Helper function used in streaming local files
 fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
     let (send, recv) = mpsc::channel::<Result<Vec<u8>>>(8);
     tokio::task::spawn_blocking(move ||{
@@ -175,15 +175,20 @@ fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
 /// A local storage directory, may or may not be temporary directory
 #[derive(Clone)]
 pub struct LocalDirectory {
+    /// Location of the storage directory
     path: PathBuf,
+    /// If the directory is a temporary directory this is the scope guard that
+    /// erases it on destruction
     _temp: Option<Arc<TempDir>>
 }
 
 impl LocalDirectory {
+    /// Open a standard directory as a blob storage
     pub fn new(path: PathBuf) -> Self {
         Self {path, _temp: None}
     }
 
+    /// Setup a temporary directory as a blob store
     pub fn new_temp() -> Result<BlobStorage> {
         let temp = tempfile::tempdir()?;
         Ok(BlobStorage::Local(Self {
@@ -192,11 +197,13 @@ impl LocalDirectory {
         }))
     }
 
+    /// Get the local path where a blob will be stored
     fn get_path(&self, label: &str) -> PathBuf {
-        let dest = self.path.with_file_name(label.to_string());
+        let dest = self.path.with_file_name(label);
         return dest;
     }
 
+    /// fetch the size of a blob by checking the file size
     async fn size(&self, label: &str) -> Result<Option<u64>> {
         let path = self.get_path(label);
         match tokio::fs::metadata(path).await {
@@ -208,23 +215,26 @@ impl LocalDirectory {
         }
     }
 
+    /// Read the local file into a stream of chunks
     async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         let path = self.get_path(label);
         return Ok(read_chunks(path))
     }
 
+    /// "download" the file by copying the local file
     async fn download(&self, label: &str, dest: PathBuf) -> Result<()> {
         let path = self.get_path(label);
-        if let Ok(_) = tokio::fs::hard_link(&path, &dest).await {
+        if tokio::fs::hard_link(&path, &dest).await.is_ok() {
             return Ok(());
         }
         tokio::fs::copy(path, dest).await?;
         return Ok(())
     }
 
+    /// "upload" the file by copying the local source file
     async fn upload(&self, label: &str, source: PathBuf) -> Result<()> {
-        let dest = self.get_path(&label);
-        if let Ok(_) = tokio::fs::hard_link(&source, &dest).await {
+        let dest = self.get_path(label);
+        if tokio::fs::hard_link(&source, &dest).await.is_ok() {
             return Ok(());
         }
         tokio::fs::copy(source, dest).await?;
@@ -232,31 +242,35 @@ impl LocalDirectory {
     }
     #[cfg(test)]
     async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
-        let dest = self.get_path(&label);
+        let dest = self.get_path(label);
         tokio::fs::write(dest, data).await?;
         return Ok(())
     }
     #[cfg(test)]
     async fn get(&self, label: &str) -> Result<Vec<u8>> {
-        let path = self.get_path(&label);
+        let path = self.get_path(label);
         Ok(tokio::fs::read(path).await?)
     }
 
+    /// erase file from storage
     async fn delete(&self, label: &str) -> Result<()> {
-        let path = self.get_path(&label);
+        let path = self.get_path(label);
         Ok(tokio::fs::remove_file(path).await?)
     }
 }
 
-
+/// Use an azure blob store
 #[derive(Clone)]
 pub struct AzureBlobStore {
     // config: AzureBlobConfig,
     // http_client: ClientWithMiddleware,
+    /// http client used to interact with the blob storage in cases the azure client doesn't cover
     http_client: reqwest::Client,
+    /// An azure blob storage client
     client: ContainerClient,
 }
 
+/// Configure access to an azure blob store
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AzureBlobConfig {
     pub account: String,
