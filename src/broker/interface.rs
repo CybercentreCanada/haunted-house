@@ -1,6 +1,6 @@
 //!
 //! Http interface presented by the hauntedhouse service to other services.
-//! 
+//!
 use std::collections::{HashSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
 use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse, Response};
 use poem::web::{TypedHeader, Data, Json};
-use poem::http::{StatusCode};
+use poem::http::StatusCode;
 use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
@@ -35,7 +35,7 @@ use super::auth::Role;
 /// Extractor for HTTP Header holding a bearer token in the Authorization field
 type BearerToken = TypedHeader<Authorization<Bearer>>;
 
-/// A middleware that extracts authentication tokens from the request and 
+/// A middleware that extracts authentication tokens from the request and
 /// gives access to the corresponding internal apis.
 struct TokenMiddleware {
     /// Pointer to the common data for the broker server
@@ -280,7 +280,7 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
 #[derive(Serialize, Deserialize)]
 pub struct IngestRequest {
     /// An opaque token returned with the response to ingesting this file.
-    /// This is to help the client track which files have been ingested when 
+    /// This is to help the client track which files have been ingested when
     /// using the websocket to communicate.
     #[serde(default)]
     token: Option<String>,

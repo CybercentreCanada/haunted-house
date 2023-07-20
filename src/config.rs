@@ -177,9 +177,13 @@ fn default_filter_item_limit() -> u64 { 50_000_000 }
 /// Root configuration schema for broker server
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BrokerSettings {
+    /// Configure API tokens for accessing the system
     pub authentication: Authentication,
+    /// Configure local database location
     pub database: Database,
+    /// Which address should the server present on
     pub bind_address: Option<String>,
+    /// TLS settings for the outward facing API
     pub tls: Option<TLSConfig>,
 
     /// List of workers controlled by the broker server

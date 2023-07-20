@@ -96,6 +96,7 @@ pub struct HouseCore {
 }
 
 impl HouseCore {
+    /// Start the broker server
     pub async fn new(database: Database, authenticator: Authenticator, config: BrokerSettings) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
@@ -190,6 +191,7 @@ impl HouseCore {
         return Ok(core)
     }
 
+    /// Initialize a search in the database and start the process
     pub async fn initialize_search(self: &Arc<Self>, req: SearchRequest) -> Result<InternalSearchStatus> {
         // Create a record for the search
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
@@ -203,6 +205,12 @@ impl HouseCore {
         return Ok(res)
     }
 
+    /// Send a task directly to a watcher for a particular worker.
+    ///
+    /// This isn't the default way to assign a task to a worker.
+    /// Worker watchers are responsible for selecting their own tasks, this is used
+    /// when a file is seen repeatedly and a watcher needs to be notified about a second task
+    /// pointing at the same file
     pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
         let workers = self.worker_ingest.read().await;
         let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
@@ -210,7 +218,9 @@ impl HouseCore {
         return Ok(())
     }
 
+    /// Check the status of a search.
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
+        // Try to find/probe a worker currently processing this search
         let channel = {
             let searches = self.running_searches.read().await;
             if let Some((_, search)) = searches.get(&code) {
@@ -222,12 +232,15 @@ impl HouseCore {
             }
         };
 
+        // if a worker was found, wait for it's response
         if let Some(recv) = channel {
             match recv.await {
                 Ok(status) => return Ok(Some(status)),
                 Err(err) => { error!("{err}"); },
             }
         }
+
+        // no worker found, fall back to reading results from the database
         self.database.search_status(&code).await
     }
 
@@ -300,50 +313,58 @@ impl HouseCore {
 
 }
 
+/// A data struct encapsulate the ingestion of a file
 #[derive(Debug)]
 pub struct IngestTask {
+    /// Information about the file being ingested
     pub info: FileInfo,
+    /// A collection of channels waiting for the completion (or error) of this ingestion
     pub response: Vec<oneshot::Sender<Result<()>>>
 }
 
 impl IngestTask {
+    /// Merge two tasks that refer to the same file
     pub fn merge(&mut self, task: IngestTask) {
+        // merge the metadata about the file
         self.info.expiry = self.info.expiry.clone().max(task.info.expiry);
         self.info.access = self.info.access.or(&task.info.access).simplify();
+        // collect all the response channels into one list
         self.response.extend(task.response.into_iter());
     }
 }
 
+/// A status snapshot for the check worker
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestCheckStatus {
+    /// How many tasks are in the input queue
     queue: usize,
+    /// How many tasks are currently being checked
     active: usize,
+    /// How many tasks have been processed in the last minute
     last_minute: usize
 }
 
+/// A message to the check worker
 #[derive(Debug)]
 pub enum IngestMessage {
+    /// A message telling the check worker about a new ingest task
     IngestMessage(IngestTask),
+    /// A message askning the check worker for a status request
     Status(oneshot::Sender<IngestCheckStatus>)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IngestWatchStatus {
-    queue: usize,
-    per_minute: f64
-}
-
-#[derive(Debug)]
-pub enum WorkerIngestMessage {
-    IngestMessage((IngestTask, FilterID)),
-    Status(oneshot::Sender<HashMap<FilterID, IngestWatchStatus>>),
-    // ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
-}
-
-
-
+/// Entry point for worker that runs the first stage (check) of ingest
+///
+/// This worker checks with the workers if they have seen this file before.
+/// For every file they will reply:
+///  - They have fully processed the ingestion task by merging the metadata
+///    into their existing entry for that file.
+///  - They are working on this file already, the task should be assigned to them.
+///  - The file should move on to normal ingestion.
+/// The results are collated and each task in the batch is routed appropriately.
 async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<IngestMessage>) {
     loop {
+        // restart the worker every time it crashes.
         match _ingest_worker(core.clone(), &mut input).await {
             Err(err) => error!("Crash in ingestion system: {err}"),
             Ok(()) => {
@@ -354,11 +375,19 @@ async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<
     }
 }
 
+/// The implementation for the above worker
 async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<IngestMessage>) -> Result<()> {
+    // A buffer of tasks to be processed and a set of hashes in that buffer
     let mut buffer_hashes: HashSet<Sha256> = Default::default();
     let mut unchecked_buffer = VecDeque::<IngestTask>::new();
+
+    // The task running the current batch of tasks. This leaves this task
+    // free to take in new tasks and respond to status queries.
+    // We are using a join set to manage the task, but only launching a single batch at a time
     let mut check_worker: JoinSet<Result<()>> = JoinSet::new();
+    // How many tasks are in the current batch
     let mut active_batch_size = 0;
+    // A counter to track how many tasks we completed in the last minute
     let mut counter = crate::counters::WindowCounter::new(60);
 
     loop {
@@ -443,7 +472,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     }
 }
 
-/// Check a batch of hashes to see if they are already (or quickly) accomidated by a worker
+/// Check a batch of hashes to see if they are already (or quickly) accommodated by a worker
 async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTask>) -> Result<()> {
     debug!("Ingest Check batch {}", tasks.len());
     // Turn the update tasks into a format for the worker
@@ -510,9 +539,31 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
     return Ok(())
 }
 
-//
+
+/// status message for task monitoring a worker node
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestWatchStatus {
+    /// length of queue for files being inserted
+    queue: usize,
+    /// how many files were ingested per minute for the last hour
+    per_minute: f64
+}
+
+/// A message to a worker monitor task
+#[derive(Debug)]
+pub enum WorkerIngestMessage {
+    /// A message assigning the task directly to the given worker
+    IngestMessage((IngestTask, FilterID)),
+    /// Request a status update
+    Status(oneshot::Sender<HashMap<FilterID, IngestWatchStatus>>),
+    // ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
+}
+
+
+/// A task that feeds files to a given worker node
 async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: WorkerID, address: WorkerAddress) {
     loop {
+        // Keep running until the task willingly exits
         match _ingest_watcher(core.clone(), &mut input, &worker, &address).await {
             Err(err) => error!("Crash in ingestion system: {err}"),
             Ok(()) => {
@@ -523,7 +574,7 @@ async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver
     }
 }
 
-
+/// Implementation for above task
 async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, id: &WorkerID, address: &WorkerAddress) -> Result<()> {
     info!("Starting ingest watcher for {id}");
     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
@@ -748,17 +799,21 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
     }
 }
 
-//
+/// Message to interact with search worker
 pub enum SearcherMessage {
+    /// Request a status update from the search worker
     Status(oneshot::Sender<InternalSearchStatus>)
 }
 
+/// Entrypoint for the search worker
 async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherMessage>, code: String) {
+    // Keep restarting the search until it completes
     while let Err(err) = _search_worker(core.clone(), &mut input, &code).await {
         error!("Crash in search: {err}")
     }
 }
 
+/// impl for above
 async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<SearcherMessage>, code: &str) -> Result<()> {
     info!("Search {code}: Starting");
     // Load the search status

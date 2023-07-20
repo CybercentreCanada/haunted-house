@@ -104,14 +104,14 @@ impl BlobStorage {
             BlobStorage::S3(obj) => obj.download(label, path).await,
         }
     }
-    /// Upload a blob from a local file
-    pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
-        match self {
-            BlobStorage::Local(obj) => obj.upload(label, path).await,
-            BlobStorage::Azure(obj) => obj.upload(label, path).await,
-            BlobStorage::S3(obj) => obj.upload(label, path).await,
-        }
-    }
+    // Upload a blob from a local file
+    // pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
+    //     match self {
+    //         BlobStorage::Local(obj) => obj.upload(label, path).await,
+    //         BlobStorage::Azure(obj) => obj.upload(label, path).await,
+    //         BlobStorage::S3(obj) => obj.upload(label, path).await,
+    //     }
+    // }
     #[cfg(test)]
     pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
         match self {
@@ -128,20 +128,24 @@ impl BlobStorage {
             BlobStorage::S3(obj) => obj.get(label).await,
         }
     }
-    /// Delete a blob from storage
-    pub async fn delete(&self, label: &str) -> Result<()> {
-        match self {
-            BlobStorage::Local(obj) => obj.delete(label).await,
-            BlobStorage::Azure(obj) => obj.delete(label).await,
-            BlobStorage::S3(obj) => obj.delete(label).await,
-        }
-    }
+    // Delete a blob from storage
+    // pub async fn delete(&self, label: &str) -> Result<()> {
+    //     match self {
+    //         BlobStorage::Local(obj) => obj.delete(label).await,
+    //         BlobStorage::Azure(obj) => obj.delete(label).await,
+    //         BlobStorage::S3(obj) => obj.delete(label).await,
+    //     }
+    // }
 }
 
 /// Helper function used in streaming local files
 fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
+    // Create the channel outside the blocking section so we can only pass in half
     let (send, recv) = mpsc::channel::<Result<Vec<u8>>>(8);
+
+    // Run the actual fine interaction in the block
     tokio::task::spawn_blocking(move ||{
+        // Open the file
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(err) => {
@@ -150,7 +154,9 @@ fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
             },
         };
 
+        // loop until the file read
         loop {
+            // Read out a block into a fresh buffer
             let mut buffer = vec![0u8; 1 << 20];
             let bytes_read = match file.read(&mut buffer) {
                 Ok(bytes_read) => bytes_read,
@@ -160,10 +166,16 @@ fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
                 },
             };
 
+            // Resize the length value to communicate the amount of actual data
             buffer.resize(bytes_read, 0);
+
+            // send the data to the socket, if the socket refuses the data
+            // stop sending
             if send.blocking_send(Ok(buffer)).is_err() {
                 return;
             }
+
+            // if a read returned zero bytes, finish
             if bytes_read == 0 {
                 break;
             }
@@ -231,15 +243,16 @@ impl LocalDirectory {
         return Ok(())
     }
 
-    /// "upload" the file by copying the local source file
-    async fn upload(&self, label: &str, source: PathBuf) -> Result<()> {
-        let dest = self.get_path(label);
-        if tokio::fs::hard_link(&source, &dest).await.is_ok() {
-            return Ok(());
-        }
-        tokio::fs::copy(source, dest).await?;
-        return Ok(())
-    }
+    // "upload" the file by copying the local source file
+    // #[cfg(test)]
+    // async fn upload(&self, label: &str, source: PathBuf) -> Result<()> {
+    //     let dest = self.get_path(label);
+    //     if tokio::fs::hard_link(&source, &dest).await.is_ok() {
+    //         return Ok(());
+    //     }
+    //     tokio::fs::copy(source, dest).await?;
+    //     return Ok(())
+    // }
     #[cfg(test)]
     async fn put(&self, label: &str, data: &[u8]) -> Result<()> {
         let dest = self.get_path(label);
@@ -252,11 +265,12 @@ impl LocalDirectory {
         Ok(tokio::fs::read(path).await?)
     }
 
-    /// erase file from storage
-    async fn delete(&self, label: &str) -> Result<()> {
-        let path = self.get_path(label);
-        Ok(tokio::fs::remove_file(path).await?)
-    }
+    // erase file from storage
+    // #[cfg(test)]
+    // async fn delete(&self, label: &str) -> Result<()> {
+    //     let path = self.get_path(label);
+    //     Ok(tokio::fs::remove_file(path).await?)
+    // }
 }
 
 /// Use an azure blob store
@@ -265,7 +279,7 @@ pub struct AzureBlobStore {
     // config: AzureBlobConfig,
     // http_client: ClientWithMiddleware,
     /// http client used to interact with the blob storage in cases the azure client doesn't cover
-    http_client: reqwest::Client,
+    _http_client: reqwest::Client,
     /// An azure blob storage client
     client: ContainerClient,
 }
@@ -281,6 +295,7 @@ pub struct AzureBlobConfig {
 }
 
 impl AzureBlobStore {
+    /// Connect to an azure blob store
     async fn new(config: AzureBlobConfig) -> Result<Self> {
         let client = Self::get_container_client(&config)?;
         if !client.exists().await? {
@@ -300,11 +315,12 @@ impl AzureBlobStore {
         // let http_client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
         //     .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         //     .build();
-        let http_client = reqwest::Client::new();
+        let _http_client = reqwest::Client::new();
 
-        Ok(Self{ http_client, client })
+        Ok(Self{ _http_client, client })
     }
 
+    /// Setup the azure container client
     fn get_container_client(config: &AzureBlobConfig) -> Result<ContainerClient> {
         let client_builder = if config.use_emulator {
             ClientBuilder::emulator()
@@ -319,6 +335,7 @@ impl AzureBlobStore {
         Ok(client_builder.container_client(config.container.clone()))
     }
 
+    /// Measure the size of the blob
     pub async fn size(&self, label: &str) -> Result<Option<u64>> {
         let client = self.client.blob_client(label);
         let data = match client.get_properties().await {
@@ -339,6 +356,7 @@ impl AzureBlobStore {
         Ok(Some(data.blob.properties.content_length))
     }
 
+    /// Download the file in chunks and stream them into the channel
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         let mut stream = self.client.blob_client(label).get().into_stream();
         let (send, recv) = mpsc::channel(8);
@@ -370,6 +388,7 @@ impl AzureBlobStore {
         Ok(recv)
     }
 
+    /// Download a file to disk
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         let mut recv = self.stream(label).await?;
         tokio::task::spawn_blocking(move || {
@@ -381,6 +400,7 @@ impl AzureBlobStore {
         }).await?
     }
 
+    /// Upload a file from disk
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         let client = self.client.blob_client(label);
         let sas = client.shared_access_signature(azure_storage::prelude::BlobSasPermissions {
@@ -402,7 +422,7 @@ impl AzureBlobStore {
         let url = client.generate_signed_blob_url(&sas)?;
 
         loop {
-            let request = self.http_client.put(url.clone())
+            let request = self._http_client.put(url.clone())
                 .header("x-ms-blob-type", "BlockBlob")
                 .header("Date", chrono::Utc::now().to_rfc3339())
                 .header("Content-Length", tokio::fs::metadata(&path).await?.len().to_string())
@@ -432,6 +452,8 @@ impl AzureBlobStore {
         Ok(client.get_content().await?)
     }
 
+    /// Delete blob
+    #[cfg(test)]
     pub async fn delete(&self, label: &str) -> Result<()> {
         let client = self.client.blob_client(label);
         if let Err(err) = client.delete().await {
@@ -457,13 +479,17 @@ impl AzureBlobStore {
     }
 }
 
+/// Wrapper for an s3 client
 #[derive(Clone)]
 pub struct S3BlobStore {
+    /// Underlying blob client
     client: aws_sdk_s3::Client,
+    /// Name of the bucket
     bucket: String,
     // region_name: String,
 }
 
+/// Configuration to access s3 bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3Config {
     access_key_id: Option<String>,
@@ -574,6 +600,7 @@ impl S3BlobStore {
         })
     }
 
+    /// read blob size via API query
     pub async fn size(&self, label: &str) -> Result<Option<u64>> {
         let request = self.client
             .head_object()
@@ -595,6 +622,9 @@ impl S3BlobStore {
         return Ok(Some(res.content_length() as u64))
     }
 
+    /// read blob into stream
+    /// The api already provides block based reading, so just spawn a task
+    /// to read from the respones and shovel data into the channel
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
         let mut request = self.client
             .get_object()
@@ -616,6 +646,7 @@ impl S3BlobStore {
         return Ok(recv)
     }
 
+    /// Download the data to disk, use tokio fs to wrap blocking operation
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         let mut request = self.client
             .get_object()
@@ -631,6 +662,7 @@ impl S3BlobStore {
         return Ok(())
     }
 
+    /// Upload a file, let the library handle streaming read
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         self.client
             .put_object()
@@ -666,6 +698,7 @@ impl S3BlobStore {
         return Ok(bytes.to_vec())
     }
 
+    /// Delete the block by api call
     pub async fn delete(&self, label: &str) -> Result<()> {
         self.client
             .delete_object()
