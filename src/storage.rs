@@ -475,6 +475,7 @@ pub struct S3Config {
     no_tls_verify: bool,
 }
 
+/// A dummy certificate verifier that just accepts anything
 pub struct NoCertificateVerification {}
 
 impl rustls::client::ServerCertVerifier for NoCertificateVerification {
@@ -492,6 +493,7 @@ impl rustls::client::ServerCertVerifier for NoCertificateVerification {
 }
 
 impl S3BlobStore {
+    /// Connect to the s3 store and ensure resources exist
     async fn new(config: S3Config) -> Result<Self> {
         // Ok(S3BlobStore { client: bucket })
         let mut loader = aws_config::from_env();
@@ -555,7 +557,14 @@ impl S3BlobStore {
         if let Err(err) = client.head_bucket().bucket(&config.bucket).send().await {
             let err = err.into_service_error();
             if err.is_not_found() {
-                client.create_bucket().bucket(&config.bucket).send().await?;
+                if let Err(err) = client.create_bucket().bucket(&config.bucket).send().await {
+                    let x = err.into_service_error();
+                    if !x.is_bucket_already_exists() && !x.is_bucket_already_owned_by_you() {
+                        return Err(x.into())
+                    }
+                }
+            } else {
+                return Err(err.into())
             }
         }
 
