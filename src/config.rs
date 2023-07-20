@@ -8,7 +8,7 @@ use crate::broker::auth::Role;
 use crate::types::{WorkerID, serialize_size, deserialize_size};
 
 /// Static assignment of an api key to a set of roles
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StaticKey {
     /// API key to be assigned
     pub key: String,
@@ -17,7 +17,7 @@ pub struct StaticKey {
 }
 
 /// Configuration for authentication to the server's api
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Authentication {
     /// Access granted via statically defined api keys
     pub static_keys: Vec<StaticKey>,
@@ -38,7 +38,7 @@ impl Default for Authentication {
 }
 
 /// Configuration of the server's database
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Database {
     /// Server will use an sqlite database loaded on a fixed path
     SQLite {
@@ -58,7 +58,7 @@ impl Default for Database {
 /// Configure directory to use as local cache for blob storage
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CacheConfig {
-    /// Use a system defined temporary directory 
+    /// Use a system defined temporary directory
     TempDir{
         /// Number of bytes to let the cache occupy
         #[serde(deserialize_with="deserialize_size", serialize_with="serialize_size")]
@@ -84,16 +84,16 @@ impl Default for CacheConfig {
 }
 
 /// Information server can use to configure its tls binding
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TLSConfig {
     /// Private key for the server certificate
     pub key_pem: String,
-    /// TLS certificate for the server to use 
+    /// TLS certificate for the server to use
     pub certificate_pem: String
 }
 
 /// Authentication information for broker's http client when connecting to workers
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WorkerTLSConfig {
     /// Accept whatever self signed certificate the worker presents
     AllowAll,
@@ -161,10 +161,27 @@ fn default_sha256_extractor() -> FieldExtractor { FieldExtractor(vec!["sha256".t
 fn default_access_extractor() -> FieldExtractor { FieldExtractor(vec!["classification".to_owned()]) }
 /// Default field path to use reading expiry for ingested file
 fn default_expiry_extractor() -> FieldExtractor { FieldExtractor(vec!["expiry_ts".to_owned()]) }
+/// default value for per_filter_pending_limit
+fn default_per_filter_pending_limit() -> u64 { 1000 }
+/// default value for per_worker_group_duplication
+fn default_per_worker_group_duplication() -> u32 { 2 }
+/// default value for search_hit_limit
+fn default_search_hit_limit() -> usize { 50000 }
+/// default value for yara_jobs_per_worker
+fn default_yara_jobs_per_worker() -> usize { 2 }
+/// default value for yara_batch_size
+fn default_yara_batch_size() -> u32 { 100 }
+/// default value for filter_item_limit
+fn default_filter_item_limit() -> u64 { 50_000_000 }
 
-/// broker server configuration details
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CoreConfig {
+/// Root configuration schema for broker server
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BrokerSettings {
+    pub authentication: Authentication,
+    pub database: Database,
+    pub bind_address: Option<String>,
+    pub tls: Option<TLSConfig>,
+
     /// List of workers controlled by the broker server
     pub workers: HashMap<WorkerID, WorkerAddress>,
     /// Certificate used to secure connection with broker server
@@ -172,7 +189,7 @@ pub struct CoreConfig {
     /// Maximum number of files that may be pending per filter file
     #[serde(default="default_per_filter_pending_limit")]
     pub per_filter_pending_limit: u64,
-    /// Maximum number of filter files belonging to the same expiry 
+    /// Maximum number of filter files belonging to the same expiry
     /// group that may be co-located on a single worker
     #[serde(default="default_per_worker_group_duplication")]
     pub per_worker_group_duplication: u32,
@@ -191,49 +208,21 @@ pub struct CoreConfig {
     pub filter_item_limit: u64,
 }
 
-/// default value for per_filter_pending_limit
-fn default_per_filter_pending_limit() -> u64 { 1000 }
-/// default value for per_worker_group_duplication
-fn default_per_worker_group_duplication() -> u32 { 2 }
-/// default value for search_hit_limit
-fn default_search_hit_limit() -> usize { 50000 }
-/// default value for yara_jobs_per_worker
-fn default_yara_jobs_per_worker() -> usize { 2 }
-/// default value for yara_batch_size
-fn default_yara_batch_size() -> u32 { 100 }
-/// default value for filter_item_limit
-fn default_filter_item_limit() -> u64 { 50_000_000 }
-
-/// Root configuration schema for broker server
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
-    pub authentication: Authentication,
-    pub database: Database,
-    pub core: CoreConfig,
-    pub bind_address: Option<String>,
-    pub tls: Option<TLSConfig>,
-}
-
-impl Default for Config {
+impl Default for BrokerSettings {
     fn default() -> Self {
         Self {
             authentication: Default::default(),
             database: Default::default(),
-            core: CoreConfig {
-                workers: [
-                    (WorkerID::from("worker-1".to_owned()), WorkerAddress::from("worker-0:4000"))
-                ].into(),
-                worker_certificate: WorkerTLSConfig::AllowAll,
-                filter_item_limit: default_filter_item_limit(),
-                per_filter_pending_limit: default_per_filter_pending_limit(),
-                per_worker_group_duplication: default_per_worker_group_duplication(),
-                search_hit_limit: default_search_hit_limit(),
-                yara_jobs_per_worker: default_yara_jobs_per_worker(),
-                yara_batch_size: default_yara_batch_size(),
-            },
-            // cache: Default::default(),
-            // files: Default::default(),
-            // blobs: Default::default(),
+            workers: [
+                (WorkerID::from("worker-1".to_owned()), WorkerAddress::from("worker-0:4000"))
+            ].into(),
+            worker_certificate: WorkerTLSConfig::AllowAll,
+            filter_item_limit: default_filter_item_limit(),
+            per_filter_pending_limit: default_per_filter_pending_limit(),
+            per_worker_group_duplication: default_per_worker_group_duplication(),
+            search_hit_limit: default_search_hit_limit(),
+            yara_jobs_per_worker: default_yara_jobs_per_worker(),
+            yara_batch_size: default_yara_batch_size(),
             bind_address: Some("localhost:4443".to_owned()),
             tls: None
         }

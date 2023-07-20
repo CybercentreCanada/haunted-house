@@ -25,7 +25,7 @@ use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::broker::interface::{SearchRequestResponse, SearchProgress};
-use crate::config::{CoreConfig, WorkerAddress, WorkerTLSConfig};
+use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig};
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
@@ -36,21 +36,21 @@ use self::database::Database;
 use self::interface::{InternalSearchStatus, SearchRequest, StatusReport};
 
 /// Entry point function to the broker
-pub async fn main(config: crate::config::Config) -> Result<()> {
+pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
     // Initialize authenticator
     info!("Initializing Authenticator");
-    let auth = Authenticator::from_config(config.authentication)?;
+    let auth = Authenticator::from_config(config.authentication.clone())?;
 
     // Initialize database
     info!("Connecting to database.");
-    let database = match config.database {
-        crate::config::Database::SQLite{path} => Database::new_sqlite(&path).await?,
+    let database = match &config.database {
+        crate::config::Database::SQLite{path} => Database::new_sqlite(path).await?,
         crate::config::Database::SQLiteTemp{..} => Database::new_sqlite_temp().await?,
     };
 
     // Start server core
     info!("Starting server core.");
-    let core = HouseCore::new(database,auth, config.core).await
+    let core = HouseCore::new(database,auth, config.clone()).await
         .context("Error launching core.")?;
 
     // Start http interface
@@ -82,7 +82,7 @@ pub struct HouseCore {
     /// Authentication information controlling which api tokens have what roles
     pub authenticator: Authenticator,
     /// configuration information tuning the system behaviour
-    pub config: CoreConfig,
+    pub config: BrokerSettings,
     /// Queue of files waiting to be ingested
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     /// Set of files that couldn't be quickly accepted by any worker
@@ -96,7 +96,7 @@ pub struct HouseCore {
 }
 
 impl HouseCore {
-    pub async fn new(database: Database, authenticator: Authenticator, config: CoreConfig) -> Result<Arc<Self>> {
+    pub async fn new(database: Database, authenticator: Authenticator, config: BrokerSettings) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         // setup pool for yara assignments

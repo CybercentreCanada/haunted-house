@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Result, Context};
 
-use crate::types::{Sha256};
+use crate::types::Sha256;
 
 use super::database_sqlite::{SQLiteInterface, SearchRecord};
 use super::interface::{SearchRequest, InternalSearchStatus};
@@ -47,7 +47,7 @@ impl Database {
         }
     }
 
-    /// Get the system internal view of a search 
+    /// Get the system internal view of a search
     pub async fn search_record(&self, code: &str) -> Result<Option<SearchRecord>> {
         match self {
             Database::SQLite(local) => local.search_record(code).await.context("search_record")

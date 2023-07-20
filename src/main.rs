@@ -80,7 +80,7 @@ enum Commands {
 }
 
 
-fn load_config(path: Option<PathBuf>) -> Result<crate::config::Config> {
+fn load_config(path: Option<PathBuf>) -> Result<crate::config::BrokerSettings> {
     let config = path.unwrap_or(PathBuf::from("./config.json"));
     let config_body = std::fs::read_to_string(config)?;
     let config_body = config::apply_env(&config_body)?;
