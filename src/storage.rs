@@ -21,7 +21,7 @@ use crate::error::ErrorKinds;
 
 
 /// Configures a blob storage location
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum BlobStorageConfig {
     /// Store blobs in a local temporary directory
     TempDir{
@@ -53,18 +53,18 @@ impl Default for BlobStorageConfig {
 }
 
 /// Setup a blob storage
-pub async fn connect(config: BlobStorageConfig) -> Result<BlobStorage> {
+pub async fn connect(config: &BlobStorageConfig) -> Result<BlobStorage> {
     match config {
         BlobStorageConfig::TempDir { .. } => {
             LocalDirectory::new_temp().context("Error setting up local blob store")
         }
         BlobStorageConfig::Directory { path, .. } => {
-            Ok(BlobStorage::Local(LocalDirectory::new(path)))
+            Ok(BlobStorage::Local(LocalDirectory::new(path.clone())))
         },
         BlobStorageConfig::Azure(azure) =>
-            Ok(BlobStorage::Azure(AzureBlobStore::new(azure).await?)),
+            Ok(BlobStorage::Azure(AzureBlobStore::new(azure.clone()).await?)),
         BlobStorageConfig::S3(config) =>
-            Ok(BlobStorage::S3(S3BlobStore::new(config).await?)),
+            Ok(BlobStorage::S3(S3BlobStore::new(config.clone()).await?)),
     }
 }
 

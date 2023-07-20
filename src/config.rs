@@ -56,7 +56,7 @@ impl Default for Database {
 }
 
 /// Configure directory to use as local cache for blob storage
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CacheConfig {
     /// Use a system defined temporary directory
     TempDir{
@@ -233,23 +233,6 @@ impl Default for BrokerSettings {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct WorkerSettings {
-    #[serde(default="default_data_path")]
-    pub data_path: PathBuf,
-    #[serde(default="default_data_limit")]
-    pub data_limit: u64,
-    #[serde(default="default_data_reserve")]
-    pub data_reserve: u64,
-    #[serde(default="default_initial_segment_size")]
-    pub initial_segment_size: u32,
-    #[serde(default="default_extended_segment_size")]
-    pub extended_segment_size: u32,
-    #[serde(default="default_ingest_batch_size")]
-    pub ingest_batch_size: u32,
-    #[serde(default="default_parallel_file_downloads")]
-    pub parallel_file_downloads: usize
-}
 
 const TRIGRAM_DIRECTORY: &str = "trigram-cache";
 const FILTER_DIRETORY: &str = "filters";
@@ -286,43 +269,56 @@ fn default_ingest_batch_size() -> u32 { 100 }
 fn default_parallel_file_downloads() -> usize { 100 }
 
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerConfig {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkerSettings {
     pub file_cache: CacheConfig,
     pub files: crate::storage::BlobStorageConfig,
-    pub settings: WorkerSettings,
     pub bind_address: Option<String>,
     pub tls: Option<TLSConfig>,
+    #[serde(default="default_data_path")]
+    pub data_path: PathBuf,
+    #[serde(default="default_data_limit")]
+    pub data_limit: u64,
+    #[serde(default="default_data_reserve")]
+    pub data_reserve: u64,
+    #[serde(default="default_initial_segment_size")]
+    pub initial_segment_size: u32,
+    #[serde(default="default_extended_segment_size")]
+    pub extended_segment_size: u32,
+    #[serde(default="default_ingest_batch_size")]
+    pub ingest_batch_size: u32,
+    #[serde(default="default_parallel_file_downloads")]
+    pub parallel_file_downloads: usize
 }
 
 
-impl Default for WorkerConfig {
+impl Default for WorkerSettings {
     fn default() -> Self {
         Self {
             file_cache: Default::default(),
             files: Default::default(),
-            settings: WorkerSettings {
-                data_path: default_data_path(),
-                data_limit: default_data_limit(),
-                data_reserve: default_data_reserve(),
-                initial_segment_size: default_initial_segment_size(),
-                extended_segment_size: default_extended_segment_size(),
-                ingest_batch_size: default_ingest_batch_size(),
-                parallel_file_downloads: default_parallel_file_downloads(),
-            },
+            data_path: default_data_path(),
+            data_limit: default_data_limit(),
+            data_reserve: default_data_reserve(),
+            initial_segment_size: default_initial_segment_size(),
+            extended_segment_size: default_extended_segment_size(),
+            ingest_batch_size: default_ingest_batch_size(),
+            parallel_file_downloads: default_parallel_file_downloads(),
             bind_address: Some("localhost:4444".to_owned()),
             tls: None,
         }
     }
 }
 
-
+/// Apply environment variable substitution to a string
 pub fn apply_env(data: &str) -> Result<String> {
     apply_variables(data, &std::env::vars().collect())
 }
 
+/// Regex used by the apply_variables method
 const REGEX: &str = r#"(^|.)\$\{([0-9[:alpha:]]+)(?::-?((?:\\\}|[^}])*))?\}"#;
 
+/// Apply variable substitution to the string using the bash syntax
 pub fn apply_variables(data: &str, vars: &HashMap<String, String>) -> Result<String> {
     let parser = regex::Regex::new(REGEX)?;
     let mut input = data;

@@ -27,26 +27,26 @@ pub struct YaraTask {
     pub hashes: Vec<Sha256>,
 }
 
-pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
+pub async fn main(config: crate::config::WorkerSettings) -> Result<()> {
     // Setup the storage
     info!("Connect to file storage");
-    let file_storage = crate::storage::connect(config.files).await?;
+    let file_storage = crate::storage::connect(&config.files).await?;
 
     // Get cache
     info!("Setup caches");
-    let (file_cache, _file_temp) = match config.file_cache {
+    let (file_cache, _file_temp) = match &config.file_cache {
         crate::config::CacheConfig::TempDir { size } => {
             let temp_dir = tempfile::tempdir()?;
-            (BlobCache::new(file_storage.clone(), size, temp_dir.path().to_owned())?, Some(temp_dir))
+            (BlobCache::new(file_storage.clone(), *size, temp_dir.path().to_owned())?, Some(temp_dir))
         }
         crate::config::CacheConfig::Directory { path, size } => {
-            (BlobCache::new(file_storage.clone(), size, PathBuf::from(path))?, None)
+            (BlobCache::new(file_storage.clone(), *size, PathBuf::from(path))?, None)
         }
     };
 
     // Figure out where the worker status interface will be hosted
     info!("Determine bind address");
-    let bind_address = config.bind_address.unwrap_or("localhost:8080".to_owned());
+    let bind_address = config.bind_address.clone().unwrap_or("localhost:8080".to_owned());
     let mut addresses = tokio::net::lookup_host(&bind_address).await?.collect_vec();
     let bind_address = match addresses.pop() {
         Some(x) => x,
@@ -57,11 +57,11 @@ pub async fn main(config: crate::config::WorkerConfig) -> Result<()> {
     info!("Status interface binding on: {bind_address}");
 
     info!("Setting up database.");
-    let database = Database::new_sqlite(config.settings.get_database_directory()).await.context("setting up database")?;
+    let database = Database::new_sqlite(config.get_database_directory()).await.context("setting up database")?;
 
     info!("Spawing processing daemons.");
     let (set_running, running) = tokio::sync::watch::channel(true);
-    let data = WorkerState::new(database, file_storage, file_cache, config.settings, running).await.context("spawning")?;
+    let data = WorkerState::new(database, file_storage, file_cache, config.clone(), running).await.context("spawning")?;
 
     // Watch for exit signal
     let exit_notice = Arc::new(tokio::sync::Notify::new());
