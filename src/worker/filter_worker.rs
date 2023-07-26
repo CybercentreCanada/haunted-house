@@ -1,7 +1,7 @@
-use std::sync::{Arc};
+use std::sync::Arc;
 
 use crate::query::Query;
-use crate::timing::{Capture};
+use crate::timing::Capture;
 use crate::types::FilterID;
 use crate::worker::filter::ExtensibleTrigramFile;
 use anyhow::Result;

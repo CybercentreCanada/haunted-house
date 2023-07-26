@@ -287,9 +287,13 @@ pub struct AzureBlobStore {
 /// Configure access to an azure blob store
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AzureBlobConfig {
+    /// Azure account identifier
     pub account: String,
+    /// Azure access key
     pub access_key: String,
+    /// Name of the container within storage account
     pub container: String,
+    /// Whether the blob storage system is being run on the development emulator
     #[serde(default)]
     pub use_emulator: bool,
 }

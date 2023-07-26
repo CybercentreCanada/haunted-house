@@ -132,6 +132,7 @@ impl<'a> RawSegmentInfo<'a> {
     }
 }
 
+/// Helper function to remove a file and succeed when missing
 fn remove_file(path: &Path) -> Result<()> {
     if let Err(err) = std::fs::remove_file(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
@@ -416,7 +417,7 @@ impl ExtensibleTrigramFile {
         }
     }
 
-    //
+    /// Prepare an operation to write a set of file trigrams to this file
     pub fn write_batch(&self, files: &mut [(u64, TrigramSet)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations
@@ -651,6 +652,7 @@ impl ExtensibleTrigramFile {
         return Ok((write_buffer, buffer_counter, self.extended_segments + added_segments))
     }
 
+    /// Check for outstanding operation sets
     fn check_and_apply_operations(&mut self, location: PathBuf, buffer_counter: u64) -> Result<()> {
         // Check file is above minimum size
         let mut buffer = File::open(&location).context("could not open edit buffer")?;
@@ -679,7 +681,7 @@ impl ExtensibleTrigramFile {
         self.apply_operations(buffer, buffer_counter, self.extended_segments + added_segments, NullCapture::new())
     }
 
-    // #[instrument]
+    /// Apply the operation set prepared
     pub fn apply_operations(&mut self, mut source: File, counter: u64, extended_segments: u32, timing: impl TimingCapture) -> Result<()> {
         let capture = mark!(timing, "apply_operations");
 
@@ -749,10 +751,12 @@ impl ExtensibleTrigramFile {
         return Ok(())
     }
 
+    /// Count the number of outstanding journals
     pub fn outstanding_journals(&self) -> Result<usize> {
         Ok(get_operation_journals(&self.directory, self.id)?.len())
     }
 
+    /// Flush the outstanding operations and delete the corresponding journals (in a background thread)
     pub fn flush_threaded(&mut self, map: Option<MmapMut>, counter: Option<u64>) -> Result<JoinHandle<()>> {
         // get a memory mapping
         let data = match map {
@@ -807,6 +811,7 @@ impl ExtensibleTrigramFile {
         return Ok(handle)
     }
 
+    /// Flush the outstanding operations and delete the corresponding journals and wait for the operation to finish
     pub fn flush_blocking(&mut self) -> Result<()> {
         let handle = self.flush_threaded(None, None)?;
         if let Err(err) = handle.join() {
@@ -816,13 +821,19 @@ impl ExtensibleTrigramFile {
     }
 }
 
-// A helper to collect file ids for each trigram
+/// Take a collection of files (represented by their id and a trigram set) and
+/// yield the trigrams in sequence that they occur. If a trigram doesn't occur
+/// in one of the files it is skipped. When the trigram is returned the file
+/// ids of the files that contain it are returned by argument.
 struct IdCollector<'a> {
+    /// counter for which trigram we are on
     acceptable: u32,
+    /// Set of files (ids and trigrams) to pass through
     iterators: Vec<(u64, Peekable<TrigramIterator<'a>>)>
 }
 
 impl IdCollector<'_> {
+    /// Function to drive the iteration described above
     fn next(&mut self, hits: &mut Vec<u64>) -> Option<u32> {
         // hits.clear();
 
@@ -859,14 +870,20 @@ impl IdCollector<'_> {
     }
 }
 
+/// An iterator over the file id list stored for a given trigram spread over several blocks
 struct TrigramCursor<'a> {
+    /// File containing the blocks we want to iterate over
     host: &'a ExtensibleTrigramFile,
+    /// Content of the current block
     current: Vec<u64>,
+    /// which value in the current block we are on
     offset: usize,
+    /// Next block we need to look at
     next: Option<u32>
 }
 
 impl<'a> TrigramCursor<'a> {
+    /// Create a cursor for the file ids under a given trigram
     pub fn new(host: &'a ExtensibleTrigramFile, trigram: u32) -> Result<Self> {
         let mut buffer = vec![];
         let segment = host.read_initial_segment(trigram)?;
@@ -924,12 +941,18 @@ fn into_trigrams(bytes: &Vec<u8>) -> Vec<u32> {
     return trigrams;
 }
 
+/// Calculate the union of two sets of numbers into the the first set
+///
+/// list need not be ordered
 fn union(base: &mut Vec<u64>, other: &Vec<u64>) {
     base.extend(other);
     base.sort_unstable();
     base.dedup();
 }
 
+/// Calculate the intersection of two sets of numbers into the the first set
+///
+/// list must be ordered
 fn intersection(base: &mut Vec<u64>, other: &Vec<u64>) {
 
     let mut base_read_index = 0;
@@ -1036,10 +1059,10 @@ mod test {
     use crate::query::Query;
     use crate::timing::{NullCapture, Capture};
     use crate::types::FilterID;
-    use crate::worker::filter::ExtensibleTrigramFile;
+    use crate::worker::filter::{ExtensibleTrigramFile, into_trigrams, intersection};
     use crate::worker::trigrams::{build_buffer, TrigramSet};
 
-    use super::{TRIGRAM_RANGE, IdCollector};
+    use super::{TRIGRAM_RANGE, IdCollector, union};
 
     #[test]
     fn simple_save_and_load() -> Result<()> {
@@ -1426,4 +1449,116 @@ mod test {
 
         return Ok(())
     }
+
+    #[test]
+    fn test_into_trigrams() {
+        assert_eq!(into_trigrams(&vec![]), Vec::<u32>::new());
+        assert_eq!(into_trigrams(&vec![0x10, 0xff]), Vec::<u32>::new());
+        assert_eq!(into_trigrams(&vec![0x10, 0xff, 0x44]), vec![0x10ff44]);
+        assert_eq!(into_trigrams(&vec![0x10, 0xff, 0x44, 0x22]), vec![0x10ff44, 0xff4422]);
+    }
+
+    #[test]
+    fn test_union() {
+        {
+            let mut base = vec![];
+            union(&mut base, &vec![]);
+            assert!(base.is_empty());
+        }
+        {
+            let mut base = vec![0x0];
+            union(&mut base, &vec![]);
+            assert_eq!(base, vec![0x0]);
+        }
+        {
+            let mut base = vec![];
+            union(&mut base, &vec![0x0]);
+            assert_eq!(base, vec![0x0]);
+        }
+        {
+            let mut base = vec![0x0, 0x1];
+            union(&mut base, &vec![]);
+            assert_eq!(base, vec![0x0, 0x1]);
+        }
+        {
+            let mut base = vec![];
+            union(&mut base, &vec![0x0, 0x1]);
+            assert_eq!(base, vec![0x0, 0x1]);
+        }
+        {
+            let mut base = vec![0xff];
+            union(&mut base, &vec![0x0, 0xff]);
+            assert_eq!(base, vec![0x0, 0xff]);
+        }
+        {
+            let mut base = vec![0xff];
+            union(&mut base, &vec![0xff, 0x0]);
+            assert_eq!(base, vec![0x0, 0xff]);
+        }
+        {
+            let mut base = vec![0x0, 0x1];
+            union(&mut base, &vec![0x0, 0x1, 0xff]);
+            assert_eq!(base, vec![0x0, 0x1, 0xff]);
+        }
+        {
+            let mut base = vec![0xff, 0x0, 0xff];
+            union(&mut base, &vec![0x1, 0x0]);
+            assert_eq!(base, vec![0x0, 0x1, 0xff]);
+        }
+    }
+
+    #[test]
+    fn test_intersection() {
+        {
+            let mut base = vec![];
+            intersection(&mut base, &vec![]);
+            assert!(base.is_empty());
+        }
+        {
+            let mut base = vec![0x0];
+            intersection(&mut base, &vec![]);
+            assert!(base.is_empty());
+        }
+        {
+            let mut base = vec![];
+            intersection(&mut base, &vec![0x0]);
+            assert!(base.is_empty());
+        }
+        {
+            let mut base = vec![0x0, 0x1];
+            intersection(&mut base, &vec![]);
+            assert!(base.is_empty());
+        }
+        {
+            let mut base = vec![];
+            intersection(&mut base, &vec![0x0, 0x1]);
+            assert!(base.is_empty());
+        }
+        {
+            let mut base = vec![0x0];
+            intersection(&mut base, &vec![0x0]);
+            assert_eq!(base, vec![0x0]);
+        }
+        {
+            let mut base = vec![0xff];
+            intersection(&mut base, &vec![0x0, 0xff]);
+            assert_eq!(base, vec![0xff]);
+        }
+        {
+            let mut base = vec![0xff];
+            intersection(&mut base, &vec![0xff, 0x0]);
+            assert_eq!(base, vec![0xff]);
+        }
+        {
+            let mut base = vec![0x0, 0x1];
+            intersection(&mut base, &vec![0x0, 0x1, 0xff]);
+            assert_eq!(base, vec![0x0, 0x1]);
+        }
+        {
+            let mut base = vec![0x1, 0xff];
+            intersection(&mut base, &vec![0x0, 0x1]);
+            assert_eq!(base, vec![0x1]);
+        }
+    }
+
 }

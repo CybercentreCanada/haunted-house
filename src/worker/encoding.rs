@@ -1,21 +1,5 @@
 
-// #[cfg(test)]
-// pub fn encode_duplicates(mut count: u64) -> Vec<u8> {
-//     let mut buffer = Vec::new();
-
-//     while count > 0b0111_1111 {
-//         buffer.push(0b0111_1111);
-//         count -= 0b0111_1111;
-//     }
-
-//     if count > 0 {
-//         buffer.push(count as u8);
-//     }
-
-//     return buffer;
-// }
-
-
+/// pack a u64 value into a buffer
 pub fn encode_value_into(mut value: u64, buffer: &mut Vec<u8>){
     while value > 0 {
         let mut fragment = value & 0b0111_1111;
@@ -34,6 +18,7 @@ pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
     return buffer
 }
 
+/// pack a set of u64 into a buffer
 pub fn encode_into(indices: &Vec<u64>, buffer: &mut Vec<u8>) {
     if indices.is_empty() {
         return;
@@ -66,10 +51,12 @@ pub fn encode_into(indices: &Vec<u64>, buffer: &mut Vec<u8>) {
 
 }
 
+/// Calculate how many bytes a value will need to be encoded
 pub fn encoded_number_size(value: u64) -> u32 {
     value.ilog2()/7 + 1
 }
 
+/// How many additional bytes are needed to add the given value to the given sequence
 pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
     match values.last() {
         Some(last) => encoded_number_size(new_value - last),
@@ -84,6 +71,7 @@ pub fn decode(data: &[u8]) -> (Vec<u64>, u32) {
     return (values, size)
 }
 
+/// Unpack a sequence of u64 from a buffer
 pub fn decode_into(data: &[u8], values: &mut Vec<u64>) -> u32 {
 
     let mut used_bytes = 0;
