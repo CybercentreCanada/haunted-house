@@ -87,7 +87,7 @@ fn load_config(path: Option<PathBuf>) -> Result<crate::config::BrokerSettings> {
     Ok(serde_json::from_str(&config_body)?)
 }
 
-fn load_worker_config(path: Option<PathBuf>) -> Result<crate::config::WorkerConfig> {
+fn load_worker_config(path: Option<PathBuf>) -> Result<crate::config::WorkerSettings> {
     let config = path.unwrap_or(PathBuf::from("./config.json"));
     let config_body = std::fs::read_to_string(config)?;
     let config_body = config::apply_env(&config_body)?;
