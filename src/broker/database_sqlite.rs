@@ -114,6 +114,11 @@ impl SQLiteInterface {
         )").execute(&mut con).await.context("error creating table searches")?;
         sqlx::query("CREATE INDEX IF NOT EXISTS searches_finished ON searches(finished)").execute(&mut con).await?;
 
+        sqlx::query("create table if not exists config_values (
+            key TEXT PRIMARY KEY,
+            data BLOB NOT NULL,
+        )").execute(&mut con).await.context("error creating table config_values")?;
+
         return Ok(())
     }
 
@@ -211,5 +216,23 @@ impl SQLiteInterface {
             None => None,
         })
     }
+
+    
+    pub async fn store_value(&self, key: &str, value: &[u8]) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO config_values(key, data) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&self.db).await?;
+        Ok(())
+    }
+
+    pub async fn fetch_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>, )> = sqlx::query_as("SELECT data FROM config_values WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.db).await?;
+
+        Ok(row.map(|(data, )| data))
+    }
+    
 }
 

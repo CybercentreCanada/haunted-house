@@ -5,10 +5,15 @@ pub mod interface;
 pub mod auth;
 mod database;
 mod database_sqlite;
+mod fetcher;
 
 use std::collections::{HashSet, HashMap, hash_map, BTreeSet, VecDeque};
+use std::str::FromStr;
 use std::sync::Arc;
 
+use assemblyline_markings::classification::ClassificationParser;
+use assemblyline_markings::config::ClassificationConfig;
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, SinkExt};
 use itertools::Itertools;
 use log::{error, info, debug};
@@ -24,8 +29,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::access::AccessControl;
 use crate::broker::interface::{SearchRequestResponse, SearchProgress};
-use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig};
+use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig, AssemblylineConfig};
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
@@ -33,7 +39,7 @@ use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, Cr
 
 use self::auth::Authenticator;
 use self::database::Database;
-use self::interface::{InternalSearchStatus, SearchRequest, StatusReport};
+use self::interface::{InternalSearchStatus, SearchRequest, StatusReport, IngestRequest};
 
 /// Entry point function to the broker
 pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
@@ -83,6 +89,8 @@ pub struct HouseCore {
     pub authenticator: Authenticator,
     /// configuration information tuning the system behaviour
     pub config: BrokerSettings,
+    /// Classification engine if that configuration was available
+    pub access_engine: Option<ClassificationParser>,
     /// Queue of files waiting to be ingested
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     /// Set of files that couldn't be quickly accepted by any worker
@@ -150,6 +158,26 @@ impl HouseCore {
             }
         );
 
+        // Check for assemblyline system
+        let (al_client, access_engine) = if let Some(assemblyline_config) = config.assemblyline.clone() {
+            // Build a client
+            let client = assemblyline_client::Client::connect(assemblyline_config.url.clone(), assemblyline_client::Authentication::ApiKey { 
+                username: assemblyline_config.username.clone(), 
+                key: assemblyline_config.apikey.clone() 
+            }).await?;
+
+            let mut def = client.help.classification_definition().await.unwrap();
+            let definition = def.remove("original_definition").unwrap();
+            let classification: ClassificationConfig = serde_json::from_value(definition).unwrap();
+
+            // Build a classification engine
+            let ce = ClassificationParser::new(classification)?;
+
+            (Some((Arc::new(client), assemblyline_config)), Some(ce))
+        } else {
+            (None, None)
+        };
+
         // Create core object
         let core = Arc::new(Self {
             database,
@@ -161,7 +189,8 @@ impl HouseCore {
             worker_ingest: RwLock::new(Default::default()),
             pending_assignments: RwLock::new(Default::default()),
             running_searches: RwLock::new(Default::default()),
-            yara_permits
+            yara_permits,
+            access_engine,
         });
 
         // Revive search workers for ongoing searches
@@ -188,6 +217,11 @@ impl HouseCore {
         // tokio::spawn(worker_watcher(core.clone()));
         // tokio::spawn(garbage_collector(core.clone()));
 
+        // Start the file fetcher
+        if let Some((al_client, config)) = al_client {
+            tokio::spawn(fetcher::fetch_agent(core.clone(), al_client, config));
+        }
+
         return Ok(core)
     }
 
@@ -203,6 +237,76 @@ impl HouseCore {
         let handle = tokio::task::spawn(search_worker(self.clone(), recv, code.clone()));
         searches.insert(code, (handle, send));
         return Ok(res)
+    }
+
+    fn prepare_classification(&self, classification: &str) -> Result<AccessControl> {
+        let ce = match self.access_engine {
+            Some(engine) => engine,
+            None => return Err(anyhow::anyhow!("Server side classification parsing not configured."))
+        };
+
+        let parts = ce.get_classification_parts(classification, false, true, true)?;
+
+        let mut top = vec![];
+
+        top.push(AccessControl::Token(ce.get_classification_level_text(parts.level, false)?));
+
+        for item in parts.required {
+            top.push(AccessControl::Token(item))
+        }
+
+        if parts.groups.len() > 1 {
+            top.push(AccessControl::Or(parts.groups.into_iter().map(AccessControl::Token).collect()));
+        } else if parts.groups.len() == 1 {
+            top.push(AccessControl::Token(parts.groups[0]));
+        }
+
+        if parts.subgroups.len() > 1 {
+            top.push(AccessControl::Or(parts.subgroups.into_iter().map(AccessControl::Token).collect()));
+        } else if parts.subgroups.len() == 1 {
+            top.push(AccessControl::Token(parts.subgroups[0]));
+        }
+
+        Ok(if top.is_empty() {
+            AccessControl::Always
+        } else if top.len() == 1 {
+            top[0]
+        } else {
+            AccessControl::And(top)
+        })
+    }
+
+    pub async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
+            info: FileInfo{
+                hash: Sha256::from_str(&file.sha256)?,
+                access: self.prepare_classification(&file.classification)?,
+                expiry: ExpiryGroup::create(&file.expiry)
+            },
+            response: vec![send]
+        }))?;
+        return recv.await?;
+    }
+
+    fn checkpoint_key(config: &AssemblylineConfig) -> Result<String> {
+        let mut url = url::Url::parse(&config.url)?;
+        url.set_username(&config.username);
+        url.set_password(Some(config.apikey.as_str()));
+        Ok(format!("checkpoint:{url}"))
+    }
+
+    pub async fn get_checkpoint(&self, config: &AssemblylineConfig) -> Result<DateTime<Utc>> {
+        let key = Self::checkpoint_key(config)?;
+        Ok(match self.database.fetch_value(&key).await? {
+            Some(value) => DateTime::parse_from_rfc3339(&String::from_utf8(value)?)?.into(),
+            None => DateTime::<Utc>::MIN_UTC,
+        })
+    }
+
+    pub async fn set_checkpoint(&self, config: &AssemblylineConfig, checkpoint: DateTime<Utc>) -> Result<()> {
+        let key = Self::checkpoint_key(config)?;
+        self.database.store_value(&key, checkpoint.to_rfc3339().as_bytes()).await
     }
 
     /// Send a task directly to a watcher for a particular worker.

@@ -72,6 +72,11 @@ tokio-tungstenite = { version = "0.19", features = ["native-tls"] }
 native-tls = "0.2"
 hyper-rustls = { version = "0.23", features = [] }
 rustls = "0.20"
+url = "2.4"
+
+# Assemblyline libraries
+assemblyline-client = "0.1"
+assemblyline-markings = "0.1"
 
 # Cloud service libraries
 azure_core = "0.8"

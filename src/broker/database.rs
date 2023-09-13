@@ -60,5 +60,18 @@ impl Database {
             Database::SQLite(local) => local.search_status(code).await.context("search_status")
         }
     }
+
+    pub async fn store_value(&self, key: &str, value: &[u8]) -> Result<()> {
+        match self {
+            Database::SQLite(local) => local.store_value(key, value).await.context("store_value")
+        }
+    }
+
+    pub async fn fetch_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            Database::SQLite(local) => local.fetch_value(key).await.context("fetch_value")
+        }
+    }
+    
 }
 

@@ -126,33 +126,19 @@ impl WorkerAddress {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FieldExtractor(Vec<String>);
 
-/// Pull file information from an elasticsearch server
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ElasticsearchIngestSource {
+/// Pull file information from an assemblyline server
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AssemblylineConfig {
     /// Url to connect to elasticsearch server
-    url: String,
+    pub url: String,
     /// Username to authenticate with
-    username: String,
-    /// Password to authenticate with
-    password: String,
-    /// Index name to read files from
-    index: String,
-    /// How to extract the sha256 from a document returned by elasticsearch
-    #[serde(default="default_sha256_extractor")]
-    sha256_extractor: FieldExtractor,
-    /// How to extract the access control from a document returned by elasticsearch
-    #[serde(default="default_access_extractor")]
-    access_extractor: FieldExtractor,
-    /// How to extract the expiry from a document returned by elasticsearch
-    #[serde(default="default_expiry_extractor")]
-    expiry_extractor: FieldExtractor
-}
-
-/// Configure a source for file ingestion
-#[derive(Debug, Serialize, Deserialize)]
-pub enum IngestSource {
-    /// Pull file information from an elasticsearch server
-    Elasticsearch(ElasticsearchIngestSource)
+    pub username: String,
+    /// API key to authenticate with
+    pub apikey: String,
+    /// Seconds between polling calls to fetch more file data
+    pub poll_interval: f64,
+    pub concurrent_tasks: usize,
+    pub batch_size: usize,
 }
 
 /// Default field path to use reading sha256 for ingested file
@@ -185,6 +171,9 @@ pub struct BrokerSettings {
     pub bind_address: Option<String>,
     /// TLS settings for the outward facing API
     pub tls: Option<TLSConfig>,
+
+    /// Configuration for the assemblyline system to tie into
+    pub assemblyline: Option<AssemblylineConfig>,
 
     /// List of workers controlled by the broker server
     pub workers: HashMap<WorkerID, WorkerAddress>,
@@ -220,6 +209,7 @@ impl Default for BrokerSettings {
             workers: [
                 (WorkerID::from("worker-1".to_owned()), WorkerAddress::from("worker-0:4000"))
             ].into(),
+            assemblyline: None,
             worker_certificate: WorkerTLSConfig::AllowAll,
             filter_item_limit: default_filter_item_limit(),
             per_filter_pending_limit: default_per_filter_pending_limit(),
