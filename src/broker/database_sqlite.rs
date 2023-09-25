@@ -26,7 +26,7 @@ pub struct SQLiteInterface {
 /// Database record describing a search, either in progress or completed.
 #[derive(Serialize, Deserialize)]
 pub struct SearchRecord {
-    /// ID code that identifies a search 
+    /// ID code that identifies a search
     pub code: String,
     /// Signature that is being run for this search
     pub yara_signature: String,
@@ -116,7 +116,7 @@ impl SQLiteInterface {
 
         sqlx::query("create table if not exists config_values (
             key TEXT PRIMARY KEY,
-            data BLOB NOT NULL,
+            data BLOB NOT NULL
         )").execute(&mut con).await.context("error creating table config_values")?;
 
         return Ok(())
@@ -217,7 +217,7 @@ impl SQLiteInterface {
         })
     }
 
-    
+
     pub async fn store_value(&self, key: &str, value: &[u8]) -> Result<()> {
         sqlx::query("INSERT OR REPLACE INTO config_values(key, data) VALUES (?, ?)")
             .bind(key)
@@ -233,6 +233,6 @@ impl SQLiteInterface {
 
         Ok(row.map(|(data, )| data))
     }
-    
+
 }
 
