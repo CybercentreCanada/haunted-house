@@ -161,9 +161,9 @@ impl HouseCore {
         // Check for assemblyline system
         let (al_client, access_engine) = if let Some(assemblyline_config) = config.assemblyline.clone() {
             // Build a client
-            let client = assemblyline_client::Client::connect(assemblyline_config.url.clone(), assemblyline_client::Authentication::ApiKey { 
-                username: assemblyline_config.username.clone(), 
-                key: assemblyline_config.apikey.clone() 
+            let client = assemblyline_client::Client::connect(assemblyline_config.url.clone(), assemblyline_client::Authentication::ApiKey {
+                username: assemblyline_config.username.clone(),
+                key: assemblyline_config.apikey.clone()
             }).await?;
 
             let mut def = client.help.classification_definition().await.unwrap();
@@ -203,7 +203,7 @@ impl HouseCore {
             }
         }
 
-        // Launch worker inget watchers.
+        // Launch worker ingest watchers.
         {
             let mut worker_ingest = core.worker_ingest.write().await;
             for (worker, address) in core.config.workers.iter() {
