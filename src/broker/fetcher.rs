@@ -22,12 +22,12 @@ pub (crate) async fn fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, conf
     }
 }
 
-/// Raw file details from assemblyline. 
+/// Raw file details from assemblyline.
 /// Not yet parsed into formats that we will use internally.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub (crate) struct FetchedFile {
     pub seen: DateTime<Utc>,
-    pub sha256: String, 
+    pub sha256: String,
     pub classification: String,
     pub expiry: Option<DateTime<Utc>>,
 }
@@ -56,11 +56,13 @@ fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
     }
 }
 
-/// 
+const RETRY_LIMIT: usize = 10;
+
+/// implementation loop to fetch files from assemblyline
 async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig) -> Result<()> {
     //
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<()>)>::new();
-    let mut pending: BTreeMap<FetchedFile, bool> = Default::default();
+    let mut pending: BTreeMap<FetchedFile, (bool, usize)> = Default::default();
     let mut poll_interval = tokio::time::interval(Duration::from_secs_f64(config.poll_interval));
 
     // Get checkpoint for this source.
@@ -69,13 +71,11 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
     // entries may also occur after this point.
     let mut checkpoint: DateTime<Utc> = core.get_checkpoint(&config).await?;
 
-    todo!("Retry limit");
-
-    loop {        
+    loop {
         // Update the checkpoint if needed
         let old_checkpoint = checkpoint;
         while let Some(first) = pending.first_entry() {
-            if *first.get() {
+            if first.get().0 {
                 checkpoint = first.remove_entry().0.seen;
             } else {
                 break
@@ -111,7 +111,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                 match pending.entry(file.clone()) {
                     std::collections::btree_map::Entry::Occupied(_) => {}
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(false);
+                        entry.insert((false, 0));
                         let core = core.clone();
                         running.spawn(async move {
                             let resp = core.start_ingest(&file).await;
@@ -131,21 +131,24 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                     None => continue,
                 };
 
-                if let Err(err) = result {
-                    error!("Error in fetch: {err}");
-                    let core = core.clone();
-                    running.spawn(async move {
-                        let resp = core.start_ingest(&file).await;
-                        return (file, resp)
-                    });
-                    continue;
+                if let std::collections::btree_map::Entry::Occupied(mut entry) = pending.entry(file.clone()) {
+                    entry.get_mut().1 += 1;
+                    if entry.get().1 <= RETRY_LIMIT {
+                        if let Err(err) = result {
+                            error!("Error in fetch: {err}");
+                            let core = core.clone();
+                            running.spawn(async move {
+                                let resp = core.start_ingest(&file).await;
+                                return (file, resp)
+                            });
+                            continue;
+                        }
+                    }
+                    entry.get_mut().0 = true;
                 }
-                
-                if let std::collections::btree_map::Entry::Occupied(mut entry) = pending.entry(file) {
-                    *entry.get_mut() = true;
-                }
+
             }
-            timeout = poll_interval.tick() => {
+            _timeout = poll_interval.tick() => {
                 continue
             }
         }

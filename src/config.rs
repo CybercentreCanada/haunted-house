@@ -136,17 +136,22 @@ pub struct AssemblylineConfig {
     /// API key to authenticate with
     pub apikey: String,
     /// Seconds between polling calls to fetch more file data
+    #[serde(default="default_poll_interval")]
     pub poll_interval: f64,
+    /// Maximum number of pending ingestion tasks
+    #[serde(default="default_concurrent_tasks")]
     pub concurrent_tasks: usize,
+    /// How many items to get from assemblyline interface with each call
+    #[serde(default="default_batch_size")]
     pub batch_size: usize,
 }
 
-/// Default field path to use reading sha256 for ingested file
-fn default_sha256_extractor() -> FieldExtractor { FieldExtractor(vec!["sha256".to_owned()]) }
-/// Default field path to use reading access control for ingested file
-fn default_access_extractor() -> FieldExtractor { FieldExtractor(vec!["classification".to_owned()]) }
-/// Default field path to use reading expiry for ingested file
-fn default_expiry_extractor() -> FieldExtractor { FieldExtractor(vec!["expiry_ts".to_owned()]) }
+/// default value for poll_interval
+fn default_poll_interval() -> f64 { 5.0 }
+/// default value for concurrent_tasks
+fn default_concurrent_tasks() -> usize { 30000 }
+/// default value for batch_size
+fn default_batch_size() -> usize { 2000 }
 /// default value for per_filter_pending_limit
 fn default_per_filter_pending_limit() -> u64 { 1000 }
 /// default value for per_worker_group_duplication
