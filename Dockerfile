@@ -1,4 +1,4 @@
-FROM rust:1.67-bullseye AS builder
+FROM rust:1.72.1-bookworm AS builder
 
 # Add more build tools
 RUN apt-get update && apt-get install -yy libclang-dev
@@ -13,7 +13,7 @@ RUN cargo build --release --target-dir /out/
 RUN test -f "/out/release/haunted-house"
 
 # Start over with an empty image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Get required apt packages
 # RUN apt-get update && apt-get install -yy libssl1.1 && rm -rf /var/lib/apt/lists/*
