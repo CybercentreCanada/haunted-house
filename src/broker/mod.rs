@@ -240,7 +240,7 @@ impl HouseCore {
     }
 
     fn prepare_classification(&self, classification: &str) -> Result<AccessControl> {
-        let ce = match self.access_engine {
+        let ce = match &self.access_engine {
             Some(engine) => engine,
             None => return Err(anyhow::anyhow!("Server side classification parsing not configured."))
         };
@@ -258,25 +258,25 @@ impl HouseCore {
         if parts.groups.len() > 1 {
             top.push(AccessControl::Or(parts.groups.into_iter().map(AccessControl::Token).collect()));
         } else if parts.groups.len() == 1 {
-            top.push(AccessControl::Token(parts.groups[0]));
+            top.push(AccessControl::Token(parts.groups[0].clone()));
         }
 
         if parts.subgroups.len() > 1 {
             top.push(AccessControl::Or(parts.subgroups.into_iter().map(AccessControl::Token).collect()));
         } else if parts.subgroups.len() == 1 {
-            top.push(AccessControl::Token(parts.subgroups[0]));
+            top.push(AccessControl::Token(parts.subgroups[0].clone()));
         }
 
         Ok(if top.is_empty() {
             AccessControl::Always
         } else if top.len() == 1 {
-            top[0]
+            top.pop().unwrap()
         } else {
             AccessControl::And(top)
         })
     }
 
-    pub async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<()> {
+    pub (crate) async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<()> {
         let (send, recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
             info: FileInfo{

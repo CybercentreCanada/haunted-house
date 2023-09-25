@@ -1,6 +1,6 @@
 [package]
 name = "haunted-house"
-version = "0.0.23"
+version = "0.0.24"
 edition = "2021"
 default-run = "haunted-house"
 
@@ -98,6 +98,7 @@ assertor = "*"
 [features]
 #python = ["pyo3", "dep:pyo3-asyncio", "dep:pyo3-log"]
 #extension-module = ["python", "pyo3/extension-module"]
+serde_yaml = ["dep:serde_yaml"]
 operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
 #default = ["extension-module"]
 default = []
