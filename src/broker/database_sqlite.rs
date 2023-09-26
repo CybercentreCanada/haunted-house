@@ -217,7 +217,7 @@ impl SQLiteInterface {
         })
     }
 
-
+    /// Write a transient configuration value to the database
     pub async fn store_value(&self, key: &str, value: &[u8]) -> Result<()> {
         sqlx::query("INSERT OR REPLACE INTO config_values(key, data) VALUES (?, ?)")
             .bind(key)
@@ -226,6 +226,7 @@ impl SQLiteInterface {
         Ok(())
     }
 
+    /// Read a transient configuration value from the database
     pub async fn fetch_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let row: Option<(Vec<u8>, )> = sqlx::query_as("SELECT data FROM config_values WHERE key = ?")
             .bind(key)

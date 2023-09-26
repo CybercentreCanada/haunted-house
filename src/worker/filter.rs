@@ -811,6 +811,11 @@ impl ExtensibleTrigramFile {
         return Ok(handle)
     }
 
+    /// Check if the index still exists
+    pub fn blocking_exists(&mut self) -> bool {
+        self.location.exists()
+    }
+
     /// Flush the outstanding operations and delete the corresponding journals and wait for the operation to finish
     pub fn flush_blocking(&mut self) -> Result<()> {
         let handle = self.flush_threaded(None, None)?;

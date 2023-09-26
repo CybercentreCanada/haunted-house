@@ -61,17 +61,19 @@ impl Database {
         }
     }
 
+    /// Write a transient configuration value to the database
     pub async fn store_value(&self, key: &str, value: &[u8]) -> Result<()> {
         match self {
             Database::SQLite(local) => local.store_value(key, value).await.context("store_value")
         }
     }
 
+    /// Read a transient configuration value from the database
     pub async fn fetch_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
         match self {
             Database::SQLite(local) => local.fetch_value(key).await.context("fetch_value")
         }
     }
-    
+
 }
 

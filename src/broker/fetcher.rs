@@ -26,9 +26,13 @@ pub (crate) async fn fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, conf
 /// Not yet parsed into formats that we will use internally.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub (crate) struct FetchedFile {
+    /// When was this file last seen by the assemblyline system
     pub seen: DateTime<Utc>,
+    /// Hash of the file in question
     pub sha256: String,
+    /// Classification of the file for this sighting
     pub classification: String,
+    /// Time of file expiry for this sighting
     pub expiry: Option<DateTime<Utc>>,
 }
 

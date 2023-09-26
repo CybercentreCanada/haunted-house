@@ -61,6 +61,7 @@ impl FilterWorker {
     }
 }
 
+/// Worker that handles write operations on this index
 fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerSettings, id: FilterID, ready_send: watch::Sender<bool>, reader_recv: mpsc::Receiver<ReaderCommand>) {
     // Open the file
     let directory = config.get_filter_directory();
@@ -90,6 +91,7 @@ fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerS
     }
 }
 
+/// Implementation method for writer_worker
 pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: FilterID, filter: Arc<RwLock<ExtensibleTrigramFile>>) -> Result<()> {
     while let Some(message) = writer_recv.blocking_recv() {
         match message {
@@ -119,12 +121,15 @@ pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: Filte
     info!("Stopping ingest writer for {id}");
     {
         let mut filter = filter.blocking_write();
-        filter.flush_blocking()?;
+        if filter.blocking_exists() {
+            filter.flush_blocking()?;
+        }
     }
     info!("Stopped ingest writer for {id}");
     return Ok(())
 }
 
+/// Outer function for running read operations on this index
 fn reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, mut reader_recv: mpsc::Receiver<ReaderCommand>) {
     loop {
         match _reader_worker(filter.clone(), &mut reader_recv) {
@@ -136,6 +141,7 @@ fn reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, mut reader_recv: mp
     }
 }
 
+/// implementation function for reader_worker
 fn _reader_worker(filter: Arc<RwLock<ExtensibleTrigramFile>>, reader_recv: &mut mpsc::Receiver<ReaderCommand>) -> Result<()> {
     while let Some(message) = reader_recv.blocking_recv() {
         match message {
