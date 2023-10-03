@@ -135,6 +135,8 @@ pub struct AssemblylineConfig {
     pub username: String,
     /// API key to authenticate with
     pub apikey: String,
+    /// CA certificate to talk to assemblyline
+    pub ca_cert: Option<String>,
     /// Seconds between polling calls to fetch more file data
     #[serde(default="default_poll_interval")]
     pub poll_interval: f64,

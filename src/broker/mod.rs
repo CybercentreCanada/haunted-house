@@ -160,11 +160,21 @@ impl HouseCore {
 
         // Check for assemblyline system
         let (al_client, access_engine) = if let Some(assemblyline_config) = config.assemblyline.clone() {
-            // Build a client
-            let client = assemblyline_client::Client::connect(assemblyline_config.url.clone(), assemblyline_client::Authentication::ApiKey {
-                username: assemblyline_config.username.clone(),
-                key: assemblyline_config.apikey.clone()
-            }).await?;
+            info!("Connecting to assemblyline system at: {}", assemblyline_config.url);
+            // setup connection
+            let connection = Arc::new(assemblyline_client::Connection::connect(
+                assemblyline_config.url.clone(),
+                assemblyline_client::Authentication::ApiKey {
+                    username: assemblyline_config.username.clone(),
+                    key: assemblyline_config.apikey.clone()
+                },
+                None,
+                true,
+                Default::default(),
+                assemblyline_config.ca_cert.clone(),
+                None,
+            ).await?);
+            let client = assemblyline_client::Client::from_connection(connection).await?;
 
             let mut def = client.help.classification_definition().await.unwrap();
             let definition = def.remove("original_definition").unwrap();
@@ -175,6 +185,7 @@ impl HouseCore {
 
             (Some((Arc::new(client), assemblyline_config)), Some(ce))
         } else {
+            info!("Not connecting to assemblyline.");
             (None, None)
         };
 
@@ -195,6 +206,7 @@ impl HouseCore {
 
         // Revive search workers for ongoing searches
         {
+            info!("Starting search workers");
             let mut searches = core.running_searches.write().await;
             for code in core.database.list_active_searches().await? {
                 let (send, recv) = mpsc::channel(64);
@@ -205,6 +217,7 @@ impl HouseCore {
 
         // Launch worker ingest watchers.
         {
+            info!("Starting worker watchers");
             let mut worker_ingest = core.worker_ingest.write().await;
             for (worker, address) in core.config.workers.iter() {
                 let (send, recv) = mpsc::unbounded_channel();
@@ -213,11 +226,13 @@ impl HouseCore {
             }
         }
 
+        info!("Starting ingest worker");
         tokio::spawn(ingest_worker(core.clone(), receive_ingest));
         // tokio::spawn(worker_watcher(core.clone()));
         // tokio::spawn(garbage_collector(core.clone()));
 
         // Start the file fetcher
+        info!("Starting file fetcher");
         if let Some((al_client, config)) = al_client {
             tokio::spawn(fetcher::fetch_agent(core.clone(), al_client, config));
         }
