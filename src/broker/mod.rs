@@ -169,10 +169,9 @@ impl HouseCore {
                     key: assemblyline_config.apikey.clone()
                 },
                 None,
-                true,
+                assemblyline_config.tls.clone(),
                 Default::default(),
-                assemblyline_config.ca_cert.clone(),
-                None,
+                Some(60.0),
             ).await?);
             let client = assemblyline_client::Client::from_connection(connection).await?;
 
@@ -252,6 +251,34 @@ impl HouseCore {
         let handle = tokio::task::spawn(search_worker(self.clone(), recv, code.clone()));
         searches.insert(code, (handle, send));
         return Ok(res)
+    }
+
+    fn prepare_access(&self, access: &str) -> Result<HashSet<String>> {
+        let ce = match &self.access_engine {
+            Some(engine) => engine,
+            None => return Err(anyhow::anyhow!("Server side classification parsing not configured."))
+        };
+
+        let parts = ce.get_classification_parts(access, false, true, true)?;
+
+        let mut terms = vec![];
+
+        terms.push(ce.get_classification_level_text(parts.level, false)?);
+
+        const FALSE_LEVELS: [&str; 2] = ["NULL", "INV"];
+
+        let levels: Vec<String> = ce.levels()
+            .iter()
+            .filter(|(lvl, data)| **lvl <= parts.level && !FALSE_LEVELS.contains(&data.short_name.as_str()))
+            .map(|(_, data)|data.short_name.to_string())
+            .collect();
+
+        terms.extend(levels);
+        terms.extend(parts.required);
+        terms.extend(parts.groups);
+        terms.extend(parts.subgroups);
+
+        return Ok(terms.into_iter().collect())
     }
 
     fn prepare_classification(&self, classification: &str) -> Result<AccessControl> {

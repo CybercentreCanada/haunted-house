@@ -138,6 +138,10 @@ impl SearcherInterface {
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
         self.core.search_status(code).await
     }
+
+    pub fn parse_user_classification(&self, classification: &str) -> Result<HashSet<String>> {
+        self.core.prepare_access(classification)
+    }
 }
 
 /// An internal interface that allows access to ingestion operations.
@@ -184,14 +188,17 @@ pub enum SearchProgress {
     Finished
 }
 
-/// Request format for starting searches
+/// Request format for starting searches as coming in from http
+/// Don't use this internally, use SearchRequest
 #[serde_as]
 #[derive(Deserialize)]
-pub struct SearchRequest {
+pub struct RawSearchRequest {
     /// Control governing who can see this search
     pub view: AccessControl,
+    /// Classification string controlling which files this search can see
+    pub classification: Option<String>,
     /// Access flags controlling which files this search can see
-    pub access: HashSet<String>,
+    pub access: Option<HashSet<String>>,
     /// filter query derived from yara signature
     #[serde_as(as = "DisplayFromStr")]
     pub query: Query,
@@ -202,6 +209,23 @@ pub struct SearchRequest {
     /// Latest expiry date to be included in this search
     pub end_date: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// Search request normalized for internal processing
+pub struct SearchRequest {
+    /// Control governing who can see this search
+    pub view: AccessControl,
+    /// Access flags controlling which files this search can see
+    pub access: HashSet<String>,
+    /// filter query derived from yara signature
+    pub query: Query,
+    /// Yara signature searching with
+    pub yara_signature: String,
+    /// Earliest expiry date to be included in this search
+    pub start_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest expiry date to be included in this search
+    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 
 /// Explicitly not seralizable, the internal view used handling search status
 /// reports before deciding whether to send it to the user.
@@ -233,10 +257,31 @@ pub struct SearchRequestResponse {
 
 /// API endpoint for starting a new search
 #[handler]
-async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<SearchRequest>) -> Result<Json<SearchRequestResponse>> {
-    if !request.view.can_access(&request.access) {
-        return Err(anyhow::anyhow!("Search access too high."))
+async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<RawSearchRequest>) -> poem::Result<Json<SearchRequestResponse>> {
+    if request.classification.is_some() == request.access.is_some() {
+        return Err(poem::Error::from_string("Only one of 'classification' and 'access' may be set.", StatusCode::BAD_REQUEST))
     }
+
+    let access = if let Some(request) = request.classification {
+        interface.parse_user_classification(&request)?
+    } else if let Some(access) = request.access {
+        access
+    } else {
+        return Err(poem::Error::from_string("Only one of 'classification' and 'access' may be set.", StatusCode::BAD_REQUEST))
+    };
+
+    if !request.view.can_access(&access) {
+        return Err(anyhow::anyhow!("Search access too high.").into())
+    }
+
+    let request = SearchRequest {
+        view: request.view,
+        access,
+        query: request.query,
+        yara_signature: request.yara_signature,
+        start_date: request.start_date,
+        end_date: request.end_date,
+    };
 
     Ok(Json(interface.initialize_search(request).await?.resp))
 }

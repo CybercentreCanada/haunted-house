@@ -136,7 +136,8 @@ pub struct AssemblylineConfig {
     /// API key to authenticate with
     pub apikey: String,
     /// CA certificate to talk to assemblyline
-    pub ca_cert: Option<String>,
+    #[serde(default)]
+    pub tls: assemblyline_client::TLSSettings,
     /// Seconds between polling calls to fetch more file data
     #[serde(default="default_poll_interval")]
     pub poll_interval: f64,
@@ -313,7 +314,7 @@ pub fn apply_env(data: &str) -> Result<String> {
 }
 
 /// Regex used by the apply_variables method
-const REGEX: &str = r#"(^|.)\$\{([0-9[:alpha:]]+)(?::-?((?:\\\}|[^}])*))?\}"#;
+const REGEX: &str = r#"(^|.)\$\{([0-9[:alpha:]_]+)(?::-?((?:\\\}|[^}])*))?\}"#;
 
 /// Apply variable substitution to the string using the bash syntax
 pub fn apply_variables(data: &str, vars: &HashMap<String, String>) -> Result<String> {
@@ -369,7 +370,10 @@ mod test {
     #[test]
     fn env_application() {
         // Simple substitution0
-        let values = HashMap::from([("Abc".to_owned(), "cats".to_owned())]);
+        let values = HashMap::from([
+            ("Abc".to_owned(), "cats".to_owned()),
+            ("A_b".to_owned(), "rats".to_owned())
+        ]);
         assert_eq!(apply_variables("abc123", &values).unwrap(), "abc123".to_owned());
         assert_eq!(apply_variables("abc${Abc}123", &values).unwrap(), "abccats123".to_owned());
         assert_eq!(apply_variables("${Abc}", &values).unwrap(), "cats".to_owned());
@@ -377,6 +381,9 @@ mod test {
         assert_eq!(apply_variables("abc${Abc}", &values).unwrap(), "abccats".to_owned());
         assert_eq!(apply_variables("\\${Abc}123", &values).unwrap(), "${Abc}123".to_owned());
         assert_eq!(apply_variables("abc\\${Abc}123", &values).unwrap(), "abc${Abc}123".to_owned());
+
+        // underscore
+        assert_eq!(apply_variables("abc${A_b}123", &values).unwrap(), "abcrats123".to_owned());
 
         // substitution with default
         assert_eq!(apply_variables("abc${Abc:-dogs}123", &values).unwrap(), "abccats123".to_owned());
