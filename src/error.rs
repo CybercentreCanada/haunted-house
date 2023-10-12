@@ -37,6 +37,8 @@ pub enum ErrorKinds {
     CouldNotParseAccessString(String, String),
     /// An access control could not be parsed from the given string because part of the string couldn't be consumed
     CouldNotParseAccessStringTrailing(String, String),
+    /// Yara signature error
+    YaraRuleError(String),
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -102,8 +104,17 @@ impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ErrorKinds {
     }
 }
 
+impl From<boreal_parser::error::Error> for ErrorKinds {
+    fn from(value: boreal_parser::error::Error) -> Self {
+        Self::YaraRuleError(value.to_diagnostic().message)
+    }
+}
+
 impl poem::error::ResponseError for ErrorKinds {
     fn status(&self) -> http::StatusCode {
         http::StatusCode::INTERNAL_SERVER_ERROR
     }
 }
+
+/// A result that always uses the crate's error type
+pub type Result<T> = std::result::Result<T, ErrorKinds>;

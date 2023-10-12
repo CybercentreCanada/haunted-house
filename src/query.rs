@@ -39,6 +39,64 @@ impl Display for Query {
     }
 }
 
+impl Query {
+    /// Clean up a query object my merging any nested operations of the same type and reducing duplication
+    pub fn flatten(self) -> Self {
+        match self {
+            Query::And(items) => {
+                let mut flat_items = vec![];
+                for item in items {
+                    let item = item.flatten();
+                    if let Query::And(sub_items) = item {
+                        flat_items.extend(sub_items);
+                    } else {
+                        flat_items.push(item);
+                    }
+                }
+                flat_items.sort_unstable();
+                flat_items.dedup();
+                if flat_items.len() == 1 {
+                    flat_items.pop().unwrap()
+                } else {
+                    Query::And(flat_items)
+                }
+            },
+            Query::Or(items) => {
+                let mut flat_items = vec![];
+                for item in items {
+                    let item = item.flatten();
+                    if let Query::Or(sub_items) = item {
+                        flat_items.extend(sub_items);
+                    } else {
+                        flat_items.push(item);
+                    }
+                }
+                flat_items.sort_unstable();
+                flat_items.dedup();
+                if flat_items.len() == 1 {
+                    flat_items.pop().unwrap()
+                } else {
+                    Query::Or(flat_items)
+                }
+            },
+            Query::Literal(value) => Query::Literal(value),
+            Query::MinOf(num, expr) => Query::MinOf(num, expr.into_iter().map(Self::flatten).collect_vec()),
+        }
+    }
+
+    /// Transform all the literal sequences in a query
+    pub fn map_literals<F>(&self, map: &F) -> Self
+        where F: Fn(&[u8]) -> Vec<u8>
+    {
+        match self {
+            Query::And(items) => Query::And(items.iter().map(|item| item.map_literals(map)).collect_vec()),
+            Query::Or(items) => Query::Or(items.iter().map(|item| item.map_literals(map)).collect_vec()),
+            Query::Literal(bytes) => Query::Literal(map(&bytes)),
+            Query::MinOf(num, items) => Query::MinOf(*num, items.iter().map(|item| item.map_literals(map)).collect_vec()),
+        }
+    }
+}
+
 /// Submodule containing the logic for deserilazing a query from the mquery format.
 /// A rough grammar for what the parser is doing is included as comments
 mod parse_ursa {

@@ -46,6 +46,8 @@ hex = "0.4"
 parse-size = { version = "1", features = ["std"] }
 schemars = { version = "0.8.6", optional = true }
 serde_yaml = { version = "0.9", optional = true }
+boreal-parser = "0.3"
+base64 = "0.21"
 
 # Database tools
 deadpool = "0.9"

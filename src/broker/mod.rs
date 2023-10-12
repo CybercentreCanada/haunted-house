@@ -6,6 +6,7 @@ pub mod auth;
 mod database;
 mod database_sqlite;
 mod fetcher;
+mod yara_query;
 
 use std::collections::{HashSet, HashMap, hash_map, BTreeSet, VecDeque};
 use std::str::FromStr;
@@ -39,7 +40,7 @@ use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, Cr
 
 use self::auth::Authenticator;
 use self::database::Database;
-use self::interface::{InternalSearchStatus, SearchRequest, StatusReport, IngestRequest};
+use self::interface::{InternalSearchStatus, SearchRequest, StatusReport};
 
 /// Entry point function to the broker
 pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
@@ -253,6 +254,7 @@ impl HouseCore {
         return Ok(res)
     }
 
+    /// Parse a classification string as user access flags
     fn prepare_access(&self, access: &str) -> Result<HashSet<String>> {
         let ce = match &self.access_engine {
             Some(engine) => engine,
@@ -265,6 +267,7 @@ impl HouseCore {
 
         terms.push(ce.get_classification_level_text(parts.level, false)?);
 
+        /// classification levels that aren't real
         const FALSE_LEVELS: [&str; 2] = ["NULL", "INV"];
 
         let levels: Vec<String> = ce.levels()
@@ -281,6 +284,7 @@ impl HouseCore {
         return Ok(terms.into_iter().collect())
     }
 
+    /// Parse a classification string as data classification
     fn prepare_classification(&self, classification: &str) -> Result<AccessControl> {
         let ce = match &self.access_engine {
             Some(engine) => engine,
@@ -331,10 +335,11 @@ impl HouseCore {
         return recv.await?;
     }
 
+    /// Given an assemblyline system get the key used for its local configuration data
     fn checkpoint_key(config: &AssemblylineConfig) -> Result<String> {
         let mut url = url::Url::parse(&config.url)?;
-        url.set_username(&config.username);
-        url.set_password(Some(config.apikey.as_str()));
+        _ = url.set_username(&config.username);
+        _ = url.set_password(Some(config.apikey.as_str()));
         Ok(format!("checkpoint:{url}"))
     }
 
