@@ -595,7 +595,30 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
 
         ExpressionKind::ForIn { selection, set, .. } |
         ExpressionKind::ForAt { selection, set, .. } => {
-            todo!()
+            let variables = select_variables(set, strings);
+            let mut warnings = vec![];
+            let mut bodies = vec![];
+            for var in variables {
+                let ParsedQuery { query, warnings: w } = variable_to_query(&var)?;
+                if let Some(query) = query {
+                    bodies.push(query);
+                }
+                warnings.extend(w);
+            }
+
+            if bodies.is_empty() {
+                return Ok(ParsedQuery { query: None, warnings })
+            }
+
+            match selection {
+                boreal_parser::expression::ForSelection::Any => Ok(ParsedQuery { query: Some(Query::Or(bodies)), warnings }),
+                boreal_parser::expression::ForSelection::All => Ok(ParsedQuery { query: Some(Query::And(bodies)), warnings }),
+                boreal_parser::expression::ForSelection::None => Ok(None.into()),
+                boreal_parser::expression::ForSelection::Expr { expr, as_percent } => {
+                    let count = parse_expression_as_count(expr, *as_percent, bodies.len())?;
+                    Ok(ParsedQuery { query: Some(Query::MinOf(count, bodies)), warnings })
+                },
+            }
         },
 
         ExpressionKind::ForIdentifiers { selection, identifiers, identifiers_span, iterator, iterator_span, body } => todo!(),
@@ -603,6 +626,7 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
     }
 }
 
+/// resolve a number where one is expected in the yara signature
 fn parse_expression_as_count(expr: &Expression, percent: bool, size: usize) -> Result<i32> {
     use boreal_parser::expression::ExpressionKind;
     match &expr.expr {
@@ -865,4 +889,30 @@ mod test {
             Query::Literal(b"xx".to_vec()),
         ]));
     }
+
+    #[test]
+    fn for_at() {
+        let (query, warnings) = parse_yara_signature(r#"
+            rule Base64Example1 {
+                strings:
+                    $a1 = "1111"
+                    $a2 = "2222"
+                    $b1 = "3333"
+                    $x = "xx"
+
+                condition:
+                    2 of them at 0
+            }
+        "#).unwrap();
+
+        assert!(warnings.is_empty());
+        assert_eq!(query, Query::MinOf(2, vec![
+            Query::Literal(b"1111".to_vec()),
+            Query::Literal(b"2222".to_vec()),
+            Query::Literal(b"3333".to_vec()),
+            Query::Literal(b"xx".to_vec()),
+        ]));
+    }
+
+
 }

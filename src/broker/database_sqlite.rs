@@ -36,6 +36,8 @@ pub struct SearchRecord {
     pub view: AccessControl,
     /// permissions describing what files can be seen by by this search
     pub access: HashSet<String>,
+    /// List of warnings encountered by running this search
+    pub warnings: Vec<String>,
     /// List of errors encountered by running this search
     pub errors: Vec<String>,
     /// Earliest expiry group this search will include
@@ -150,6 +152,7 @@ impl SQLiteInterface {
                 access: req.access.clone(),
                 view: req.view.clone(),
                 query: req.query.clone(),
+                warnings: req.warnings.clone(),
                 hit_files: Default::default(),
                 truncated: false,
                 finished: false,
@@ -208,6 +211,7 @@ impl SQLiteInterface {
                     finished: record.finished,
                     phase: if record.finished { SearchProgress::Finished } else { SearchProgress::Unknown },
                     progress: (0, 1),
+                    warnings: record.warnings,
                     errors: record.errors,
                     hits: record.hit_files.into_iter().map(|hash|hash.hex()).collect(),
                     truncated: record.truncated,

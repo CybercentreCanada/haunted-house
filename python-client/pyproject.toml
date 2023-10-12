@@ -7,10 +7,7 @@ license = {text = "MIT Licence"}
 version = "0.0.19"
 dependencies = [
     "aiohttp",
-    "assemblyline",
-    "assemblyline_client",
     "pydantic",
-    "mquery_query_lib",
     "arrow",
     "requests",
 ]

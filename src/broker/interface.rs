@@ -18,11 +18,12 @@ use poem::web::headers::Authorization;
 use poem::web::headers::authorization::Bearer;
 use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::serde_as;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::access::AccessControl;
+use crate::broker::yara_query::parse_yara_signature;
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
 use crate::query::Query;
@@ -139,9 +140,16 @@ impl SearcherInterface {
         self.core.search_status(code).await
     }
 
+    /// Given a user classification string get their access flags
     pub fn parse_user_classification(&self, classification: &str) -> Result<HashSet<String>> {
         self.core.prepare_access(classification)
     }
+
+    /// Given a user classification string get their access flags
+    pub fn parse_data_classification(&self, classification: &str) -> Result<AccessControl> {
+        self.core.prepare_classification(classification)
+    }
+
 }
 
 /// An internal interface that allows access to ingestion operations.
@@ -165,7 +173,7 @@ impl IngestInterface {
         self.core.ingest_queue.send(super::IngestMessage::IngestMessage(IngestTask{
             info: FileInfo{
                 hash,
-                access: request.access,
+                access: self.core.prepare_classification(&request.access)?,
                 expiry: ExpiryGroup::create(&request.expiry)
             },
             response: vec![send]
@@ -193,15 +201,12 @@ pub enum SearchProgress {
 #[serde_as]
 #[derive(Deserialize)]
 pub struct RawSearchRequest {
-    /// Control governing who can see this search
-    pub view: AccessControl,
+    /// Classification governing who can see this search
+    pub view: String,
     /// Classification string controlling which files this search can see
     pub classification: Option<String>,
     /// Access flags controlling which files this search can see
     pub access: Option<HashSet<String>>,
-    /// filter query derived from yara signature
-    #[serde_as(as = "DisplayFromStr")]
-    pub query: Query,
     /// Yara signature searching with
     pub yara_signature: String,
     /// Earliest expiry date to be included in this search
@@ -218,6 +223,8 @@ pub struct SearchRequest {
     pub access: HashSet<String>,
     /// filter query derived from yara signature
     pub query: Query,
+    /// Warnings produced while running search
+    pub warnings: Vec<String>,
     /// Yara signature searching with
     pub yara_signature: String,
     /// Earliest expiry date to be included in this search
@@ -243,6 +250,8 @@ pub struct SearchRequestResponse {
     pub code: String,
     /// if the search has been completed
     pub finished: bool,
+    /// list of warnings encountered while running search
+    pub warnings: Vec<String>,
     /// list of errors encountered while running search
     pub errors: Vec<String>,
     /// which phase of the search is currently active
@@ -262,6 +271,7 @@ async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Js
         return Err(poem::Error::from_string("Only one of 'classification' and 'access' may be set.", StatusCode::BAD_REQUEST))
     }
 
+    let view = interface.parse_data_classification(&request.view)?;
     let access = if let Some(request) = request.classification {
         interface.parse_user_classification(&request)?
     } else if let Some(access) = request.access {
@@ -270,14 +280,17 @@ async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Js
         return Err(poem::Error::from_string("Only one of 'classification' and 'access' may be set.", StatusCode::BAD_REQUEST))
     };
 
-    if !request.view.can_access(&access) {
+    if !view.can_access(&access) {
         return Err(anyhow::anyhow!("Search access too high.").into())
     }
 
+    let (query, warnings) = parse_yara_signature(&request.yara_signature)?;
+
     let request = SearchRequest {
-        view: request.view,
+        view,
         access,
-        query: request.query,
+        query,
+        warnings,
         yara_signature: request.yara_signature,
         start_date: request.start_date,
         end_date: request.end_date,
@@ -290,7 +303,7 @@ async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Js
 #[derive(Serialize, Deserialize, Default)]
 pub struct StatusRequestBody {
     /// Level of access to use in retreiving search status
-    pub access: HashSet<String>,
+    pub access: String,
 }
 
 /// API endpoint for fetching search status
@@ -314,7 +327,12 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
         }
     };
 
-    if !status.view.can_access(&access.access) {
+    let access = match interface.parse_user_classification(&access.access) {
+        Ok(access) => access,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}").into_response())
+    };
+
+    if !status.view.can_access(&access) {
         return (StatusCode::NOT_FOUND, "Search code not found.".into_response())
     }
 
@@ -336,7 +354,7 @@ pub struct IngestRequest {
     #[serde(default = "default_blocking")]
     block: bool,
     /// What access control to apply to this file
-    access: crate::access::AccessControl,
+    access: String,
     /// When to expire this file from hauntedhouse
     #[serde(with = "ts_seconds_option")]
     expiry: Option<chrono::DateTime<chrono::Utc>>

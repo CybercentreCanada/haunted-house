@@ -56,4 +56,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     asyncio.run(main(args.yara_file, args.access, verify=not args.trust_all))
-

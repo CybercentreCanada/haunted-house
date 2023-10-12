@@ -38,6 +38,7 @@ pub (crate) struct FetchedFile {
 
 
 impl FetchedFile {
+    /// Build a fetched file object from the json data
     fn extract(data: &JsonMap) -> Option<Self> {
         Some(Self{
             sha256: data.get("sha256")?.as_str()?.to_owned(),
@@ -48,6 +49,7 @@ impl FetchedFile {
     }
 }
 
+/// Extract a date value from a json field
 fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
     match item.get(key) {
         Some(item) => match DateTime::parse_from_rfc3339(item.as_str()?) {
@@ -60,6 +62,7 @@ fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
     }
 }
 
+/// How many times should ingesting a file be retried
 const RETRY_LIMIT: usize = 10;
 
 /// implementation loop to fetch files from assemblyline

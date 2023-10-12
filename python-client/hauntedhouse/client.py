@@ -2,14 +2,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-import typing
+# import typing
 
 import arrow
 import aiohttp
 import requests
 import pydantic
-from assemblyline.common.classification import Classification
-from mquery_query_lib import yaraparse
 
 
 logger = logging.getLogger('hauntedhouse.client')
@@ -41,7 +39,7 @@ class SearchStatus(pydantic.BaseModel):
 class Client:
     def __init__(self, address: str, api_key: str, classification: dict, verify: bool = True):
         self.address = address
-        self.access_engine = Classification(classification)
+        # self.access_engine = Classification(classification)
 
         self.ingest_connection_lock = asyncio.Lock()
         self.ingest_connection: None | aiohttp.ClientWebSocketResponse = None
@@ -70,9 +68,6 @@ class Client:
 
     async def start_search(self, yara_rule: str, access_control: str, group: str = '',
                            archive_only=False) -> SearchStatus:
-        # Parse the access string into a set of key words
-        access_fields = self.prepare_access(access_control)
-        search_view = self.prepare_classification(access_control)
 
         # If we only want archived material set the start date to the far future
         start_date = None
@@ -81,9 +76,8 @@ class Client:
 
         # Send the search request
         result = await self.session.post('/search/', json={
-            'view': search_view,
-            'access': access_fields,
-            'query': query_from_yara(yara_rule),
+            'view': access_control,
+            'access': access_control,
             'group': group,
             'yara_signature': yara_rule,
             'start_date': start_date,
@@ -96,9 +90,6 @@ class Client:
 
     def start_search_sync(self, yara_rule: str, access_control: str, group: str = '',
                           archive_only=False) -> SearchStatus:
-        # Parse the access string into a set of key words
-        access_fields = self.prepare_access(access_control)
-        search_view = self.prepare_classification(access_control)
 
         # If we only want archived material set the start date to the far future
         start_date = None
@@ -107,9 +98,8 @@ class Client:
 
         # Send the search request
         result = self.sync_session.post(self.address + '/search/', json={
-            'view': search_view,
-            'access': access_fields,
-            'query': query_from_yara(yara_rule),
+            'view': access_control,
+            'access': access_control,
             'group': group,
             'yara_signature': yara_rule,
             'start_date': start_date,
@@ -121,81 +111,20 @@ class Client:
         return SearchStatus(**result.json())
 
     async def search_status(self, code: str, access: str) -> SearchStatus:
-        access_parts = self.prepare_access(access)
-
         # Send the request
-        result = await self.session.get('/search/' + code, json={'access': access_parts})
+        result = await self.session.get('/search/' + code, json={'access': access})
         result.raise_for_status()
 
         # Parse the message
         return SearchStatus(**await result.json())
 
     def search_status_sync(self, code: str, access: str) -> SearchStatus:
-        access_parts = self.prepare_access(access)
-
         # Send the request
-        result = self.sync_session.get(self.address + '/search/' + code, json={'access': access_parts})
+        result = self.sync_session.get(self.address + '/search/' + code, json={'access': access})
         result.raise_for_status()
 
         # Parse the message
         return SearchStatus(**result.json())
-
-    def prepare_access(self, access: str) -> list[str]:
-        if not access:
-            return []
-        parts = self.access_engine.get_access_control_parts(access)
-        terms = []
-        terms.extend([
-            key for key in self.access_engine.levels_map_stl.keys()
-            if key not in FALSE_LEVELS and self.access_engine.levels_map[key] <= parts['__access_lvl__']
-        ])
-        terms.extend(parts['__access_req__'])
-        terms.extend(parts['__access_grp1__'])
-        terms.extend(parts['__access_grp2__'])
-        while '__EMPTY__' in terms:
-            terms.remove('__EMPTY__')
-        return terms
-
-    @staticmethod
-    def _token(item):
-        return {'Token': item}
-
-    def prepare_classification(self, classification: str):
-        parts = self.access_engine.get_access_control_parts(classification)
-
-        group1 = parts['__access_grp1__']
-        group2 = parts['__access_grp2__']
-
-        if '__EMPTY__' in group1:
-            group1.remove('__EMPTY__')
-        if '__EMPTY__' in group2:
-            group2.remove('__EMPTY__')
-
-        top = []
-
-        top.append(self._token(self.access_engine.levels_map[str(parts['__access_lvl__'])]))
-
-        for item in parts['__access_req__']:
-            top.append(self._token(item))
-
-        if group1:
-            if len(group1) > 1:
-                top.append({"Or": [self._token(g) for g in group1]})
-            else:
-                top.append(self._token(group1[0]))
-
-        if group2:
-            if len(group2) > 1:
-                top.append({"Or": [self._token(g) for g in group2]})
-            else:
-                top.append(self._token(group2[0]))
-
-        if len(top) == 0:
-            return "Always"
-        if len(top) == 1:
-            return top[0]
-        else:
-            return {"And": top}
 
     async def ingest(self, sha256: str, classification: str, expiry, token: None | str = None):
         token = str(token or uuid.uuid4().hex)
@@ -212,7 +141,7 @@ class Client:
             body = {
                 'token': token,
                 'hash': sha256,
-                'access': self.prepare_classification(classification),
+                'access': classification,
                 'expiry': expiry,
                 'block': True,
             }
@@ -259,17 +188,3 @@ class Client:
         # Clear futures wating on this socket to complete
         for future in self.ingest_futures.values():
             future.cancel()
-
-
-def query_from_yara(yara_rule: str) -> str:
-    rules = yaraparse.parse_yara(yara_rule)
-
-    if len(rules) == 0:
-        raise ValueError("A yara rule couldn't be found")
-    elif len(rules) == 1:
-        query = rules[0].parse().query
-        if not query or query == '{}':
-            raise CouldNotParseRule()
-        return query
-    else:
-        raise ValueError("Only a single yara rule expected")
