@@ -4,7 +4,7 @@ description = "Client for hauntedhouse yara search engine."
 readme = "readme.md"
 requires-python = ">=3.9"
 license = {text = "MIT Licence"}
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
     "aiohttp",
     "pydantic",
