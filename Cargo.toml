@@ -4,10 +4,6 @@ version = "0.0.34"
 edition = "2021"
 default-run = "haunted-house"
 
-[[bin]]
-name = "operator"
-required-features = ["operator"]
-
 [dependencies]
 
 # Language utilities
