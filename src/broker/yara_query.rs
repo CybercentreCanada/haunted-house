@@ -1,3 +1,7 @@
+//!
+//! Functions to extract filter queries from yara signatures
+//!
+
 use base64::Engine;
 use boreal_parser::expression::Expression;
 use boreal_parser::file::YaraFileComponent;
@@ -62,7 +66,9 @@ pub fn parse_yara_signature(signature: &str) -> Result<(Query, Vec<String>)> {
         return Err(ErrorKinds::YaraRuleError("At least one rule must be provided".to_string()))
     };
 
-    let res = parse_expression(&signature.condition, &signature.variables, None)?;
+    let mut res = parse_expression(&signature.condition, &signature.variables, None)?;
+    res.warnings.sort_unstable();
+    res.warnings.dedup();
     match res.query {
         Some(query) => Ok((query.flatten(), res.warnings)),
         None => Err(ErrorKinds::YaraRuleError("Could not build filter from rule".to_string())),
@@ -71,9 +77,6 @@ pub fn parse_yara_signature(signature: &str) -> Result<(Query, Vec<String>)> {
 
 /// take a declared variable and build a set of byte queries from it
 fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
-    if var.modifiers.nocase {
-        return Ok("Case insensitive strings not supported.".into())
-    }
     if var.modifiers.private {
         return Ok("Private strings not used in filtering.".into())
     }
@@ -84,6 +87,31 @@ fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
         VariableDeclarationValue::Regex(regex) => parse_regex(regex)?,
         VariableDeclarationValue::HexString(hex) => parse_strings(hex, 3)?,
     };
+
+    // Apply nocase and add a warning
+    if var.modifiers.nocase {
+        patterns.query = match patterns.query {
+            Some(query) => {
+                //
+                let mut forms = vec![
+                    query.map_literals(&to_lowercase),
+                    query.map_literals(&to_uppercase),
+                    query,
+                ];
+
+                forms.sort_unstable();
+                forms.dedup();
+
+                patterns.warnings.push("Case insensitive strings not fully supported.".to_owned());
+                if forms.len() == 1 {
+                    forms.pop()
+                } else {
+                    Some(Query::Or(forms))
+                }
+            },
+            None => None
+        }
+    }
 
     // interleave null in string
     if var.modifiers.wide {
@@ -171,6 +199,24 @@ fn base64_encode(permute: u8, data: &[u8], alphabet: [u8;64]) -> Vec<u8> {
         1 => &output[2..],
         _ => &output[3..],
     }.as_bytes().to_vec()
+}
+
+/// Produce an ascii lowercase version of a query
+fn to_lowercase(values: &[u8]) -> Vec<u8> {
+    let mut data = vec![];
+    for byte in values {
+        data.push(byte.to_ascii_lowercase())
+    }
+    data
+}
+
+/// Produce an ascii uppercase version of a query
+fn to_uppercase(values: &[u8]) -> Vec<u8> {
+    let mut data = vec![];
+    for byte in values {
+        data.push(byte.to_ascii_uppercase())
+    }
+    data
 }
 
 /// Add null padding to every byte in the give byte sequence
@@ -366,7 +412,7 @@ fn produce_regex(node: &boreal_parser::regex::Node, limit: usize) -> Vec<(bool, 
                     ZeroOrMore => { paths.push((true, vec![], true)); },
                     OneOrMore => {},
                     Range(range) => {
-                        if let RepetitionRange::Bounded(a, b) = range {
+                        if let RepetitionRange::Bounded(a, _) = range {
                             if *a == 0 {
                                 paths.push((true, vec![], true));
                             }
@@ -620,9 +666,10 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
                 },
             }
         },
-
-        ExpressionKind::ForIdentifiers { selection, identifiers, identifiers_span, iterator, iterator_span, body } => todo!(),
-        ExpressionKind::ForRules { selection, set } => todo!(),
+        ExpressionKind::ForRules { .. } =>
+            Err(ErrorKinds::YaraRuleError("References to other yara rules not supported.".to_owned())),
+        ExpressionKind::ForIdentifiers { .. } =>
+            Err(ErrorKinds::YaraRuleError("Unsupported loop used. Please share this rule for more information.".to_owned())),
     }
 }
 
@@ -914,5 +961,137 @@ mod test {
         ]));
     }
 
+    #[test]
+    fn test_open_source_rule() {
+        let (query, warnings) = parse_yara_signature(r#"
+            rule mysql_database_presence
+            {
+                meta:
+                    author="CYB3RMX"
+                    description="This rule checks MySQL database presence"
+
+                strings:
+                    $db = "MySql.Data"
+                    $db1 = "MySqlCommand"
+                    $db2 = "MySqlConnection"
+                    $db3 = "MySqlDataReader"
+                    $db4 = "MySql.Data.MySqlClient"
+
+                condition:
+                    (any of ($db*))
+            }
+        "#).unwrap();
+
+        assert!(warnings.is_empty());
+        assert_eq!(query, Query::Or(vec![
+            Query::Literal(b"MySql.Data".to_vec()),
+            Query::Literal(b"MySql.Data.MySqlClient".to_vec()),
+            Query::Literal(b"MySqlCommand".to_vec()),
+            Query::Literal(b"MySqlConnection".to_vec()),
+            Query::Literal(b"MySqlDataReader".to_vec()),
+        ]));
+
+        let (query, warnings) = parse_yara_signature(r#"
+            rule Str_Win32_Wininet_Library
+            {
+
+                meta:
+                    author = "@adricnet"
+                    description = "Match Windows Inet API library declaration"
+                    method = "String match"
+                    reference = "https://github.com/dfirnotes/rules"
+
+                strings:
+                    $wininet_lib = "WININET.dll" nocase
+
+                condition:
+                    (all of ($wininet*))
+            }
+        "#).unwrap();
+
+        assert!(warnings.len() == 1);
+        assert_eq!(query, Query::Or(vec![
+            Query::Literal(b"WININET.DLL".to_vec()),
+            Query::Literal(b"WININET.dll".to_vec()),
+            Query::Literal(b"wininet.dll".to_vec()),
+        ]));
+
+        let (query, warnings) = parse_yara_signature(r#"
+            rule win_files_operation {
+                meta:
+                    author = "x0r"
+                    description = "Affect private profile"
+                version = "0.1"
+                strings:
+                    $f1 = "kernel32.dll" nocase
+                    $c1 = "WriteFile"
+                    $c2 = "SetFilePointer"
+                    $c3 = "WriteFile"
+                    $c4 = "ReadFile"
+                    $c5 = "DeleteFileA"
+                    $c6 = "CreateFileA"
+                    $c7 = "FindFirstFileA"
+                    $c8 = "MoveFileExA"
+                    $c9 = "FindClose"
+                    $c10 = "SetFileAttributesA"
+                    $c11 = "CopyFile"
+
+                condition:
+                    $f1 and 3 of ($c*)
+            }
+        "#).unwrap();
+
+        assert!(warnings.len() == 1);
+        assert_eq!(query, Query::And(vec![
+            Query::Or(vec![
+                Query::Literal(b"KERNEL32.DLL".to_vec()),
+                Query::Literal(b"kernel32.dll".to_vec()),
+            ]),
+            Query::MinOf(3, vec![
+                Query::Literal(b"CopyFile".to_vec()),
+                Query::Literal(b"CreateFileA".to_vec()),
+                Query::Literal(b"DeleteFileA".to_vec()),
+                Query::Literal(b"FindClose".to_vec()),
+                Query::Literal(b"FindFirstFileA".to_vec()),
+                Query::Literal(b"MoveFileExA".to_vec()),
+                Query::Literal(b"ReadFile".to_vec()),
+                Query::Literal(b"SetFileAttributesA".to_vec()),
+                Query::Literal(b"SetFilePointer".to_vec()),
+                Query::Literal(b"WriteFile".to_vec()),
+            ])
+        ]));
+
+        let (query, warnings) = parse_yara_signature(r#"
+            rule screenshot {
+                meta:
+                    author = "x0r"
+                    description = "Take screenshot"
+                version = "0.1"
+                strings:
+                    $d1 = "Gdi32.dll" nocase
+                    $d2 = "User32.dll" nocase
+                    $c1 = "BitBlt"
+                    $c2 = "GetDC"
+                condition:
+                    1 of ($d*) and 1 of ($c*)
+            }
+        "#).unwrap();
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(query, Query::And(vec![
+            Query::Or(vec![
+                Query::Literal(b"BitBlt".to_vec()),
+                Query::Literal(b"GetDC".to_vec()),
+            ]),
+            Query::Or(vec![
+                Query::Literal(b"GDI32.DLL".to_vec()),
+                Query::Literal(b"Gdi32.dll".to_vec()),
+                Query::Literal(b"gdi32.dll".to_vec()),
+                Query::Literal(b"USER32.DLL".to_vec()),
+                Query::Literal(b"User32.dll".to_vec()),
+                Query::Literal(b"user32.dll".to_vec()),
+            ]),
+        ]));
+    }
 
 }

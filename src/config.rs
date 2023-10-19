@@ -231,12 +231,15 @@ impl Default for BrokerSettings {
     }
 }
 
-
+/// The sub directory where trigram data is cached
 const TRIGRAM_DIRECTORY: &str = "trigram-cache";
+/// The sub directory where filter data is stored
 const FILTER_DIRETORY: &str = "filters";
+/// The sub directory where sql database are stored
 const DATABASE_DIRETORY: &str = "sql-data";
 
 impl WorkerSettings {
+    /// Make sure all the data directories exist
     pub fn init_directories(&self) -> Result<()> {
         std::fs::create_dir_all(self.get_trigram_cache_directory())?;
         std::fs::create_dir_all(self.get_filter_directory())?;
@@ -244,47 +247,70 @@ impl WorkerSettings {
         return Ok(())
     }
 
+    /// Get a path object for the trigram directory
     pub fn get_trigram_cache_directory(&self) -> PathBuf {
         self.data_path.join(TRIGRAM_DIRECTORY)
     }
 
+    /// Get a path object for the filter directory
     pub fn get_filter_directory(&self) -> PathBuf {
         self.data_path.join(FILTER_DIRETORY)
     }
 
+    /// Geth a path for the database directory
     pub fn get_database_directory(&self) -> PathBuf {
         self.data_path.join(DATABASE_DIRETORY)
     }
 }
 
-
+/// Default path where workers will store data.
+/// Assuming the system is running in a container by default a root directory
+/// /data/ is used, assuming that is some sort of meaningful mount.
 fn default_data_path() -> PathBuf { PathBuf::from("/data/") }
+/// Default soft cap data limit
 fn default_data_limit() -> u64 { 1 << 40 }
+/// Number of bytes that will be reserved from the soft cap for transient purposes.
 fn default_data_reserve() -> u64 { 5 << 30 }
+/// The default size for the initial segments of the filter files
 fn default_initial_segment_size() -> u32 { 128 }
+/// The default size for extended segments for the filter files
 fn default_extended_segment_size() -> u32 { 2048 }
+/// How many files to ingest into a filter in a single pass
 fn default_ingest_batch_size() -> u32 { 100 }
+/// How many files to download into the trigram cache concurrently
 fn default_parallel_file_downloads() -> usize { 100 }
 
-
+/// Settings for the worker server
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkerSettings {
+    /// Where should files be stored temporarily while processing occurs
     pub file_cache: CacheConfig,
+    /// Where are the files being indexed stored
     pub files: crate::storage::BlobStorageConfig,
+    /// What address should this server bind to
     pub bind_address: Option<String>,
+    /// What TLS settings should the server use
     pub tls: Option<TLSConfig>,
+    /// Which path should be used for local data storage
     #[serde(default="default_data_path")]
     pub data_path: PathBuf,
+    /// A soft cap on the number of bytes of data to be saved by the worker.
+    /// The worker should stop accepting new items when the size gets near this.
     #[serde(default="default_data_limit")]
     pub data_limit: u64,
+    /// How much space (bytes) should be reserved for transient storage
     #[serde(default="default_data_reserve")]
     pub data_reserve: u64,
+    /// Default size for initial data segments in the filter files
     #[serde(default="default_initial_segment_size")]
     pub initial_segment_size: u32,
+    /// Default size for extended segments in the filter files
     #[serde(default="default_extended_segment_size")]
     pub extended_segment_size: u32,
+    /// How many files should be ingested per batch
     #[serde(default="default_ingest_batch_size")]
     pub ingest_batch_size: u32,
+    /// How many files should be downloaded concurrently
     #[serde(default="default_parallel_file_downloads")]
     pub parallel_file_downloads: usize
 }

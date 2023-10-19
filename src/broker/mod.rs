@@ -285,6 +285,7 @@ impl HouseCore {
     }
 
     /// Parse a classification string as data classification
+    #[allow(clippy::comparison_chain)]
     fn prepare_classification(&self, classification: &str) -> Result<AccessControl> {
         let ce = match &self.access_engine {
             Some(engine) => engine,
@@ -322,6 +323,7 @@ impl HouseCore {
         })
     }
 
+    /// Kick off the ingestion of a file and wait for its completion
     pub (crate) async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<()> {
         let (send, recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
@@ -343,6 +345,7 @@ impl HouseCore {
         Ok(format!("checkpoint:{url}"))
     }
 
+    /// Given an assemblyline system get the date to resume reading file records from
     pub async fn get_checkpoint(&self, config: &AssemblylineConfig) -> Result<DateTime<Utc>> {
         let key = Self::checkpoint_key(config)?;
         Ok(match self.database.fetch_value(&key).await? {
@@ -351,6 +354,7 @@ impl HouseCore {
         })
     }
 
+    /// Set the date checkpoint for reading files from an assemblyline system
     pub async fn set_checkpoint(&self, config: &AssemblylineConfig, checkpoint: DateTime<Utc>) -> Result<()> {
         let key = Self::checkpoint_key(config)?;
         self.database.store_value(&key, checkpoint.to_rfc3339().as_bytes()).await
@@ -480,7 +484,7 @@ impl IngestTask {
         self.info.expiry = self.info.expiry.clone().max(task.info.expiry);
         self.info.access = self.info.access.or(&task.info.access).simplify();
         // collect all the response channels into one list
-        self.response.extend(task.response.into_iter());
+        self.response.extend(task.response);
     }
 }
 

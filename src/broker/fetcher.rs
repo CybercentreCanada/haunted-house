@@ -1,3 +1,10 @@
+//!
+//! Given an Assemlyline client pull files from its file record and ingest them into this system.
+//!
+//! Track the oldest record processed so that that when restarted it has
+//! a safe place to resume from.
+//!
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

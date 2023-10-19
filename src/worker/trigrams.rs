@@ -366,7 +366,7 @@ impl Ord for Chunk {
 
 impl PartialOrd for Chunk {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.iter().cmp(other.iter()))
+        Some(std::cmp::Ord::cmp(self, other))
     }
 }
 

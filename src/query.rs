@@ -80,7 +80,16 @@ impl Query {
                 }
             },
             Query::Literal(value) => Query::Literal(value),
-            Query::MinOf(num, expr) => Query::MinOf(num, expr.into_iter().map(Self::flatten).collect_vec()),
+            Query::MinOf(num, expr) => {
+                let mut items = expr.into_iter().map(Self::flatten).collect_vec();
+                items.sort_unstable();
+                items.dedup();
+                if num == 1 {
+                    Query::Or(items).flatten()
+                } else {
+                    Query::MinOf(num, items)
+                }
+            },
         }
     }
 
