@@ -29,13 +29,13 @@ impl WindowCounter {
 
         let time = chrono::Utc::now().timestamp();
 
-        if let Some((window, counter)) = self.buffer.front_mut() {
+        if let Some((window, counter)) = self.buffer.back_mut() {
             if *window == time {
                 *counter += value;
                 return;
             }
         }
-        self.buffer.push_front((time, value));
+        self.buffer.push_back((time, value));
     }
 
     /// Get the number of events currently in the window
@@ -47,10 +47,10 @@ impl WindowCounter {
     /// Flush events that have fallen outside of the window
     fn clean(&mut self) {
         let oldest = chrono::Utc::now().timestamp() - self.window;
-        while let Some((time, value)) = self.buffer.back() {
+        while let Some((time, value)) = self.buffer.front() {
             if *time < oldest {
                 self.count -= *value;
-                self.buffer.pop_back();
+                self.buffer.pop_front();
             } else {
                 break
             }
