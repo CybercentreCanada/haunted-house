@@ -89,7 +89,7 @@ impl BlobStorage {
         }
     }
     /// Download the blob as a stream of chunks
-    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>, ErrorKinds> {
         match self {
             BlobStorage::Local(obj) => obj.stream(label).await,
             BlobStorage::Azure(obj) => obj.stream(label).await,
@@ -139,9 +139,9 @@ impl BlobStorage {
 }
 
 /// Helper function used in streaming local files
-fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>>> {
+fn read_chunks(path: PathBuf) -> mpsc::Receiver<Result<Vec<u8>, ErrorKinds>> {
     // Create the channel outside the blocking section so we can only pass in half
-    let (send, recv) = mpsc::channel::<Result<Vec<u8>>>(8);
+    let (send, recv) = mpsc::channel::<Result<Vec<u8>, ErrorKinds>>(8);
 
     // Run the actual fine interaction in the block
     tokio::task::spawn_blocking(move ||{
@@ -228,7 +228,7 @@ impl LocalDirectory {
     }
 
     /// Read the local file into a stream of chunks
-    async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
+    async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>, ErrorKinds> {
         let path = self.get_path(label);
         return Ok(read_chunks(path))
     }
@@ -361,7 +361,7 @@ impl AzureBlobStore {
     }
 
     /// Download the file in chunks and stream them into the channel
-    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>, ErrorKinds> {
         let mut stream = self.client.blob_client(label).get().into_stream();
         let (send, recv) = mpsc::channel(8);
         tokio::spawn(async move {
@@ -369,7 +369,7 @@ impl AzureBlobStore {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(err) => {
-                        _ = send.send(Err(anyhow::anyhow!(err))).await;
+                        _ = send.send(Err(err.into())).await;
                         return;
                     },
                 };
@@ -379,11 +379,11 @@ impl AzureBlobStore {
                     let data = match data {
                         Ok(data) => data,
                         Err(err) => {
-                            _ = send.send(Err(anyhow::anyhow!(err))).await;
+                            _ = send.send(Err(err.into())).await;
                             return;
                         },
                     };
-                    if send.send(anyhow::Ok(data.to_vec())).await.is_err() {
+                    if send.send(Ok(data.to_vec())).await.is_err() {
                         return;
                     }
                 };
@@ -629,7 +629,7 @@ impl S3BlobStore {
     /// read blob into stream
     /// The api already provides block based reading, so just spawn a task
     /// to read from the respones and shovel data into the channel
-    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>>>, ErrorKinds> {
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>, ErrorKinds> {
         let mut request = self.client
             .get_object()
             .bucket(&self.bucket)
@@ -642,7 +642,7 @@ impl S3BlobStore {
             while let Some(buffer) = request.body.next().await {
                 _ = match buffer {
                     Ok(data) => send.send(Ok(data.to_vec())).await,
-                    Err(err) => send.send(Err(err.into())).await,
+                    Err(err) => send.send(Err(ErrorKinds::OtherBlobError(err.to_string()))).await,
                 };
             }
         });

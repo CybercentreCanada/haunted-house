@@ -185,6 +185,8 @@ impl WorkerState {
         })
     }
 
+    /// Given a set of files expected to be ingested check the progress of the ones already underway
+    /// and add new ones
     pub async fn ingest_file(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
         // Filter those we already have information for quickly
         // the ones that are currently pending can be dropped
@@ -202,18 +204,22 @@ impl WorkerState {
         let mut completed = vec![];
         let files = self.database.check_insert_status(files).await?;
         let mut outstanding = vec![];
+        let mut rejected = vec![];
         let mut modified_filters = vec![];
         for (filter, file, status) in files {
             match status {
                 IngestStatus::Ready => {
-                    completed.push(file.hash);
+                    completed.push((filter, file.hash));
                     continue
                 },
                 IngestStatus::Pending(_) => continue,
                 IngestStatus::Missing => {
                     // if its not complete, either start downloading it, or pass it
                     // to the next step
-                    if !self.trigrams.is_ready(filter, &file.hash).await? {
+                    if self.trigrams.clear_rejected(filter, file.hash.clone()).await {
+                        rejected.push((filter, file.hash));
+                        continue
+                    } else if !self.trigrams.is_ready(filter, &file.hash).await? {
                         self.trigrams.start_fetch(filter, file.hash).await?;
                     } else {
                         outstanding.push((filter, file));
@@ -223,10 +229,13 @@ impl WorkerState {
             }
         }
 
+        // Clear out files that have been abandoned
+        self.database.abandon_files(rejected.clone()).await?;
+
         // Ingest the file
         let complete = self.database.ingest_files(outstanding).await?;
-        for completed_file in complete {
-            completed.push(completed_file.hash);
+        for (filter, completed_file) in complete {
+            completed.push((filter, completed_file.hash));
         }
 
         // Let ingest feeders know files are ready
@@ -248,6 +257,7 @@ impl WorkerState {
         // return progress, with metadata about our filters
         return Ok(IngestFilesResponse {
             completed,
+            rejected,
             // unknown_filters,
             filter_pending,
             expiry_groups,

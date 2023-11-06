@@ -1086,9 +1086,9 @@ mod test {
             Query::Or(vec![
                 Query::Literal(b"GDI32.DLL".to_vec()),
                 Query::Literal(b"Gdi32.dll".to_vec()),
-                Query::Literal(b"gdi32.dll".to_vec()),
                 Query::Literal(b"USER32.DLL".to_vec()),
                 Query::Literal(b"User32.dll".to_vec()),
+                Query::Literal(b"gdi32.dll".to_vec()),
                 Query::Literal(b"user32.dll".to_vec()),
             ]),
         ]));

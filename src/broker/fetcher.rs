@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use log::error;
+use log::{error, info};
 use tokio::time::Duration;
 use anyhow::Result;
 use assemblyline_client::{Client, JsonMap};
@@ -74,8 +74,9 @@ const RETRY_LIMIT: usize = 10;
 
 /// implementation loop to fetch files from assemblyline
 async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig) -> Result<()> {
+    info!("Fetch agent starting");
     //
-    let mut running = tokio::task::JoinSet::<(FetchedFile, Result<()>)>::new();
+    let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, (bool, usize)> = Default::default();
     let mut poll_interval = tokio::time::interval(Duration::from_secs_f64(config.poll_interval));
 
@@ -115,6 +116,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                 .use_archive(true)
                 .field_list("classification,expiry_ts,sha256,seen.last".to_owned())
                 .search().await?;
+
             for item in result.items {
                 let file = match FetchedFile::extract(&item) {
                     Some(file) => file,

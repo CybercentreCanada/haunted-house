@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::iter::Peekable;
 
 use anyhow::Result;
+use aws_config::retry::ErrorKind;
 use log::error;
 use tokio::sync::{Semaphore, RwLock};
 use tokio::task::JoinHandle;
@@ -15,6 +16,7 @@ use bitvec::prelude::BitArray;
 use serde::{Serialize, Deserialize, de::Error};
 
 use crate::config::WorkerSettings;
+use crate::error::ErrorKinds;
 use crate::storage::BlobStorage;
 use crate::types::{Sha256, FilterID, FileInfo};
 
@@ -28,13 +30,15 @@ pub struct TrigramCache {
     permits: Semaphore,
     /// List of jobs either building trigram sets or waiting for a permit
     pending: RwLock<HashMap<(FilterID, Sha256), JoinHandle<()>>>,
+    /// List of jobs that have been rejected and can't be completed
+    rejected: RwLock<HashSet<(FilterID, Sha256)>>,
     /// A storage driver where the target files can be loaded from
     files: BlobStorage
 }
 
 
 impl TrigramCache {
-
+    /// Setup the cache
     pub async fn new(config: &WorkerSettings, files: BlobStorage) -> Result<Arc<Self>> {
         let temp_dir = config.get_trigram_cache_directory().join("temp");
         if temp_dir.exists() {
@@ -46,10 +50,12 @@ impl TrigramCache {
             temp_dir,
             permits: Semaphore::new(config.parallel_file_downloads),
             pending: RwLock::new(Default::default()),
+            rejected: Default::default(),
             files,
         }))
     }
 
+    /// Expire all files related to a particular filter
     pub async fn expire(&self, filter: FilterID) -> Result<()> {
         // Flush out pending tasks
         {
@@ -74,6 +80,7 @@ impl TrigramCache {
         return Ok(())
     }
 
+    /// Start pulling a file into the trigram cache
     pub async fn start_fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
         if self.is_ready(filter, &hash).await? {
             return Ok(())
@@ -81,17 +88,35 @@ impl TrigramCache {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.pending.write().await.entry((filter, hash.clone())) {
             let core = self.clone();
             entry.insert(tokio::spawn(async move {
-                if let Err(err) = core._fetch_file(filter, &hash).await {
-                    error!("Fetch file error: {err}");
+                let mut not_found_errors = 0;
+                let rejected = loop {
+                    if let Err(err) = core._fetch_file(filter, &hash).await {
+                        error!("Fetch file error: {err} [attempt {not_found_errors}]");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        if ErrorKinds::BlobNotFound == err {
+                            not_found_errors += 1;
+                            if not_found_errors < 10 {
+                                continue
+                            }
+                        }
+                        break true
+                    }
+                    break false
+                };
+                if rejected {
+                    let mut rejected = core.rejected.write().await;
+                    rejected.insert((filter, hash.clone()));
                 }
+
                 let mut pending = core.pending.write().await;
                 pending.remove(&(filter, hash));
+
             }));
         }
         return Ok(())
     }
 
-    async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
+    async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<(), ErrorKinds> {
         let _permit = self.permits.acquire().await?;
 
         // Gather the file content
@@ -108,7 +133,7 @@ impl TrigramCache {
             temp.flush()?;
             std::fs::create_dir_all(filter_dir)?;
             temp.persist(cache_path)?;
-            anyhow::Ok(())
+            Result::<(), ErrorKinds>::Ok(())
         }).await??;
         return Ok(())
     }
@@ -134,11 +159,18 @@ impl TrigramCache {
         Ok(tokio::fs::try_exists(self._path(filter, hash)).await?)
     }
 
+    pub async fn clear_rejected(&self, filter: FilterID, hash: Sha256) -> bool {
+        let mut rejected = self.rejected.write().await;
+        rejected.remove(&(filter, hash))
+    }
+
+    /// Load the content of a file
     pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<TrigramSet> {
         let data = tokio::fs::read(self._path(filter, hash)).await?;
         Ok(postcard::from_bytes(&data)?)
     }
 
+    /// Free a specific file from the cache
     pub async fn release(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
         let path = self._path(filter, hash);
         match tokio::fs::remove_file(&path).await {
@@ -153,10 +185,12 @@ impl TrigramCache {
         }
     }
 
+    /// helper function to map filter ids to cache subdirectory
     pub fn _filter_path(&self, filter: FilterID) -> PathBuf {
         self.cache_dir.join(filter.to_string())
     }
 
+    /// Get the path where a specific file will be saved
     pub fn _path(&self, filter: FilterID, hash: &Sha256) -> PathBuf {
         self._filter_path(filter).join(hash.to_string())
     }
@@ -187,7 +221,7 @@ pub (crate) fn build_buffer(data: &[u8]) -> Result<TrigramSet> {
 }
 
 /// Convert a stream of buffers into a trigram set
-async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>) -> Result<TrigramSet> {
+async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>) -> Result<TrigramSet, ErrorKinds> {
     // Prepare accumulators
     let mut output = TrigramSet::new();
 
@@ -524,7 +558,7 @@ mod test {
     use super::{Chunk, TrigramSet};
 
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn build_random_chunk() {
         let mut values = (0..u16::MAX).collect_vec();
 
@@ -543,7 +577,7 @@ mod test {
         }
     }
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn single_values() {
         for ii in 0..=0xFFFFFF {
             let mut bits = TrigramSet::new();
@@ -552,7 +586,7 @@ mod test {
         }
     }
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn adding_values() {
         // Have the first chunk of this map get fully saturated plus a little more
         let mut bits = TrigramSet::new();

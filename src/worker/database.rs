@@ -178,7 +178,7 @@ impl Database {
         }
     }
 
-    pub async fn ingest_files(&self, files: Vec<(FilterID, FileInfo)>) -> Result<Vec<FileInfo>> {
+    pub async fn ingest_files(&self, files: Vec<(FilterID, FileInfo)>) -> Result<Vec<(FilterID, FileInfo)>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
@@ -218,6 +218,16 @@ impl Database {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
                 chan.send(SQLiteCommand::FinishedIngest { id, files, response: send }).await?;
+                resp.await?
+            }
+        }
+    }
+
+    pub async fn abandon_files(&self, files: Vec<(FilterID, Sha256)>) -> Result<()> {
+        match self {
+            Database::SQLite(chan) => {
+                let (send, resp) = oneshot::channel();
+                chan.send(SQLiteCommand::AbandonFiles { files, response: send }).await?;
                 resp.await?
             }
         }

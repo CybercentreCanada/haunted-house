@@ -31,10 +31,11 @@ pub enum SQLiteCommand {
     UpdateFileAccess{files: Vec<FileInfo>, response: BatchRespond<IngestStatusBundle>},
     GetFileAccess{id: FilterID, hash: Sha256, response: Respond<Option<AccessControl>>},
     CheckInsertStatus{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo, IngestStatus)>>},
-    IngestFiles{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<FileInfo>>},
+    IngestFiles{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo)>>},
     SelectFileHashes{id: FilterID, file_indices: Vec<u64>, access: HashSet<String>, response: Respond<Vec<Sha256>>},
     GetIngestBatch{id: FilterID, limit: u32, response: Respond<Vec<(u64, Sha256)>>},
     FinishedIngest{id: FilterID, files: Vec<(u64, Sha256)>, response: Respond<f64>},
+    AbandonFiles{files: Vec<(FilterID, Sha256)>, response: Respond<()>},
 }
 
 #[derive(Debug)]
@@ -42,11 +43,12 @@ pub enum FilterCommand {
     DeleteFilter{response: oneshot::Sender<Result<()>>},
     GetFileAccess{hash: Sha256, response: oneshot::Sender<Result<Option<AccessControl>>>},
     CheckInsertStatus{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo, IngestStatus)>>>},
-    IngestFiles{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<FileInfo>>>},
+    IngestFiles{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo)>>>},
     SelectFileHashes{file_indices: Vec<u64>, access: HashSet<String>, response: oneshot::Sender<Result<Vec<Sha256>>>},
     GetIngestBatch{limit: u32, response: oneshot::Sender<Result<Vec<(u64, Sha256)>>>},
     FinishedIngest{files: Vec<(u64, Sha256)>, response: oneshot::Sender<Result<f64>>},
     UpdateFileAccess{files: Vec<FileInfo>, response: oneshot::Sender<Result<IngestStatusBundle>>},
+    AbandonFile{file: Sha256, response: oneshot::Sender<Result<()>>},
 }
 
 impl FilterCommand {
@@ -60,6 +62,7 @@ impl FilterCommand {
             FilterCommand::GetIngestBatch { response, .. } => _ = response.send(Err(error)),
             FilterCommand::FinishedIngest { response, .. } => _ = response.send(Err(error)),
             FilterCommand::UpdateFileAccess { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::AbandonFile { response, .. } => _ = response.send(Err(error)),
         }
     }
 }
@@ -216,6 +219,21 @@ impl BufferedSQLite {
             },
             SQLiteCommand::FinishedIngest { id, files, response } => {
                 self.send_filter(id, FilterCommand::FinishedIngest { files, response }).await
+            },
+            SQLiteCommand::AbandonFiles {files, response } => {
+                let mut collectors = vec![];
+                for (filter, file) in files {
+                    if let Some(channel) = self.workers.get(&filter) {
+                        let (send, recv) = oneshot::channel();
+                        channel.send(FilterCommand::AbandonFile { file, response: send }).await?;
+                        collectors.push(recv)
+                    }
+                }
+
+                for x in collectors {
+                    x.await;
+                }
+                response.send(Ok(()));
             },
         };
         Ok(())
@@ -417,6 +435,7 @@ impl FilterSQLWorker {
             FilterCommand::GetIngestBatch { limit, response } => { _ = response.send(self.get_ingest_batch(limit).await); },
             FilterCommand::FinishedIngest { files, response } => { _ = response.send(self.finished_ingest(files).await); },
             FilterCommand::UpdateFileAccess { files, response } => { _ = response.send(self.update_file_access(files).await); },
+            FilterCommand::AbandonFile { file, response } => { _ = response.send(self.abandon_file(file).await); },
         };
         Ok(false)
     }
@@ -457,7 +476,7 @@ impl FilterSQLWorker {
         return Ok(output)
     }
 
-    pub async fn ingest_files(&self, files: Vec<FileInfo>) -> Result<Vec<FileInfo>> {
+    pub async fn ingest_files(&self, files: Vec<FileInfo>) -> Result<Vec<(FilterID, FileInfo)>> {
         let mut conn = self.db.begin().await?;
         let mut completed = vec![];
         for file in files {
@@ -466,7 +485,7 @@ impl FilterSQLWorker {
                 .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await?;
             if let Some((ingested, )) = row {
                 if ingested {
-                    completed.push(file);
+                    completed.push((self.id, file));
                 }
                 continue
             }
@@ -583,5 +602,16 @@ impl FilterSQLWorker {
         }
         transaction.commit().await?;
         return Ok(stamp.elapsed().as_secs_f64())
+    }
+
+    pub async fn abandon_file(&self, file: Sha256) -> Result<()> {
+        let mut transaction = self.db.begin().await?;
+        sqlx::query("DELETE FROM files WHERE sha256 = ?").bind(file.as_bytes()).execute(&mut transaction).await?;
+        let mut pending = self.filter_pending.write().await;
+        if let Some(pending) = pending.get_mut(&self.id) {
+            pending.remove(&file);
+        }
+        transaction.commit().await?;
+        return Ok(())
     }
 }

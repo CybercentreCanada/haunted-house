@@ -40,7 +40,7 @@ use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, Cr
 
 use self::auth::Authenticator;
 use self::database::Database;
-use self::interface::{InternalSearchStatus, SearchRequest, StatusReport};
+use self::interface::{InternalSearchStatus, SearchRequest, StatusReport, FilterStatus};
 
 /// Entry point function to the broker
 pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
@@ -324,7 +324,7 @@ impl HouseCore {
     }
 
     /// Kick off the ingestion of a file and wait for its completion
-    pub (crate) async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<()> {
+    pub (crate) async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<bool> {
         let (send, recv) = oneshot::channel();
         self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
             info: FileInfo{
@@ -438,7 +438,9 @@ impl HouseCore {
 
         let mut pending_tasks = HashMap::<String, u32>::new();
         for (group, queue) in self.pending_assignments.read().await.iter() {
-            pending_tasks.insert(group.to_string(), queue.len() as u32);
+            if !queue.is_empty() {
+                pending_tasks.insert(group.to_string(), queue.len() as u32);
+            }
         }
 
         // gather responses from the workers
@@ -450,7 +452,12 @@ impl HouseCore {
             let body: crate::worker::interface::DetailedStatus = response.json().await?;
             storage.insert(worker.clone(), body.storage);
             for (expiry, filter, size) in body.filters {
-                filters.push((expiry.to_string(), worker.clone(), filter, size));
+                filters.push(FilterStatus{
+                    expiry: expiry.to_string(),
+                    worker: worker.clone(),
+                    id: filter,
+                    size
+                });
             }
         }
         filters.sort_unstable();
@@ -474,7 +481,7 @@ pub struct IngestTask {
     /// Information about the file being ingested
     pub info: FileInfo,
     /// A collection of channels waiting for the completion (or error) of this ingestion
-    pub response: Vec<oneshot::Sender<Result<()>>>
+    pub response: Vec<oneshot::Sender<Result<bool>>>
 }
 
 impl IngestTask {
@@ -555,7 +562,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 // Drop stale tasks
                 if task.info.expiry <= today {
                     for resp in task.response {
-                        _ = resp.send(Ok(()));
+                        _ = resp.send(Ok(false));
                     }
                     continue
                 }
@@ -597,7 +604,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         _ = resp.send(IngestCheckStatus {
                             queue: unchecked_buffer.len(),
                             active: active_batch_size,
-                            last_minute: counter.average()
+                            last_minute: counter.value()
                         });
                     },
                 }
@@ -662,7 +669,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         for sha in res.processed {
             if let Some(task) = tasks.remove(&sha) {
                 for response in task.response {
-                    _ = response.send(Ok(()));
+                    _ = response.send(Ok(true));
                 }
             }
         }
@@ -750,6 +757,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
         }
     }
 
+    info!("Ingest watcher for {id} initialized");
     loop {
         // Wait until something changes
         tokio::select!{
@@ -783,7 +791,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                             status.insert(id, IngestWatchStatus {
                                 queue: num,
                                 per_minute: match counters.get_mut(&id){
-                                    Some(count) => count.average() as f64/((start.elapsed().as_secs_f64()/60.0).clamp(1.0, 60.0)),
+                                    Some(count) => count.value() as f64/((start.elapsed().as_secs_f64()/60.0).clamp(1.0, 60.0)),
                                     None => 0.0,
                                 }
                             });
@@ -824,31 +832,54 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
 
                 // Pull out the tasks that have been finished
                 debug!("response from {id}: process {} completed", response.completed.len());
-                for hash in response.completed {
-                    if let Some((filter, task)) = active.remove(&hash) {
-                        for response in task.response {
-                            _ = response.send(Ok(()));
-                        }
-                        match counters.entry(filter) {
-                            hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
-                            hash_map::Entry::Vacant(entry) => {
-                                let mut counter = crate::counters::WindowCounter::new(60 * 60);
-                                counter.increment(1);
-                                entry.insert(counter);
-                            },
+                for (targets, response_value) in [(response.completed, true), (response.rejected, false)] {
+                    for (targeted_filter, hash) in targets {
+                        if let Some((filter, task)) = active.remove(&hash) {
+                            // its possible for a file to be queued for multiple filters when the expiry date
+                            // moves, so if the filter id doesn't match, we have sent it twice for different days
+                            // and this isn't the one we are waiting for
+                            if filter != targeted_filter {
+                                continue
+                            }
+                            // Otherwise this is the filter we are waiting for send a response to all waiters
+                            for response in task.response {
+                                _ = response.send(Ok(response_value));
+                            }
+                            match counters.entry(filter) {
+                                hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
+                                hash_map::Entry::Vacant(entry) => {
+                                    let mut counter = crate::counters::WindowCounter::new(60 * 60);
+                                    counter.increment(1);
+                                    entry.insert(counter);
+                                },
+                            }
                         }
                     }
                 }
 
-                // process any missing filters
-                // for hash in active.keys().cloned().collect_vec() {
-                //     if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
-                //         if response.unknown_filters.contains(&entry.get().0) {
-                //             let (_, task) = entry.remove();
-                //             core.ingest_queue.send(IngestMessage::IngestMessage(task))?;
+                // for (targeted_filter, hash) in response.rejected {
+                //     if let Some((filter, task)) = active.remove(&hash) {
+                //         // its possible for a file to be queued for multiple filters when the expiry date
+                //         // moves, so if the filter id doesn't match, we have sent it twice for different days
+                //         // and this isn't the one we are waiting for
+                //         if filter != targeted_filter {
+                //             continue
+                //         }
+                //         // Otherwise this is the filter we are waiting for send a response to all waiters
+                //         for response in task.response {
+                //             _ = response.send(Ok(false));
+                //         }
+                //         match counters.entry(filter) {
+                //             hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
+                //             hash_map::Entry::Vacant(entry) => {
+                //                 let mut counter = crate::counters::WindowCounter::new(60 * 60);
+                //                 counter.increment(1);
+                //                 entry.insert(counter);
+                //             },
                 //         }
                 //     }
                 // }
+
 
                 if response.storage_pressure {
                     continue
@@ -922,7 +953,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         if entry.get().1.info.expiry <= today {
                             let (_, task) = entry.remove();
                             for resp in task.response {
-                                _ = resp.send(Ok(()));
+                                _ = resp.send(Ok(false));
                             }
                         }
                     }
@@ -992,7 +1023,9 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
         let (client_sender, result_stream) = mpsc::channel(128);
         for (worker, address) in &core.config.workers {
             let address = address.websocket("/search/filter")?;
-            let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(address, None, false, Some(core.ws_connector.clone())).await?;
+            let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+                address.clone(), None, false, Some(core.ws_connector.clone())).await
+                .context(format!("Unable to resolve worker name from: {address}"))?;
             let client_sender = client_sender.clone();
             let request_body = request_body.clone();
             let worker = worker.clone();

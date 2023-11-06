@@ -16,8 +16,8 @@ pub enum ErrorKinds {
     // VarintIncomplete,
     /// A filter was requested which does not exist
     FilterUnknown(FilterID),
-    /// An otherwise not distinguished error occurred with S3
-    OtherS3Error(String),
+    /// An otherwise not distinguished error occurred with blob storage
+    OtherBlobError(String),
     // CorruptFilterID,
     /// An otherwise not distinguished error occurred with database access
     DatabaseError(String),
@@ -33,6 +33,8 @@ pub enum ErrorKinds {
     IOError(String),
     /// An error occurred within the tokio channels
     ChannelError(String),
+    /// Error raised when a tokio resource has shut down
+    TokioResourceClosed,
     /// An access control could not be parsed from the given string
     CouldNotParseAccessString(String, String),
     /// An access control could not be parsed from the given string because part of the string couldn't be consumed
@@ -63,8 +65,19 @@ impl From<aws_smithy_client::SdkError<aws_sdk_s3::error::GetObjectError>> for Er
         if error.is_no_such_key() {
             ErrorKinds::BlobNotFound
         } else {
-            ErrorKinds::OtherS3Error(error.to_string())
+            ErrorKinds::OtherBlobError(error.to_string())
         }
+    }
+}
+
+impl From<azure_storage::Error> for ErrorKinds {
+    fn from(value: azure_storage::Error) -> Self {
+        if let Some(err) = value.as_http_error() {
+            if azure_core::StatusCode::NotFound == err.status() {
+                return ErrorKinds::BlobNotFound
+            }
+        }
+        ErrorKinds::OtherBlobError(value.to_string())
     }
 }
 
@@ -107,6 +120,12 @@ impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ErrorKinds {
 impl From<boreal_parser::error::Error> for ErrorKinds {
     fn from(value: boreal_parser::error::Error) -> Self {
         Self::YaraRuleError(value.to_diagnostic().message)
+    }
+}
+
+impl From<tokio::sync::AcquireError> for ErrorKinds {
+    fn from(value: tokio::sync::AcquireError) -> Self {
+        Self::TokioResourceClosed
     }
 }
 

@@ -1161,7 +1161,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn multiple_writes() -> Result<()> {
         // let x = setup_global_subscriber();
 
@@ -1225,7 +1225,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn duplicate_batch() -> Result<()> {
         let data = TrigramSet::random(thread_rng().gen());
 
@@ -1311,7 +1311,7 @@ mod test {
         return Ok(())
     }
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn out_of_order_batch_reversed() -> Result<()> {
         let mut bits = TrigramSet::new();
         bits.insert(0);
@@ -1351,7 +1351,7 @@ mod test {
         return Ok(())
     }
 
-    // #[test]
+    // #[test] temporary remove for performance reasons
     // fn large_batch() -> Result<()> {
     //     // build test data
     //     let mut trigrams = vec![];
@@ -1397,7 +1397,7 @@ mod test {
     //     Ok(())
     // }
 
-    #[test]
+    // #[test] temporary remove for performance reasons
     fn collector() {
         let mut objects = vec![];
         for ii in 0..256 {

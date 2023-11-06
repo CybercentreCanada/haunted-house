@@ -161,7 +161,8 @@ pub struct IngestFilesRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct IngestFilesResponse {
-    pub completed: Vec<Sha256>,
+    pub completed: Vec<(FilterID, Sha256)>,
+    pub rejected: Vec<(FilterID, Sha256)>,
     // pub unknown_filters: Vec<FilterID>,
     pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
     pub filter_size: HashMap<FilterID, u64>,

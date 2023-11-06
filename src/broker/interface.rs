@@ -88,10 +88,10 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
             req.extensions_mut().insert(IngestInterface::new(self.core.clone()));
         }
 
-        if !roles.is_empty() {
-            req.extensions_mut().insert(roles);
-            req.extensions_mut().insert(StatusInterface::new(self.core.clone()));
-        }
+        // always allow status
+        // if !roles.is_empty() {
+        req.extensions_mut().insert(StatusInterface::new(self.core.clone()));
+        // }
 
         // call the next endpoint.
         self.ep.call(req).await
@@ -167,7 +167,7 @@ impl IngestInterface {
     }
 
     /// Add a file to the search database. Waits for ingestion to finish.
-    pub async fn ingest(&self, request: IngestRequest) -> Result<()> {
+    pub async fn ingest(&self, request: IngestRequest) -> Result<bool> {
         let (send, recv) = oneshot::channel();
         let hash = Sha256::from_str(&request.hash)?;
         self.core.ingest_queue.send(super::IngestMessage::IngestMessage(IngestTask{
@@ -380,7 +380,8 @@ pub struct IngestResponse {
 #[handler]
 async fn insert_sha(Data(interface): Data<&IngestInterface>, Json(request): Json<IngestRequest>) -> Result<()> {
     if request.block {
-        interface.ingest(request).await
+        interface.ingest(request).await?;
+        Ok(())
     } else {
         let interface = interface.clone();
         tokio::spawn(async move {
@@ -398,7 +399,7 @@ async fn ingest_stream(Data(interface): Data<&IngestInterface>, ws: poem::web::w
     ws.protocols(vec!["ingest-stream"])
     .on_upgrade(|mut socket| async move {
         tokio::spawn(async move {
-            let mut active: JoinSet<(String, Option<String>, Result<()>)> = JoinSet::new();
+            let mut active: JoinSet<(String, Option<String>, Result<bool>)> = JoinSet::new();
             loop {
                 tokio::select! {
                     message = socket.next() => {
@@ -462,7 +463,7 @@ async fn ingest_stream(Data(interface): Data<&IngestInterface>, ws: poem::web::w
 
                         let (hash, token, result) = item;
                         let response = match result {
-                            Ok(()) => IngestResponse{
+                            Ok(_) => IngestResponse{
                                 token,
                                 hash,
                                 error: Default::default(),
@@ -501,6 +502,15 @@ async fn get_status() -> Result<()> {
 }
 
 /// Response body from the status endpoint
+#[derive(Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+pub (crate) struct FilterStatus {
+    pub expiry: String,
+    pub worker: WorkerID,
+    pub id: FilterID,
+    pub size: u64,
+}
+
+/// Response body from the status endpoint
 #[derive(Serialize, Deserialize)]
 pub (crate) struct StatusReport {
     /// Status of the check stage of ingestion
@@ -512,7 +522,7 @@ pub (crate) struct StatusReport {
     /// Number of pending ingest files that haven't been assigned to a worker yet
     pub pending_tasks: HashMap<String, u32>,
     /// Information about filters
-    pub filters: Vec<(String, WorkerID, FilterID, u64)>,
+    pub filters: Vec<FilterStatus>,
     /// Storage information
     pub storage: HashMap<WorkerID, StorageStatus>,
 }
