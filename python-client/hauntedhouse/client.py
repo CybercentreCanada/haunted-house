@@ -99,8 +99,7 @@ class Client:
         # Send the search request
         result = self.sync_session.post(self.address + '/search/', json={
             'view': access_control,
-            'access': access_control,
-            'group': group,
+            'classification': access_control,
             'yara_signature': yara_rule,
             'start_date': start_date,
             'end_date': None,
