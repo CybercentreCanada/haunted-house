@@ -187,7 +187,7 @@ impl WorkerState {
 
     /// Given a set of files expected to be ingested check the progress of the ones already underway
     /// and add new ones
-    pub async fn ingest_file(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
+    pub async fn ingest_files(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
         // Filter those we already have information for quickly
         // the ones that are currently pending can be dropped
         let pending = self.database.filter_pending().await?;

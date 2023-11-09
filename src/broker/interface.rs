@@ -30,7 +30,7 @@ use crate::query::Query;
 use crate::types::{FileInfo, Sha256, ExpiryGroup, WorkerID, FilterID};
 use crate::worker::interface::StorageStatus;
 
-use super::{HouseCore, IngestTask, IngestCheckStatus, IngestWatchStatus};
+use super::{HouseCore, IngestTask, IngestCheckStatus, IngestWatchStatus, FetchStatus};
 use super::auth::Role;
 
 /// Extractor for HTTP Header holding a bearer token in the Authorization field
@@ -515,6 +515,7 @@ pub (crate) struct FilterStatus {
 pub (crate) struct StatusReport {
     /// Status of the check stage of ingestion
     pub ingest_check: IngestCheckStatus,
+    pub fetcher: Option<FetchStatus>,
     /// Status for the per-worker ingestion watcher
     pub ingest_watchers: HashMap<WorkerID, HashMap<FilterID, IngestWatchStatus>>,
     /// Number of active searches

@@ -172,7 +172,7 @@ pub struct IngestFilesResponse {
 
 #[handler]
 async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesRequest>) -> poem::Result<Json<IngestFilesResponse>> {
-    Ok(Json(state.ingest_file(request.0.files).await?))
+    Ok(Json(state.ingest_files(request.0.files).await?))
 }
 
 #[handler]

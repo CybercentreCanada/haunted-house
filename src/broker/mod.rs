@@ -78,6 +78,22 @@ pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
 /// the channel for communicating with that task
 type SearchInfo = (JoinHandle<()>, mpsc::Sender<SearcherMessage>);
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FetchStatus {
+    last_minute_searches: i64,
+    last_minute_throughput: i64,
+    last_minute_retries: i64,
+    checkpoint_data: chrono::DateTime<chrono::Utc>,
+    last_fetch_rows: i64,
+}
+
+/// A message to the fetch worker
+#[derive(Debug)]
+pub enum FetchControlMessage {
+    /// A message askning the check worker for a status request
+    Status(oneshot::Sender<FetchStatus>)
+}
+
 /// Information encapsulating the broker state
 pub struct HouseCore {
     /// Connection to the database where searches are stored
@@ -94,6 +110,8 @@ pub struct HouseCore {
     pub access_engine: Option<ClassificationParser>,
     /// Queue of files waiting to be ingested
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
+    /// Queue of files waiting to be ingested
+    pub fetcher_control_queue: Option<mpsc::Sender<FetchControlMessage>>,
     /// Set of files that couldn't be quickly accepted by any worker
     pub pending_assignments: RwLock<HashMap<ExpiryGroup, VecDeque<IngestTask>>>,
     /// tasks pushing new files to the corresponding worker
@@ -160,7 +178,7 @@ impl HouseCore {
         );
 
         // Check for assemblyline system
-        let (al_client, access_engine) = if let Some(assemblyline_config) = config.assemblyline.clone() {
+        let (al_client, access_engine, fetch_send) = if let Some(assemblyline_config) = config.assemblyline.clone() {
             info!("Connecting to assemblyline system at: {}", assemblyline_config.url);
             // setup connection
             let connection = Arc::new(assemblyline_client::Connection::connect(
@@ -182,11 +200,12 @@ impl HouseCore {
 
             // Build a classification engine
             let ce = ClassificationParser::new(classification)?;
+            let (send, recv) = mpsc::channel(16);
 
-            (Some((Arc::new(client), assemblyline_config)), Some(ce))
+            (Some((Arc::new(client), assemblyline_config, recv)), Some(ce), Some(send))
         } else {
             info!("Not connecting to assemblyline.");
-            (None, None)
+            (None, None, None)
         };
 
         // Create core object
@@ -202,6 +221,7 @@ impl HouseCore {
             running_searches: RwLock::new(Default::default()),
             yara_permits,
             access_engine,
+            fetcher_control_queue: fetch_send,
         });
 
         // Revive search workers for ongoing searches
@@ -233,8 +253,8 @@ impl HouseCore {
 
         // Start the file fetcher
         info!("Starting file fetcher");
-        if let Some((al_client, config)) = al_client {
-            tokio::spawn(fetcher::fetch_agent(core.clone(), al_client, config));
+        if let Some((al_client, config, fetch_recv)) = al_client {
+            tokio::spawn(fetcher::fetch_agent(core.clone(), al_client, config, fetch_recv));
         }
 
         return Ok(core)
@@ -462,12 +482,23 @@ impl HouseCore {
         }
         filters.sort_unstable();
 
+        // get status from fetcher
+        let fetcher = match &self.fetcher_control_queue {
+            Some(queue) => {
+                let (send, recv) = oneshot::channel();
+                queue.send(FetchControlMessage::Status(send)).await;
+                Some(recv.await?)
+            }
+            None => None
+        };
+
         // combine info
         Ok(StatusReport{
             pending_tasks,
             ingest_check: ingest_recv.await?,
             active_searches,
             ingest_watchers,
+            fetcher,
             filters,
             storage,
         })

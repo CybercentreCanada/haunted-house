@@ -5,22 +5,24 @@
 //! a safe place to resume from.
 //!
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use log::{error, info};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
 use assemblyline_client::{Client, JsonMap};
 
 use crate::config::AssemblylineConfig;
-use super::HouseCore;
+use super::{HouseCore, FetchStatus, FetchControlMessage};
 
 /// Pull files from an assemblyline system
-pub (crate) async fn fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig) {
+pub (crate) async fn fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig, recv: mpsc::Receiver<FetchControlMessage>) {
+    let recv = Arc::new(Mutex::new(recv));
     loop {
-        match tokio::spawn(_fetch_agent(core.clone(), client.clone(), config.clone())).await {
+        match tokio::spawn(_fetch_agent(core.clone(), client.clone(), config.clone(), recv.clone())).await {
             Ok(Ok(())) => break,
             Ok(Err(err)) => error!("Error in the fetch agent: {err}"),
             Err(err) => error!("Error in the fetch agent: {err}"),
@@ -72,13 +74,27 @@ fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
 /// How many times should ingesting a file be retried
 const RETRY_LIMIT: usize = 10;
 
+struct PendingInfo {
+    finished: bool,
+    retries: usize,
+}
+
+
 /// implementation loop to fetch files from assemblyline
-async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig) -> Result<()> {
+async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig, control: Arc<Mutex<mpsc::Receiver<FetchControlMessage>>>) -> Result<()> {
+    let mut control = control.lock().await;
     info!("Fetch agent starting");
     //
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
-    let mut pending: BTreeMap<FetchedFile, (bool, usize)> = Default::default();
+    let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
+    let mut recent: BTreeSet<FetchedFile> = Default::default();
     let mut poll_interval = tokio::time::interval(Duration::from_secs_f64(config.poll_interval));
+
+    // metrics collectors
+    let mut search_counter = crate::counters::WindowCounter::new(60);
+    let mut throughput_counter = crate::counters::WindowCounter::new(60);
+    let mut retry_counter = crate::counters::WindowCounter::new(60);
+    let mut last_fetch_rows = 0;
 
     // Get checkpoint for this source.
     // The checkpoint represents the earliest value for the seen.last field where
@@ -90,14 +106,19 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
         // Update the checkpoint if needed
         let old_checkpoint = checkpoint;
         while let Some(first) = pending.first_entry() {
-            if first.get().0 {
-                checkpoint = first.remove_entry().0.seen;
+            if first.get().finished {
+                let file = first.remove_entry().0;
+                checkpoint = file.seen;
+                recent.insert(file);
             } else {
                 break
             }
         }
         if old_checkpoint != checkpoint {
             core.set_checkpoint(&config, checkpoint).await?;
+        }
+        while recent.len() > 100_000 {
+            recent.pop_first();
         }
 
         // If there is free space get extra jobs
@@ -109,6 +130,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                 None => checkpoint,
             };
 
+            search_counter.increment(1);
             let result = client.search
                 .file(format!("seen.last: [{} TO *]", seek_point.to_rfc3339()))
                 .sort("seen.last asc".to_owned())
@@ -116,18 +138,23 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                 .use_archive(true)
                 .field_list("classification,expiry_ts,sha256,seen.last".to_owned())
                 .search().await?;
+            last_fetch_rows = result.rows;
 
             for item in result.items {
                 let file = match FetchedFile::extract(&item) {
                     Some(file) => file,
                     None => continue,
                 };
+                if recent.contains(&file) {
+                    continue
+                }
 
                 // insert into the set of jobs
                 match pending.entry(file.clone()) {
                     std::collections::btree_map::Entry::Occupied(_) => {}
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert((false, 0));
+                        println!("{} {}", file.sha256, file.seen);
+                        entry.insert(PendingInfo{finished: false, retries: 0});
                         let core = core.clone();
                         running.spawn(async move {
                             let resp = core.start_ingest(&file).await;
@@ -147,10 +174,12 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                     None => continue,
                 };
 
+                throughput_counter.increment(1);
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = pending.entry(file.clone()) {
-                    entry.get_mut().1 += 1;
-                    if entry.get().1 <= RETRY_LIMIT {
+                    entry.get_mut().retries += 1;
+                    if entry.get().retries <= RETRY_LIMIT {
                         if let Err(err) = result {
+                            retry_counter.increment(1);
                             error!("Error in fetch: {err}");
                             let core = core.clone();
                             running.spawn(async move {
@@ -160,9 +189,23 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
                             continue;
                         }
                     }
-                    entry.get_mut().0 = true;
+                    entry.get_mut().finished = true;
                 }
 
+            }
+            message = control.recv() => {
+                match message {
+                    Some(FetchControlMessage::Status(respond)) => {
+                        _ = respond.send(FetchStatus {
+                            last_minute_searches: search_counter.value() as i64,
+                            last_minute_throughput: throughput_counter.value() as i64,
+                            last_minute_retries: retry_counter.value() as i64,
+                            checkpoint_data: checkpoint,
+                            last_fetch_rows,
+                        });
+                    },
+                    None => return Ok(())
+                };
             }
             _timeout = poll_interval.tick() => {
                 continue
