@@ -29,6 +29,7 @@ class DuplicateToken(KeyError):
 class SearchStatus(pydantic.BaseModel):
     code: str
     finished: bool
+    warnings: list[str]
     errors: list[str]
     hits: list[str]
     truncated: bool
@@ -37,7 +38,7 @@ class SearchStatus(pydantic.BaseModel):
 
 
 class Client:
-    def __init__(self, address: str, api_key: str, classification: dict, verify: bool = True):
+    def __init__(self, address: str, api_key: str, verify: bool = True):
         self.address = address
         # self.access_engine = Classification(classification)
 
@@ -66,8 +67,7 @@ class Client:
     async def close(self):
         await self.session.close()
 
-    async def start_search(self, yara_rule: str, access_control: str, group: str = '',
-                           archive_only=False) -> SearchStatus:
+    async def start_search(self, yara_rule: str, access_control: str, archive_only=False) -> SearchStatus:
 
         # If we only want archived material set the start date to the far future
         start_date = None
@@ -77,8 +77,7 @@ class Client:
         # Send the search request
         result = await self.session.post('/search/', json={
             'view': access_control,
-            'access': access_control,
-            'group': group,
+            'classification': access_control,
             'yara_signature': yara_rule,
             'start_date': start_date,
             'end_date': None,
@@ -88,8 +87,7 @@ class Client:
         # Parse the message
         return SearchStatus(**await result.json())
 
-    def start_search_sync(self, yara_rule: str, access_control: str, group: str = '',
-                          archive_only=False) -> SearchStatus:
+    def start_search_sync(self, yara_rule: str, access_control: str, archive_only=False) -> SearchStatus:
 
         # If we only want archived material set the start date to the far future
         start_date = None
@@ -166,13 +164,13 @@ class Client:
                 # Figure out any token with the message
                 token = message.get('token', None)
                 if token is None:
-                    logger.error(f"Unknown message from ingest feed: {message}")
+                    logger.error("Unknown message from ingest feed: %s", message)
                     continue
 
                 # Find the future associated with the token
                 future = self.ingest_futures.pop(token, None)
                 if future is None:
-                    logger.error(f"Unexpected message from ingest feed: {message}")
+                    logger.error("Unexpected message from ingest feed: %s", message)
                     continue
 
                 # Satisfy the future
