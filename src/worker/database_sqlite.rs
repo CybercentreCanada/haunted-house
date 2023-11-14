@@ -12,7 +12,7 @@ use crate::access::AccessControl;
 use crate::error::ErrorKinds;
 use crate::types::{FilterID, FileInfo, ExpiryGroup, Sha256};
 
-use super::database::{IngestStatus, IngestStatusBundle};
+use super::database::{IngestStatus, IngestStatusBundle, IngestProgress};
 
 
 type Result<T> = core::result::Result<T, ErrorKinds>;
@@ -31,6 +31,7 @@ pub enum SQLiteCommand {
     UpdateFileAccess{files: Vec<FileInfo>, response: BatchRespond<IngestStatusBundle>},
     GetFileAccess{id: FilterID, hash: Sha256, response: Respond<Option<AccessControl>>},
     CheckInsertStatus{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo, IngestStatus)>>},
+    IngestFile{filter: FilterID, file: FileInfo, response: Respond<IngestProgress>},
     IngestFiles{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo)>>},
     SelectFileHashes{id: FilterID, file_indices: Vec<u64>, access: HashSet<String>, response: Respond<Vec<Sha256>>},
     GetIngestBatch{id: FilterID, limit: u32, response: Respond<Vec<(u64, Sha256)>>},
@@ -43,6 +44,7 @@ pub enum FilterCommand {
     DeleteFilter{response: oneshot::Sender<Result<()>>},
     GetFileAccess{hash: Sha256, response: oneshot::Sender<Result<Option<AccessControl>>>},
     CheckInsertStatus{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo, IngestStatus)>>>},
+    IngestFile{file: FileInfo, response: Respond<IngestProgress>},
     IngestFiles{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo)>>>},
     SelectFileHashes{file_indices: Vec<u64>, access: HashSet<String>, response: oneshot::Sender<Result<Vec<Sha256>>>},
     GetIngestBatch{limit: u32, response: oneshot::Sender<Result<Vec<(u64, Sha256)>>>},
@@ -57,6 +59,7 @@ impl FilterCommand {
             FilterCommand::DeleteFilter { response } => _ = response.send(Err(error)),
             FilterCommand::GetFileAccess { response, .. } => _ = response.send(Err(error)),
             FilterCommand::CheckInsertStatus { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::IngestFile { response, .. } => _ = response.send(Err(error)),
             FilterCommand::IngestFiles { response, .. } => _ = response.send(Err(error)),
             FilterCommand::SelectFileHashes { response, .. } => _ = response.send(Err(error)),
             FilterCommand::GetIngestBatch { response, .. } => _ = response.send(Err(error)),
@@ -188,6 +191,11 @@ impl BufferedSQLite {
 
                 _ = response.send(collectors);
             },
+            SQLiteCommand::IngestFile{ filter, file, response } => {
+                if let Some(channel) = self.workers.get(&filter) {
+                    channel.send(FilterCommand::IngestFile { file, response }).await?;
+                }
+            }
             SQLiteCommand::CheckInsertStatus{ files, response } => {
                 let mut batches: HashMap<FilterID, Vec<FileInfo>> = Default::default();
                 for (filter, info) in files {
@@ -430,6 +438,7 @@ impl FilterSQLWorker {
             FilterCommand::DeleteFilter { response, .. } => { _ = response.send(self.delete_filter().await); return Ok(true); },
             FilterCommand::GetFileAccess { hash, response } => { _ = response.send(self.get_file_access(&hash).await); },
             FilterCommand::CheckInsertStatus {files, response } => { _ = response.send(self.check_insert_status(files).await); },
+            FilterCommand::IngestFile { file, response } => { _ = response.send(self.ingest_single(file).await); },
             FilterCommand::IngestFiles { files, response } => { _ = response.send(self.ingest_files(files).await); },
             FilterCommand::SelectFileHashes { file_indices, access, response } => { _ = response.send(self.select_file_hashes(&file_indices, &access).await); },
             FilterCommand::GetIngestBatch { limit, response } => { _ = response.send(self.get_ingest_batch(limit).await); },
@@ -455,11 +464,37 @@ impl FilterSQLWorker {
         }
     }
 
+    pub async fn ingest_single(&self, file: FileInfo) -> Result<IngestProgress> {
+        let mut conn = self.db.acquire().await?;
+
+        // Check if the file is already ingested
+        let row: Option<(i64, bool)> = sqlx::query_as("SELECT number, ingested FROM files WHERE hash = ?")
+            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await?;
+        if let Some((number, ingested, )) = row {
+            if ingested {
+                return Ok(IngestProgress::Ready)
+            }
+            return Ok(IngestProgress::Pending(self.id, number))
+        }
+
+        // Insert the new file if it is not there
+        let res = sqlx::query("INSERT INTO files(hash, access) VALUES(?, ?)")
+            .bind(file.hash.as_bytes())
+            .bind(file.access.to_string())
+            .execute(&mut conn).await?;
+
+        if let Some(size) = self.filter_sizes.write().await.get_mut(&self.id) {
+            *size += 1;
+        };
+    
+        Ok(IngestProgress::Pending(self.id, res.last_insert_rowid()))
+    }
+
     pub async fn check_insert_status(&self, files: Vec<FileInfo>) -> Result<Vec<(FilterID, FileInfo, IngestStatus)>> {
         let mut conn = self.db.acquire().await?;
         let mut output = vec![];
         for file in files {
-            let (ingested, ): (bool, ) = match query_as("SELECT ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
+            let (number, ingested): (i64, bool) = match query_as("SELECT number, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
                 Some(row) => row,
                 None => {
                     output.push((self.id, file, IngestStatus::Missing));
@@ -470,7 +505,7 @@ impl FilterSQLWorker {
             if ingested {
                 output.push((self.id, file, IngestStatus::Ready));
             } else {
-                output.push((self.id, file, IngestStatus::Pending(self.id)));
+                output.push((self.id, file, IngestStatus::Pending(self.id, number)));
             }
         }
         return Ok(output)
@@ -522,7 +557,7 @@ impl FilterSQLWorker {
 
             match self._update_file_access(&mut conn, &file).await? {
                 IngestStatus::Ready => output.ready.push(file.hash),
-                IngestStatus::Pending(id) => { output.pending.insert(file.hash, id); },
+                IngestStatus::Pending(id, _) => { output.pending.insert(file.hash, id); },
                 IngestStatus::Missing => output.missing.push(file.hash),
             }
         }
@@ -530,7 +565,7 @@ impl FilterSQLWorker {
     }
 
     pub async fn _update_file_access(&self, conn: &mut PoolConnection<sqlx::Sqlite>, file: &FileInfo) -> Result<IngestStatus> {
-        let (access_string, ingested): (String, bool) = match query_as("SELECT access, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
+        let (number, access_string, ingested): (i64, String, bool) = match query_as("SELECT number, access, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
             Some(row) => row,
             None => return Ok(IngestStatus::Missing)
         };
@@ -541,7 +576,7 @@ impl FilterSQLWorker {
             if ingested {
                 return Ok(IngestStatus::Ready)
             } else {
-                return Ok(IngestStatus::Pending(self.id))
+                return Ok(IngestStatus::Pending(self.id, number))
             }
         }
 
@@ -554,7 +589,7 @@ impl FilterSQLWorker {
             if ingested {
                 return Ok(IngestStatus::Ready)
             } else {
-                return Ok(IngestStatus::Pending(self.id))
+                return Ok(IngestStatus::Pending(self.id, number))
             }
         }
         return Ok(IngestStatus::Missing)

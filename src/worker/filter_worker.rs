@@ -10,28 +10,28 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
 
-use super::trigrams::TrigramSet;
+use super::trigrams::{TrigramSet, CacheGuard};
 
 #[derive(Debug)]
 enum ReaderCommand {
     Query(Query, oneshot::Sender<Result<Vec<u64>>>)
 }
 
-#[derive(Debug)]
-pub enum WriterCommand {
-    Ingest(Vec<(u64, TrigramSet)>, oneshot::Sender<()>),
-    Flush
-}
+// #[derive(Debug)]
+// pub enum WriterCommand {
+//     Ingest(Arc<CacheGuard>, u64, oneshot::Sender<()>),
+//     Flush
+// }
+pub type WriterCommand = (Arc<CacheGuard>, u64, oneshot::Sender<()>);
 
 pub struct FilterWorker {
     readiness: watch::Receiver<bool>,
     reader_connection: mpsc::Sender<ReaderCommand>,
-    pub writer_connection: mpsc::Sender<WriterCommand>,
     writer_thread: std::thread::JoinHandle<()>,
 }
 
 impl FilterWorker {
-    pub fn open(config: WorkerSettings, id: FilterID) -> Result<Self> {
+    pub fn open(config: WorkerSettings, id: FilterID) -> Result<(Self, mpsc::Sender<WriterCommand>)> {
         let (ready_send, ready_recv) = watch::channel(false);
         let (reader_send, reader_recv) = mpsc::channel(64);
         let (writer_send, writer_recv) = mpsc::channel(2);
@@ -39,7 +39,7 @@ impl FilterWorker {
             // let ready_recv = ready_recv.clone();
             move || { writer_worker(writer_recv, config, id, ready_send, reader_recv) }
         });
-        Ok(Self { readiness: ready_recv, reader_connection: reader_send, writer_connection: writer_send, writer_thread })
+        Ok((Self { readiness: ready_recv, reader_connection: reader_send, writer_thread }, writer_send))
     }
 
     pub async fn join(self) {
@@ -95,7 +95,7 @@ fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerS
 pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: FilterID, filter: Arc<RwLock<ExtensibleTrigramFile>>) -> Result<()> {
     while let Some(message) = writer_recv.blocking_recv() {
         match message {
-            WriterCommand::Ingest(mut batch, finished) => {
+            WriterCommand::Ingest(guard, finished) => {
                 // Insert the batch
                 let capture = Capture::new();
                 let size = batch.len();

@@ -14,8 +14,14 @@ type Result<T> = core::result::Result<T, ErrorKinds>;
 #[derive(Debug)]
 pub enum IngestStatus {
     Ready,
-    Pending(FilterID),
+    Pending(FilterID, i64),
     Missing
+}
+
+#[derive(Debug)]
+pub enum IngestProgress {
+    Ready,
+    Pending(FilterID, i64),
 }
 
 #[derive(Debug, Default)]
@@ -174,6 +180,16 @@ impl Database {
                     results.extend(part.into_iter());
                 }
                 return Ok(results)
+            }
+        }
+    }
+
+    pub async fn ingest_file(&self, filter: FilterID, file: FileInfo) -> Result<IngestProgress> {
+        match self {
+            Database::SQLite(chan) => {
+                let (send, resp) = oneshot::channel();
+                chan.send(SQLiteCommand::IngestFile { filter, file, response: send }).await?;
+                return Ok(resp.await??)
             }
         }
     }

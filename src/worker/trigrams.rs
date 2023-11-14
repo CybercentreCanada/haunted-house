@@ -9,7 +9,7 @@ use std::iter::Peekable;
 use anyhow::Result;
 use aws_config::retry::ErrorKind;
 use log::error;
-use tokio::sync::{Semaphore, RwLock};
+use tokio::sync::{Semaphore, RwLock, Mutex};
 use tokio::task::JoinHandle;
 use bitvec::{bitarr, BitArr};
 use bitvec::prelude::BitArray;
@@ -29,11 +29,33 @@ pub struct TrigramCache {
     /// A semaphore to track the number of trigram sets currently being calculated to limit resource consumption
     permits: Semaphore,
     /// List of jobs either building trigram sets or waiting for a permit
-    pending: RwLock<HashMap<(FilterID, Sha256), JoinHandle<()>>>,
+    // pending: RwLock<HashMap<(FilterID, Sha256), JoinHandle<()>>>,
     /// List of jobs that have been rejected and can't be completed
-    rejected: RwLock<HashSet<(FilterID, Sha256)>>,
+    // rejected: RwLock<HashSet<(FilterID, Sha256)>>,
     /// A storage driver where the target files can be loaded from
-    files: BlobStorage
+    files: BlobStorage,
+
+    guards: tokio::sync::Mutex<HashMap<(FilterID, Sha256), std::sync::Weak<CacheGuard>>>,
+}
+
+pub (crate) struct CacheGuard {
+    cache: Arc<TrigramCache>,
+    filter: FilterID,
+    hash: Sha256,
+}
+
+impl Drop for CacheGuard {
+    fn drop(&mut self) {
+        tokio::spawn(async {
+            self.cache.release(self.filter, &self.hash).await
+        });
+    }
+}
+
+impl std::fmt::Debug for CacheGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheGuard").field("filter", &self.filter).field("hash", &self.hash).finish()
+    }
 }
 
 
@@ -49,28 +71,29 @@ impl TrigramCache {
             cache_dir: config.get_trigram_cache_directory(),
             temp_dir,
             permits: Semaphore::new(config.parallel_file_downloads),
-            pending: RwLock::new(Default::default()),
-            rejected: Default::default(),
+            // pending: RwLock::new(Default::default()),
+            // rejected: Default::default(),
             files,
+            guards: Mutex::new(Default::default())
         }))
     }
 
     /// Expire all files related to a particular filter
     pub async fn expire(&self, filter: FilterID) -> Result<()> {
-        // Flush out pending tasks
-        {
-            let mut pending = self.pending.write().await;
-            let mut remove = vec![];
-            for (key, task) in pending.iter() {
-                if key.0 == filter {
-                    remove.push(key.clone());
-                    task.abort();
-                }
-            }
-            for key in remove {
-                pending.remove(&key);
-            }
-        }
+        // // Flush out pending tasks
+        // {
+        //     let mut pending = self.pending.write().await;
+        //     let mut remove = vec![];
+        //     for (key, task) in pending.iter() {
+        //         if key.0 == filter {
+        //             remove.push(key.clone());
+        //             task.abort();
+        //         }
+        //     }
+        //     for key in remove {
+        //         pending.remove(&key);
+        //     }
+        // }
 
         // Erase directory
         let dir = self._filter_path(filter);
@@ -81,40 +104,87 @@ impl TrigramCache {
     }
 
     /// Start pulling a file into the trigram cache
-    pub async fn start_fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
-        if self.is_ready(filter, &hash).await? {
-            return Ok(())
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.pending.write().await.entry((filter, hash.clone())) {
-            let core = self.clone();
-            entry.insert(tokio::spawn(async move {
-                let mut not_found_errors = 0;
-                let rejected = loop {
-                    if let Err(err) = core._fetch_file(filter, &hash).await {
-                        error!("Fetch file error: {err} [attempt {not_found_errors}]");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        if ErrorKinds::BlobNotFound == err {
-                            not_found_errors += 1;
-                            if not_found_errors < 10 {
-                                continue
-                            }
-                        }
-                        break true
-                    }
-                    break false
-                };
-                if rejected {
-                    let mut rejected = core.rejected.write().await;
-                    rejected.insert((filter, hash.clone()));
+    pub async fn fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<Option<Arc<CacheGuard>>, ErrorKinds> {
+        let guard = match self.guards.lock().await.entry((filter, hash.clone())) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                match entry.get().upgrade() {
+                    Some(guard) => guard,
+                    None => {
+                        let guard = Arc::new(CacheGuard { cache: self.clone(), filter, hash: hash.clone() });
+                        entry.insert(Arc::downgrade(&guard));
+                        guard
+                    },
                 }
+            },
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let guard = Arc::new(CacheGuard { cache: self.clone(), filter, hash: hash.clone() });
+                entry.insert(Arc::downgrade(&guard));
+                guard
+            },
+        };
 
-                let mut pending = core.pending.write().await;
-                pending.remove(&(filter, hash));
-
-            }));
+        if self.is_ready(filter, &hash).await? {
+            return Ok(Some(guard))
         }
-        return Ok(())
+
+        let mut not_found_errors = 0;
+        let rejected = loop {
+            if let Err(err) = self._fetch_file(filter, &hash).await {
+                error!("Fetch file error: {err} [attempt {not_found_errors}]");
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if ErrorKinds::BlobNotFound == err {
+                    not_found_errors += 1;
+                    if not_found_errors < 10 {
+                        continue
+                    }
+                }
+                break true
+            }
+            break false
+        };
+
+        if rejected {
+            return Ok(None)
+        }
+
+        Ok(Some(guard))
     }
+
+    /// Start pulling a file into the trigram cache
+    // pub async fn start_fetch(self: &Arc<Self>, filter: FilterID, hash: Sha256) -> Result<()> {
+    //     if self.is_ready(filter, &hash).await? {
+    //         return Ok(())
+    //     }
+    //     if let std::collections::hash_map::Entry::Vacant(entry) = self.pending.write().await.entry((filter, hash.clone())) {
+    //         let core = self.clone();
+    //         entry.insert(tokio::spawn(async move {
+    //             let mut not_found_errors = 0;
+    //             let rejected = loop {
+    //                 if let Err(err) = core._fetch_file(filter, &hash).await {
+    //                     error!("Fetch file error: {err} [attempt {not_found_errors}]");
+    //                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    //                     if ErrorKinds::BlobNotFound == err {
+    //                         not_found_errors += 1;
+    //                         if not_found_errors < 10 {
+    //                             continue
+    //                         }
+    //                     }
+    //                     break true
+    //                 }
+    //                 break false
+    //             };
+    //             if rejected {
+    //                 let mut rejected = core.rejected.write().await;
+    //                 rejected.insert((filter, hash.clone()));
+    //             }
+
+    //             let mut pending = core.pending.write().await;
+    //             pending.remove(&(filter, hash));
+
+    //         }));
+    //     }
+    //     return Ok(())
+    // }
 
     async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<(), ErrorKinds> {
         let _permit = self.permits.acquire().await?;
@@ -138,31 +208,31 @@ impl TrigramCache {
         return Ok(())
     }
 
-    pub async fn strip_pending(&self, collection: &mut Vec<(FilterID, FileInfo)>) {
-        let workers = self.pending.read().await;
-        collection.retain(|(filter, info)|{
-            !workers.contains_key(&(*filter, info.hash.clone()))
-        });
-    }
+    // pub async fn strip_pending(&self, collection: &mut Vec<(FilterID, FileInfo)>) {
+    //     let workers = self.pending.read().await;
+    //     collection.retain(|(filter, info)|{
+    //         !workers.contains_key(&(*filter, info.hash.clone()))
+    //     });
+    // }
 
-    pub async fn add_pending(&self, collection: &mut HashMap<FilterID, HashSet<Sha256>>) {
-        let workers = self.pending.read().await;
-        for (filter, sha) in workers.keys() {
-            match collection.entry(*filter) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(sha.clone()); },
-                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert([sha.clone()].into()); },
-            }
-        }
-    }
+    // pub async fn add_pending(&self, collection: &mut HashMap<FilterID, HashSet<Sha256>>) {
+    //     let workers = self.pending.read().await;
+    //     for (filter, sha) in workers.keys() {
+    //         match collection.entry(*filter) {
+    //             std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(sha.clone()); },
+    //             std::collections::hash_map::Entry::Vacant(entry) => { entry.insert([sha.clone()].into()); },
+    //         }
+    //     }
+    // }
 
-    pub async fn is_ready(&self, filter: FilterID, hash: &Sha256) -> Result<bool> {
+    pub async fn is_ready(&self, filter: FilterID, hash: &Sha256) -> Result<bool, ErrorKinds> {
         Ok(tokio::fs::try_exists(self._path(filter, hash)).await?)
     }
 
-    pub async fn clear_rejected(&self, filter: FilterID, hash: Sha256) -> bool {
-        let mut rejected = self.rejected.write().await;
-        rejected.remove(&(filter, hash))
-    }
+    // pub async fn clear_rejected(&self, filter: FilterID, hash: Sha256) -> bool {
+    //     let mut rejected = self.rejected.write().await;
+    //     rejected.remove(&(filter, hash))
+    // }
 
     /// Load the content of a file
     pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<TrigramSet> {
@@ -172,6 +242,9 @@ impl TrigramCache {
 
     /// Free a specific file from the cache
     pub async fn release(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
+        let mut guards = self.guards.lock().await;
+        guards.remove(&(filter, hash.clone()));
+
         let path = self._path(filter, hash);
         match tokio::fs::remove_file(&path).await {
             Ok(_) => Ok(()),

@@ -7,21 +7,27 @@ use tokio::sync::{mpsc, watch, Notify, oneshot};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
+use crate::error::ErrorKinds;
 use crate::query::Query;
 use crate::storage::BlobStorage;
 use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
 
 use super::YaraTask;
-use super::database::{IngestStatus, Database, IngestStatusBundle};
+use super::database::{IngestStatus, Database, IngestStatusBundle, IngestProgress};
 use super::filter::ExtensibleTrigramFile;
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse, StorageStatus};
 use super::trigrams::TrigramCache;
 
+enum IngestFileResponse {
+    Rejected,
+    Finished
+}
+
 pub struct WorkerState {
     pub database: Database,
     pub running: watch::Receiver<bool>,
-    pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>, watch::Sender<bool>)>>,
+    pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, mpsc::Sender<WriterCommand>)>>,
     pub file_storage: BlobStorage,
     pub file_cache: BlobCache,
     pub trigrams: Arc<TrigramCache>,
@@ -60,11 +66,11 @@ impl WorkerState {
                     error!("Duplicate filter?");
                     continue
                 }
-                let notify = Arc::new(tokio::sync::Notify::new());
-                let (send_running, recv_running) = watch::channel(true);
-                let worker = FilterWorker::open(new.config.clone(), id)?;
-                tokio::spawn(new.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
-                filters.insert(id, (worker, notify, send_running));
+                // let notify = Arc::new(tokio::sync::Notify::new());
+                // let (send_running, recv_running) = watch::channel(true);
+                // let (worker, channel) = ;
+                // tokio::spawn(new.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
+                filters.insert(id, FilterWorker::open(new.config.clone(), id)?);
             }
         }
 
@@ -78,11 +84,13 @@ impl WorkerState {
 
     pub async fn stop(&self) {
         let mut filters = self.filters.write().await;
-        for (_, (_, notify, running)) in filters.iter() {
-            _ = running.send(false);
-            notify.notify_waiters();
+        let mut threads = vec![];
+        // drop all the senders so the threads exit when they finish their current work
+        for (_, (worker, _)) in filters.drain() {
+            threads.push(worker);
         }
-        for (_, (worker, _, _)) in filters.drain() {
+        // wait for them to finish that work
+        for worker in threads {
             worker.join().await;
         }
     }
@@ -91,11 +99,12 @@ impl WorkerState {
         self.database.create_filter(id, &expiry).await?;
         let mut filters = self.filters.write().await;
         if filters.contains_key(&id) { return Ok(()); }
-        let (send_running, recv_running) = watch::channel(true);
-        let worker = FilterWorker::open(self.config.clone(), id)?;
-        let notify = Arc::new(tokio::sync::Notify::new());
-        tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
-        filters.insert(id, (worker, notify, send_running));
+        // let (send_running, recv_running) = watch::channel(true);
+        // let worker = FilterWorker::open(self.config.clone(), id)?;
+        // let notify = Arc::new(tokio::sync::Notify::new());
+        // tokio::spawn(self.clone().ingest_feeder(id, worker.writer_connection.clone(), notify.clone(), recv_running));
+        // filters.insert(id, (worker, notify, send_running));
+        filters.insert(id, FilterWorker::open(self.config.clone(), id)?);
         return Ok(())
     }
 
@@ -123,9 +132,8 @@ impl WorkerState {
     pub async fn delete_index(&self, id: FilterID) -> Result<()> {
         info!("Deleting index {id}");
         // Stop the worker if running
-        if let Some((worker, notify, running)) = self.filters.write().await.remove(&id) {
-            _ = running.send(false);
-            notify.notify_waiters();
+        if let Some((worker, channel)) = self.filters.write().await.remove(&id) {
+            drop(channel);
             worker.join().await;
         }
 
@@ -185,172 +193,204 @@ impl WorkerState {
         })
     }
 
-    /// Given a set of files expected to be ingested check the progress of the ones already underway
-    /// and add new ones
-    pub async fn ingest_files(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
-        // Filter those we already have information for quickly
-        // the ones that are currently pending can be dropped
-        let pending = self.database.filter_pending().await?;
-        files.retain(|(filter, file)| {
-            match pending.get(filter) {
-                Some(hashes) => !hashes.contains(&file.hash),
-                None => true
-            }
-        });
-        // The ones we currently waiting for their file download can also be dropped
-        self.trigrams.strip_pending(&mut files).await;
-
-        // Check for any completed files
-        let mut completed = vec![];
-        let files = self.database.check_insert_status(files).await?;
-        let mut outstanding = vec![];
-        let mut rejected = vec![];
-        let mut modified_filters = vec![];
-        for (filter, file, status) in files {
-            match status {
-                IngestStatus::Ready => {
-                    completed.push((filter, file.hash));
-                    continue
-                },
-                IngestStatus::Pending(_) => continue,
-                IngestStatus::Missing => {
-                    // if its not complete, either start downloading it, or pass it
-                    // to the next step
-                    if self.trigrams.clear_rejected(filter, file.hash.clone()).await {
-                        rejected.push((filter, file.hash));
-                        continue
-                    } else if !self.trigrams.is_ready(filter, &file.hash).await? {
-                        self.trigrams.start_fetch(filter, file.hash).await?;
-                    } else {
-                        outstanding.push((filter, file));
-                        modified_filters.push(filter);
-                    }
-                }
-            }
+    pub async fn ingest_file(self: &Arc<Self>, filter: FilterID, file: FileInfo) -> Result<IngestFileResponse, ErrorKinds> {
+        // Check if we are working on old file data
+        if file.expiry <= ExpiryGroup::today() {
+            return Ok(IngestFileResponse::Rejected)
         }
 
-        // Clear out files that have been abandoned
-        self.database.abandon_files(rejected.clone()).await?;
-
-        // Ingest the file
-        let complete = self.database.ingest_files(outstanding).await?;
-        for (filter, completed_file) in complete {
-            completed.push((filter, completed_file.hash));
-        }
-
-        // Let ingest feeders know files are ready
-        self.notify_ingest_feeders(modified_filters).await;
-
-        // gather a list of which filters are assigned to what
-        let mut expiry_groups: HashMap<ExpiryGroup, Vec<FilterID>> = Default::default();
-        for (id, group) in self.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
-            match expiry_groups.entry(group) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(id),
-                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(vec![id]); },
+        // Install the file in the database
+        let id = match self.database.ingest_file(filter, file.clone()).await? {
+            IngestProgress::Ready => return Ok(IngestFileResponse::Finished),
+            IngestProgress::Pending(filter, number) => number,
+        };
+        
+        // Load the file into the cache
+        let guard = match self.trigrams.fetch(filter, file.hash.clone()).await? {
+            Some(guard) => guard,
+            None => {
+                self.database.abandon_files(vec![(filter, file.hash.clone())]).await?; 
+                return Ok(IngestFileResponse::Rejected);
             }
+        };
+        
+        // Queue up the file 
+        let (finished_send, finished_recv) = oneshot::channel();
+        match self.filters.read().await.get(&filter) {
+            Some((_, writer)) => {
+                writer.send(WriterCommand::Ingest(guard, id as u64, finished_send)).await?;
+            }
+            None => return Err(ErrorKinds::ChannelError("lost connection to filter".to_owned()))
         }
+        finished_recv.await?;
 
-        //
-        let mut filter_pending = self.database.filter_pending().await?;
-        self.trigrams.add_pending(&mut filter_pending).await;
-
-        // return progress, with metadata about our filters
-        return Ok(IngestFilesResponse {
-            completed,
-            rejected,
-            // unknown_filters,
-            filter_pending,
-            expiry_groups,
-            storage_pressure: self.check_storage_pressure().await?,
-            filter_size: self.database.filter_sizes().await?,
-        })
+        // confirm file in database
+        self.database.finished_ingest(filter, vec![(id as u64, file.hash)]).await?;
+        Ok(IngestFileResponse::Finished)
     }
 
-    pub async fn notify_ingest_feeders(&self, mut ids: Vec<FilterID>) {
-        ids.sort_unstable();
-        ids.dedup();
-        let filters = self.filters.read().await;
-        for id in ids {
-            if let Some((_, notify, _)) = filters.get(&id) {
-                notify.notify_waiters()
-            }
-        }
-    }
+    // /// Given a set of files expected to be ingested check the progress of the ones already underway
+    // /// and add new ones
+    // pub async fn ingest_files(self: &Arc<Self>, mut files: Vec<(FilterID, FileInfo)>) -> Result<IngestFilesResponse> {
+    //     // Filter those we already have information for quickly
+    //     // the ones that are currently pending can be dropped
+    //     let pending = self.database.filter_pending().await?;
+    //     files.retain(|(filter, file)| {
+    //         match pending.get(filter) {
+    //             Some(hashes) => !hashes.contains(&file.hash),
+    //             None => true
+    //         }
+    //     });
+    //     // The ones we currently waiting for their file download can also be dropped
+    //     self.trigrams.strip_pending(&mut files).await;
 
-    pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>, running: watch::Receiver<bool>) {
-        while let Err(err) = self._ingest_feeder(id, &writer, notify.clone(), running.clone()).await {
-            error!("ingest feeder crash {err:?}");
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-        }
-        info!("Stopping ingest feeder for {id}");
-    }
+    //     // Check for any completed files
+    //     let mut completed = vec![];
+    //     let files = self.database.check_insert_status(files).await?;
+    //     let mut outstanding = vec![];
+    //     let mut rejected = vec![];
+    //     let mut modified_filters = vec![];
+    //     for (filter, file, status) in files {
+    //         match status {
+    //             IngestStatus::Ready => {
+    //                 completed.push((filter, file.hash));
+    //                 continue
+    //             },
+    //             IngestStatus::Pending(_) => continue,
+    //             IngestStatus::Missing => {
+    //                 // if its not complete, either start downloading it, or pass it
+    //                 // to the next step
+    //                 if self.trigrams.clear_rejected(filter, file.hash.clone()).await {
+    //                     rejected.push((filter, file.hash));
+    //                     continue
+    //                 } else if !self.trigrams.is_ready(filter, &file.hash).await? {
+    //                     self.trigrams.start_fetch(filter, file.hash).await?;
+    //                 } else {
+    //                     outstanding.push((filter, file));
+    //                     modified_filters.push(filter);
+    //                 }
+    //             }
+    //         }
+    //     }
 
-    pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>, running: watch::Receiver<bool>) -> Result<()> {
-        info!("Starting ingest feeder for {id}");
-        while *self.running.borrow() && *running.borrow() {
-            // Get next set of incomplete files
-            let stamp = std::time::Instant::now();
-            let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
-            let time_get_batch = stamp.elapsed().as_secs_f64();
-            if batch.is_empty() {
-                if tokio::time::timeout(tokio::time::Duration::from_secs(600), notify.notified()).await.is_err() {
-                    writer.send(WriterCommand::Flush).await?;
-                }
-                continue
-            }
+    //     // Clear out files that have been abandoned
+    //     self.database.abandon_files(rejected.clone()).await?;
 
-            let mut min = u64::MAX;
-            let mut max = u64::MIN;
-            for (number, _) in &batch {
-                min = min.min(*number);
-                max = max.max(*number);
-            }
-            info!("Ingesting batch to {id} ({min} to {max})");
+    //     // Ingest the file
+    //     let complete = self.database.ingest_files(outstanding).await?;
+    //     for (filter, completed_file) in complete {
+    //         completed.push((filter, completed_file.hash));
+    //     }
 
-            let stamp = std::time::Instant::now();
-            // Load the file trigrams
-            let mut trigrams = vec![];
-            let mut hashes = vec![];
-            for (number, hash) in &batch {
-                hashes.push(hash.clone());
-                let data = self.trigrams.get(id, hash).await?;
-                trigrams.push((*number, data));
-            }
-            let time_load_trigrams = stamp.elapsed().as_secs_f64();
+    //     // Let ingest feeders know files are ready
+    //     self.notify_ingest_feeders(modified_filters).await;
 
-            let stamp = std::time::Instant::now();
-            // Send the files to the writer
-            let (finished_send, finished_recv) = oneshot::channel();
-            writer.send(WriterCommand::Ingest(trigrams, finished_send)).await?;
+    //     // gather a list of which filters are assigned to what
+    //     let mut expiry_groups: HashMap<ExpiryGroup, Vec<FilterID>> = Default::default();
+    //     for (id, group) in self.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
+    //         match expiry_groups.entry(group) {
+    //             std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(id),
+    //             std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(vec![id]); },
+    //         }
+    //     }
 
-            // Wait for a positive response
-            finished_recv.await?;
-            let time_install = stamp.elapsed().as_secs_f64();
+    //     //
+    //     let mut filter_pending = self.database.filter_pending().await?;
+    //     self.trigrams.add_pending(&mut filter_pending).await;
 
-            // Commit those file ids
-            let stamp = std::time::Instant::now();
-            let processing = self.database.finished_ingest(id, batch).await?;
-            let time_finish = stamp.elapsed().as_secs_f64();
+    //     // return progress, with metadata about our filters
+    //     return Ok(IngestFilesResponse {
+    //         completed,
+    //         rejected,
+    //         // unknown_filters,
+    //         filter_pending,
+    //         expiry_groups,
+    //         storage_pressure: self.check_storage_pressure().await?,
+    //         filter_size: self.database.filter_sizes().await?,
+    //     })
+    // }
 
-            let stamp = std::time::Instant::now();
-            for hash in hashes {
-                if let Err(err) = self.trigrams.release(id, &hash).await {
-                    error!("{err}");
-                }
-            }
-            let time_cleanup = stamp.elapsed().as_secs_f64();
-            info!("{id} Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish} ({processing}); cleanup {time_cleanup}");
-        }
-        return Ok(())
-    }
+    // pub async fn notify_ingest_feeders(&self, mut ids: Vec<FilterID>) {
+    //     ids.sort_unstable();
+    //     ids.dedup();
+    //     let filters = self.filters.read().await;
+    //     for id in ids {
+    //         if let Some((_, notify, _)) = filters.get(&id) {
+    //             notify.notify_waiters()
+    //         }
+    //     }
+    // }
+
+    // pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, writer: mpsc::Sender<WriterCommand>, notify: Arc<Notify>, running: watch::Receiver<bool>) {
+    //     while let Err(err) = self._ingest_feeder(id, &writer, notify.clone(), running.clone()).await {
+    //         error!("ingest feeder crash {err:?}");
+    //         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    //     }
+    //     info!("Stopping ingest feeder for {id}");
+    // }
+
+    // pub async fn _ingest_feeder(self: &Arc<Self>, id: FilterID, writer: &mpsc::Sender<WriterCommand>, notify: Arc<Notify>, running: watch::Receiver<bool>) -> Result<()> {
+    //     info!("Starting ingest feeder for {id}");
+    //     while *self.running.borrow() && *running.borrow() {
+    //         // Get next set of incomplete files
+    //         let stamp = std::time::Instant::now();
+    //         let batch = self.database.get_ingest_batch(id, self.config.ingest_batch_size).await?;
+    //         let time_get_batch = stamp.elapsed().as_secs_f64();
+    //         if batch.is_empty() {
+    //             if tokio::time::timeout(tokio::time::Duration::from_secs(600), notify.notified()).await.is_err() {
+    //                 writer.send(WriterCommand::Flush).await?;
+    //             }
+    //             continue
+    //         }
+
+    //         let mut min = u64::MAX;
+    //         let mut max = u64::MIN;
+    //         for (number, _) in &batch {
+    //             min = min.min(*number);
+    //             max = max.max(*number);
+    //         }
+    //         info!("Ingesting batch to {id} ({min} to {max})");
+
+    //         let stamp = std::time::Instant::now();
+    //         // Load the file trigrams
+    //         let mut trigrams = vec![];
+    //         let mut hashes = vec![];
+    //         for (number, hash) in &batch {
+    //             hashes.push(hash.clone());
+    //             let data = self.trigrams.get(id, hash).await?;
+    //             trigrams.push((*number, data));
+    //         }
+    //         let time_load_trigrams = stamp.elapsed().as_secs_f64();
+
+    //         let stamp = std::time::Instant::now();
+    //         // Send the files to the writer
+    //         let (finished_send, finished_recv) = oneshot::channel();
+    //         writer.send(WriterCommand::Ingest(trigrams, finished_send)).await?;
+
+    //         // Wait for a positive response
+    //         finished_recv.await?;
+    //         let time_install = stamp.elapsed().as_secs_f64();
+
+    //         // Commit those file ids
+    //         let stamp = std::time::Instant::now();
+    //         let processing = self.database.finished_ingest(id, batch).await?;
+    //         let time_finish = stamp.elapsed().as_secs_f64();
+
+    //         let stamp = std::time::Instant::now();
+    //         for hash in hashes {
+    //             if let Err(err) = self.trigrams.release(id, &hash).await {
+    //                 error!("{err}");
+    //             }
+    //         }
+    //         let time_cleanup = stamp.elapsed().as_secs_f64();
+    //         info!("{id} Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish} ({processing}); cleanup {time_cleanup}");
+    //     }
+    //     return Ok(())
+    // }
 
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {
         Ok(self.database.get_filters(first, last).await?)
     }
-
-    // pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>> {
-    //     Ok(self.database.get_expiry(first, last).await?)
-    // }
 
     pub async fn is_ready(&self) -> Result<bool> {
         // Get the most comprehensive list of filters we can
@@ -361,7 +401,7 @@ impl WorkerState {
         // Make sure they are all ready
         for id in ids {
             match filters.get(&id) {
-                Some((filter, _, _)) => if !filter.is_ready() {
+                Some((filter, _)) => if !filter.is_ready() {
                     return Ok(false);
                 }
                 None => return Ok(false)
@@ -371,7 +411,7 @@ impl WorkerState {
     }
 
     pub async fn query_filter(self: Arc<Self>, id: FilterID, query: Query, access: HashSet<String>, respond: mpsc::Sender<FilterSearchResponse>) {
-        if let Some((filter, _, _)) = self.filters.read().await.get(&id) {
+        if let Some((filter, _)) = self.filters.read().await.get(&id) {
             match filter.query(query).await {
                 Ok(file_indices) => {
                     match self.database.select_file_hashes(id, &file_indices, &access).await {
