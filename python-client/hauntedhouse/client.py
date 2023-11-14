@@ -35,6 +35,7 @@ class SearchStatus(pydantic.BaseModel):
     truncated: bool
     phase: str
     progress: tuple[int, int]
+    query: str
 
 
 class Client:

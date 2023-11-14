@@ -262,6 +262,8 @@ pub struct SearchRequestResponse {
     pub hits: Vec<String>,
     /// flag indicating if the hits list has been truncated
     pub truncated: bool,
+    /// Filter query generated for this search
+    pub query: String,
 }
 
 /// API endpoint for starting a new search

@@ -215,6 +215,7 @@ impl SQLiteInterface {
                     errors: record.errors,
                     hits: record.hit_files.into_iter().map(|hash|hash.hex()).collect(),
                     truncated: record.truncated,
+                    query: record.query.to_string(),
                 }
             }),
             None => None,

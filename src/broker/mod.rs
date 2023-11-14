@@ -486,7 +486,7 @@ impl HouseCore {
         let fetcher = match &self.fetcher_control_queue {
             Some(queue) => {
                 let (send, recv) = oneshot::channel();
-                queue.send(FetchControlMessage::Status(send)).await;
+                _ = queue.send(FetchControlMessage::Status(send)).await;
                 Some(recv.await?)
             }
             None => None
@@ -1127,6 +1127,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 truncated: false,
                                 progress: (done, total),
                                 phase: SearchProgress::Filtering,
+                                query: status.query.to_string(),
                             }
                         });
                     },
@@ -1207,6 +1208,7 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
                                 truncated: false,
                                 progress: (initial_total, candidates.len().await?),
                                 phase: SearchProgress::Yara,
+                                query: status.query.to_string(),
                             }
                         });
                     },
