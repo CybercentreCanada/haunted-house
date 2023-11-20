@@ -468,13 +468,10 @@ impl FilterSQLWorker {
         let mut conn = self.db.acquire().await?;
 
         // Check if the file is already ingested
-        let row: Option<(i64, bool)> = sqlx::query_as("SELECT number, ingested FROM files WHERE hash = ?")
-            .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await?;
-        if let Some((number, ingested, )) = row {
-            if ingested {
-                return Ok(IngestProgress::Ready)
-            }
-            return Ok(IngestProgress::Pending(self.id, number))
+        match self._update_file_access(&mut conn, &file).await? {
+            IngestStatus::Ready => return Ok(IngestProgress::Ready),
+            IngestStatus::Pending(id, number) => return Ok(IngestProgress::Pending(id, number)),
+            IngestStatus::Missing => {},
         }
 
         // Insert the new file if it is not there

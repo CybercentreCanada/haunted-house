@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
 
-use super::trigrams::{TrigramSet, CacheGuard};
+use super::trigrams::CacheGuard;
 
 #[derive(Debug)]
 enum ReaderCommand {
@@ -93,31 +93,69 @@ fn writer_worker(mut writer_recv: mpsc::Receiver<WriterCommand>, config: WorkerS
 
 /// Implementation method for writer_worker
 pub fn _writer_worker(writer_recv: &mut mpsc::Receiver<WriterCommand>, id: FilterID, filter: Arc<RwLock<ExtensibleTrigramFile>>) -> Result<()> {
-    while let Some(message) = writer_recv.blocking_recv() {
-        match message {
-            WriterCommand::Ingest(guard, finished) => {
-                // Insert the batch
-                let capture = Capture::new();
-                let size = batch.len();
-                let batch = {
-                    let filter = filter.blocking_read();
-                    filter.write_batch(&mut batch, &capture)?
-                };
-                {
-                    let mut filter = filter.blocking_write();
-                    filter.apply_operations(batch.0, batch.1, batch.2, &capture)?;
-                }
-                _ = finished.send(());
-                info!("Ingest {size} into {id} install time: \n{}", capture.format());
-            },
-            WriterCommand::Flush => {
+    // track how long we have had data pending a flush, None means no data to flush
+    let mut flush_waiting: Option<std::time::Instant> = None;
+
+    // iterate until our socket closes
+    loop {
+        // check if its time to flush data
+        if let Some(waiting) = flush_waiting {
+            if waiting.elapsed() > std::time::Duration::from_secs(600) {
                 let mut filter = filter.blocking_write();
                 if filter.outstanding_journals()? > 0 {
                     filter.flush_threaded(None, None)?;
                 }
+                flush_waiting = None;
             }
         }
+
+        // read for more updates
+        let message = match writer_recv.try_recv() {
+            Ok(message) => message,
+            Err(err) => match err {
+                mpsc::error::TryRecvError::Empty => {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue
+                },
+                mpsc::error::TryRecvError::Disconnected => {
+                    break
+                },
+            },
+        };
+
+        // read all pending messages 
+        let mut batch = vec![message];
+        while let Ok(message) = writer_recv.try_recv() {
+            batch.push(message);
+        }
+        batch.sort_by(|a, b|a.1.cmp(&b.1));
+
+        // Read the data for the pending writes
+        let mut responses = vec![];
+        let mut data = vec![];
+        for (guard, number, message) in batch {
+            data.push((number, guard.load()?));
+            responses.push((message, guard));
+        }
+
+        // write the data
+        let capture = Capture::new();
+        let batch = {
+            let filter = filter.blocking_read();
+            filter.write_batch(&mut data, &capture)?
+        };
+        {
+            let mut filter = filter.blocking_write();
+            filter.apply_operations(batch.0, batch.1, batch.2, &capture)?;
+        }
+        flush_waiting = Some(std::time::Instant::now());
+
+        // notify the requesters and let the cache guards drop
+        for (resp, _) in responses {
+            resp.send(());
+        }
     }
+
     info!("Stopping ingest writer for {id}");
     {
         let mut filter = filter.blocking_write();

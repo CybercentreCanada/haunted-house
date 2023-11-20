@@ -1,16 +1,14 @@
 //! Tools for handling the trigram sets from files.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::iter::Peekable;
 
 use anyhow::Result;
-use aws_config::retry::ErrorKind;
 use log::error;
-use tokio::sync::{Semaphore, RwLock, Mutex};
-use tokio::task::JoinHandle;
+use tokio::sync::{Semaphore, Mutex};
 use bitvec::{bitarr, BitArr};
 use bitvec::prelude::BitArray;
 use serde::{Serialize, Deserialize, de::Error};
@@ -18,7 +16,7 @@ use serde::{Serialize, Deserialize, de::Error};
 use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
 use crate::storage::BlobStorage;
-use crate::types::{Sha256, FilterID, FileInfo};
+use crate::types::{Sha256, FilterID};
 
 /// A manager for a directory holding the trigram sets yet to be written to filters.
 pub struct TrigramCache {
@@ -55,6 +53,12 @@ impl Drop for CacheGuard {
 impl std::fmt::Debug for CacheGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheGuard").field("filter", &self.filter).field("hash", &self.hash).finish()
+    }
+}
+
+impl CacheGuard {
+    pub fn load(&self) -> Result<TrigramSet> {
+        self.cache.get_blocking(self.filter, &self.hash)
     }
 }
 
@@ -235,8 +239,8 @@ impl TrigramCache {
     // }
 
     /// Load the content of a file
-    pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<TrigramSet> {
-        let data = tokio::fs::read(self._path(filter, hash)).await?;
+    pub fn get_blocking(&self, filter: FilterID, hash: &Sha256) -> Result<TrigramSet> {
+        let data = std::fs::read(self._path(filter, hash))?;
         Ok(postcard::from_bytes(&data)?)
     }
 

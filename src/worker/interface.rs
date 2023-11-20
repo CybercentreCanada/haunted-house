@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context};
+use anyhow::Context;
 use futures::{SinkExt, StreamExt};
-use log::{error};
+use http::StatusCode;
+use log::error;
 use poem::web::websocket::{WebSocket, Message};
 use poem::{handler, Route, get, EndpointExt, Server, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
@@ -18,7 +19,7 @@ use crate::query::Query;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID};
 use crate::worker::YaraTask;
 
-use super::manager::{WorkerState};
+use super::manager::{WorkerState, IngestFileResponse};
 
 // use crate::config::TLSConfig;
 // use crate::interface::LoggerMiddleware;
@@ -155,24 +156,17 @@ async fn update_file_info(state: Data<&Arc<WorkerState>>, request: Json<UpdateFi
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct IngestFilesRequest {
-    pub files: Vec<(FilterID, FileInfo)>
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct IngestFilesResponse {
-    pub completed: Vec<(FilterID, Sha256)>,
-    pub rejected: Vec<(FilterID, Sha256)>,
-    // pub unknown_filters: Vec<FilterID>,
-    pub filter_pending: HashMap<FilterID, HashSet<Sha256>>,
-    pub filter_size: HashMap<FilterID, u64>,
-    pub expiry_groups: HashMap<ExpiryGroup, Vec<FilterID>>,
-    pub storage_pressure: bool,
+pub struct IngestFileRequest {
+    pub filter: FilterID,
+    pub file: FileInfo,
 }
 
 #[handler]
-async fn ingest_files(state: Data<&Arc<WorkerState>>, request: Json<IngestFilesRequest>) -> poem::Result<Json<IngestFilesResponse>> {
-    Ok(Json(state.ingest_files(request.0.files).await?))
+async fn ingest_file(state: Data<&Arc<WorkerState>>, Json(request): Json<IngestFileRequest>) -> poem::Result<StatusCode> {
+    match state.ingest_file(request.filter, request.file).await? {
+        IngestFileResponse::Finished => Ok(StatusCode::OK),
+        IngestFileResponse::Rejected => Ok(StatusCode::NOT_ACCEPTABLE),
+    }
 }
 
 #[handler]
@@ -254,9 +248,10 @@ pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<
         .at("/search/filter", get(run_filter_search))
         .at("/search/yara", get(run_yara_search))
         .at("/files/update", post(update_file_info))
-        .at("/files/ingest", post(ingest_files))
+        .at("/files/ingest", post(ingest_file))
         .at("/files/ingest-queues", get(list_ingest_files))
         .at("/status/online", get(get_online_status))
+        .at("/status/stream", get(get_status_stream))
         .at("/status/ready", get(get_ready_status))
         .at("/status/detail", get(get_detail_status))
         .data(state)

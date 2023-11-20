@@ -33,10 +33,11 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::access::AccessControl;
 use crate::broker::interface::{SearchRequestResponse, SearchProgress};
 use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig, AssemblylineConfig};
+use crate::error::ErrorKinds;
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
-use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, CreateIndexRequest, IngestFilesRequest, IngestFilesResponse, FilterSearchRequest, FilterSearchResponse, YaraSearchResponse};
+use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, CreateIndexRequest, FilterSearchRequest, FilterSearchResponse, YaraSearchResponse};
 
 use self::auth::Authenticator;
 use self::database::Database;
@@ -113,9 +114,9 @@ pub struct HouseCore {
     /// Queue of files waiting to be ingested
     pub fetcher_control_queue: Option<mpsc::Sender<FetchControlMessage>>,
     /// Set of files that couldn't be quickly accepted by any worker
-    pub pending_assignments: RwLock<HashMap<ExpiryGroup, VecDeque<IngestTask>>>,
+    // pub pending_assignments: RwLock<HashMap<ExpiryGroup, VecDeque<IngestTask>>>,
     /// tasks pushing new files to the corresponding worker
-    pub worker_ingest: RwLock<HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>>,
+    // pub worker_ingest: RwLock<HashMap<WorkerID, mpsc::UnboundedSender<WorkerIngestMessage>>>,
     /// Set of running searches
     pub running_searches: RwLock<HashMap<String, SearchInfo>>,
     /// Pool of permits limiting the assignment of yara tasks to a fixed number per worker
@@ -216,8 +217,8 @@ impl HouseCore {
             config,
             client,
             ws_connector: connector,
-            worker_ingest: RwLock::new(Default::default()),
-            pending_assignments: RwLock::new(Default::default()),
+            // worker_ingest: RwLock::new(Default::default()),
+            // pending_assignments: RwLock::new(Default::default()),
             running_searches: RwLock::new(Default::default()),
             yara_permits,
             access_engine,
@@ -344,17 +345,49 @@ impl HouseCore {
     }
 
     /// Kick off the ingestion of a file and wait for its completion
-    pub (crate) async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<bool> {
-        let (send, recv) = oneshot::channel();
-        self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
-            info: FileInfo{
-                hash: Sha256::from_str(&file.sha256)?,
-                access: self.prepare_classification(&file.classification)?,
-                expiry: ExpiryGroup::create(&file.expiry)
-            },
-            response: vec![send]
-        }))?;
-        return recv.await?;
+    // pub (crate) async fn start_ingest(&self, file: &fetcher::FetchedFile) -> Result<bool> {        
+    //     let (send, recv) = oneshot::channel();
+    //     self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
+    //         info: FileInfo{
+    //             hash: Sha256::from_str(&file.sha256)?,
+    //             access: self.prepare_classification(&file.classification)?,
+    //             expiry: ExpiryGroup::create(&file.expiry)
+    //         },
+    //         response: vec![send]
+    //     }))?;
+    //     return recv.await?;
+    // }
+
+    pub (crate) async fn ingest_file(&self, file: &fetcher::FetchedFile) -> Result<bool> {
+        // check if the file can already been handled by a worker
+        let worker = {
+            let (send, recv) = oneshot::channel();
+            self.ingest_queue.send(IngestMessage::IngestMessage(IngestTask{
+                info: FileInfo{
+                    hash: Sha256::from_str(&file.sha256)?,
+                    access: self.prepare_classification(&file.classification)?,
+                    expiry: ExpiryGroup::create(&file.expiry)
+                },
+                response: vec![send]
+            }))?;
+            match recv.await? {
+                ExistingFileCheckStatus::Completed(value) => return Ok(value),
+                ExistingFileCheckStatus::Pending(worker) => Some(worker),
+                ExistingFileCheckStatus::Unprocessed => None,
+                // ExistingFileCheckStatus::Error(err) => return Err(err),
+            }
+        };
+        
+        // select a server to add this file on
+        let worker = match worker {
+            Some(worker) => worker,
+            None => {
+                todo!()
+            }
+        };
+        
+        // wait for the server to process this file
+        todo!();
     }
 
     /// Given an assemblyline system get the key used for its local configuration data
@@ -386,12 +419,12 @@ impl HouseCore {
     /// Worker watchers are responsible for selecting their own tasks, this is used
     /// when a file is seen repeatedly and a watcher needs to be notified about a second task
     /// pointing at the same file
-    pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
-        let workers = self.worker_ingest.read().await;
-        let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
-        channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)))?;
-        return Ok(())
-    }
+    // pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
+    //     let workers = self.worker_ingest.read().await;
+    //     let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
+    //     channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)))?;
+    //     return Ok(())
+    // }
 
     /// Check the status of a search.
     pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
@@ -506,13 +539,22 @@ impl HouseCore {
 
 }
 
+//
+#[derive(Debug)]
+enum ExistingFileCheckStatus {
+    Completed(bool),
+    Pending(WorkerID),
+    Unprocessed,
+    // Error(ErrorKinds)
+}
+
 /// A data struct encapsulate the ingestion of a file
 #[derive(Debug)]
 pub struct IngestTask {
     /// Information about the file being ingested
     pub info: FileInfo,
     /// A collection of channels waiting for the completion (or error) of this ingestion
-    pub response: Vec<oneshot::Sender<Result<bool>>>
+    pub response: Vec<oneshot::Sender<ExistingFileCheckStatus>>
 }
 
 impl IngestTask {
@@ -593,7 +635,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 // Drop stale tasks
                 if task.info.expiry <= today {
                     for resp in task.response {
-                        _ = resp.send(Ok(false));
+                        _ = resp.send(ExistingFileCheckStatus::Completed(false));
                     }
                     continue
                 }
@@ -700,7 +742,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         for sha in res.processed {
             if let Some(task) = tasks.remove(&sha) {
                 for response in task.response {
-                    _ = response.send(Ok(true));
+                    _ = response.send(ExistingFileCheckStatus::Completed(true));
                 }
             }
         }
@@ -708,313 +750,299 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         // If the ingestion is in progress we can forward this task to the relivant watcher
         for (sha, filter) in res.pending {
             if let Some(task) = tasks.remove(&sha) {
-                core.send_to_ingest_watcher(&worker, task, filter).await?;
+                for response in task.response {
+                    _ = response.send(ExistingFileCheckStatus::Pending(worker.clone()));
+                }
+                // core.send_to_ingest_watcher(&worker, task, filter).await?;
             }
+        }
+    }
+
+    // reply that the remaining tasks could not be processed
+    for task in tasks.into_values() {
+        for response in task.response {
+            _ = response.send(ExistingFileCheckStatus::Unprocessed);
         }
     }
 
     // Put the tasks not marked as processed or pending by any working into the queue
-    let mut unassigned = core.pending_assignments.write().await;
-    'next_task: for task in tasks.into_values() {
-        match unassigned.entry(task.info.expiry.clone()) {
-            hash_map::Entry::Occupied(mut entry) => {
-                for existing in entry.get_mut().iter_mut() {
-                    if existing.info.hash == task.info.hash {
-                        existing.merge(task);
-                        continue 'next_task;
-                    }
-                }
-                entry.get_mut().push_back(task)
-            },
-            hash_map::Entry::Vacant(entry) => { entry.insert(VecDeque::from_iter([task])); },
-        }
-    }
+    // let mut unassigned = core.pending_assignments.write().await;
+    // 'next_task: for task in tasks.into_values() {
+    //     match unassigned.entry(task.info.expiry.clone()) {
+    //         hash_map::Entry::Occupied(mut entry) => {
+    //             for existing in entry.get_mut().iter_mut() {
+    //                 if existing.info.hash == task.info.hash {
+    //                     existing.merge(task);
+    //                     continue 'next_task;
+    //                 }
+    //             }
+    //             entry.get_mut().push_back(task)
+    //         },
+    //         hash_map::Entry::Vacant(entry) => { entry.insert(VecDeque::from_iter([task])); },
+    //     }
+    // }
     return Ok(())
 }
 
 
-/// status message for task monitoring a worker node
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IngestWatchStatus {
-    /// length of queue for files being inserted
-    queue: usize,
-    /// how many files were ingested per minute for the last hour
-    per_minute: f64
-}
+// /// status message for task monitoring a worker node
+// #[derive(Debug, Serialize, Deserialize)]
+// pub struct IngestWatchStatus {
+//     /// length of queue for files being inserted
+//     queue: usize,
+//     /// how many files were ingested per minute for the last hour
+//     per_minute: f64
+// }
 
-/// A message to a worker monitor task
-#[derive(Debug)]
-pub enum WorkerIngestMessage {
-    /// A message assigning the task directly to the given worker
-    IngestMessage((IngestTask, FilterID)),
-    /// Request a status update
-    Status(oneshot::Sender<HashMap<FilterID, IngestWatchStatus>>),
-    // ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
-}
+// /// A message to a worker monitor task
+// #[derive(Debug)]
+// pub enum WorkerIngestMessage {
+//     /// A message assigning the task directly to the given worker
+//     IngestMessage((IngestTask, FilterID)),
+//     /// Request a status update
+//     Status(oneshot::Sender<HashMap<FilterID, IngestWatchStatus>>),
+//     // ListPending(oneshot::Sender<HashMap<FilterID, Vec<Sha256>>>),
+// }
 
 
 /// A task that feeds files to a given worker node
-async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: WorkerID, address: WorkerAddress) {
-    loop {
-        // Keep running until the task willingly exits
-        match _ingest_watcher(core.clone(), &mut input, &worker, &address).await {
-            Err(err) => error!("Crash in ingestion system: {err}"),
-            Ok(()) => {
-                info!("Ingest worker stopped.");
-                break;
-            }
-        }
-    }
-}
+// async fn ingest_watcher(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<WorkerIngestMessage>, worker: WorkerID, address: WorkerAddress) {
+//     loop {
+//         // Keep running until the task willingly exits
+//         match _ingest_watcher(core.clone(), &mut input, &worker, &address).await {
+//             Err(err) => error!("Crash in ingestion system: {err}"),
+//             Ok(()) => {
+//                 info!("Ingest worker stopped.");
+//                 break;
+//             }
+//         }
+//     }
+// }
 
-/// Implementation for above task
-async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, id: &WorkerID, address: &WorkerAddress) -> Result<()> {
-    info!("Starting ingest watcher for {id}");
-    let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
-    let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
-    let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-    query_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut counters = HashMap::<FilterID, crate::counters::WindowCounter>::new();
-    let start = std::time::Instant::now();
+// /// Implementation for above task
+// async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiver<WorkerIngestMessage>, id: &WorkerID, address: &WorkerAddress) -> Result<()> {
+//     info!("Starting ingest watcher for {id}");
+//     let mut active: HashMap<Sha256, (FilterID, IngestTask)> = Default::default();
+//     let mut query: JoinSet<Result<reqwest::Response>> = JoinSet::new();
+//     let mut query_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+//     query_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+//     let mut counters = HashMap::<FilterID, crate::counters::WindowCounter>::new();
+//     let start = std::time::Instant::now();
 
-    {
-        let request = core.client.get(address.http("/files/ingest-queues")?);
-        let result = request.send().await?;
-        let response: HashMap<FilterID, Vec<FileInfo>> = result.json().await?;
-        for (filter, files) in response {
-            for file in files {
-                active.insert(file.hash.clone(), (filter, IngestTask{info: file, response:vec![]}));
-            }
-        }
-    }
+//     {
+//         let request = core.client.get(address.http("/files/ingest-queues")?);
+//         let result = request.send().await?;
+//         let response: HashMap<FilterID, Vec<FileInfo>> = result.json().await?;
+//         for (filter, files) in response {
+//             for file in files {
+//                 active.insert(file.hash.clone(), (filter, IngestTask{info: file, response:vec![]}));
+//             }
+//         }
+//     }
 
-    info!("Ingest watcher for {id} initialized");
-    loop {
-        // Wait until something changes
-        tokio::select!{
-            // Watch for command messages
-            message = input.recv() => {
-                let message = match message {
-                    Some(message) => message,
-                    None => break Ok(())
-                };
+//     info!("Ingest watcher for {id} initialized");
+//     loop {
+//         // Wait until something changes
+//         tokio::select!{
+//             // Watch for command messages
+//             message = input.recv() => {
+//                 let message = match message {
+//                     Some(message) => message,
+//                     None => break Ok(())
+//                 };
 
-                match message {
-                    WorkerIngestMessage::IngestMessage((task, filter)) => {
-                        match active.entry(task.info.hash.clone()) {
-                            hash_map::Entry::Occupied(mut entry) => {
-                                let (old_filter, old_task) = entry.get_mut();
-                                if old_task.info.expiry < task.info.expiry {
-                                    *old_filter = filter;
-                                }
-                                old_task.merge(task);
-                            },
-                            hash_map::Entry::Vacant(entry) => { entry.insert((filter, task)); },
-                        }
-                    },
-                    WorkerIngestMessage::Status(resp) => {
-                        let mut count = HashMap::<FilterID, usize>::new();
-                        for (id, _) in active.values() {
-                            count.insert(*id, 1 + count.get(id).unwrap_or(&0));
-                        }
-                        let mut status = HashMap::<FilterID, IngestWatchStatus>::new();
-                        for (id, num) in count {
-                            status.insert(id, IngestWatchStatus {
-                                queue: num,
-                                per_minute: match counters.get_mut(&id){
-                                    Some(count) => count.value() as f64/((start.elapsed().as_secs_f64()/60.0).clamp(1.0, 60.0)),
-                                    None => 0.0,
-                                }
-                            });
-                        }
-                        _ = resp.send(status);
-                    },
-                    // WorkerIngestMessage::ListPending(resp) => {
-                    //     let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
-                    //     for (id, task) in active.values() {
-                    //         match count.entry(*id) {
-                    //             hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push(task.info.hash.clone()); },
-                    //             hash_map::Entry::Vacant(entry) => { entry.insert(vec![task.info.hash.clone()]); },
-                    //         }
-                    //     }
-                    //     _ = resp.send(count);
-                    // },
-                }
-            },
+//                 match message {
+//                     WorkerIngestMessage::IngestMessage((task, filter)) => {
+//                         match active.entry(task.info.hash.clone()) {
+//                             hash_map::Entry::Occupied(mut entry) => {
+//                                 let (old_filter, old_task) = entry.get_mut();
+//                                 if old_task.info.expiry < task.info.expiry {
+//                                     *old_filter = filter;
+//                                 }
+//                                 old_task.merge(task);
+//                             },
+//                             hash_map::Entry::Vacant(entry) => { entry.insert((filter, task)); },
+//                         }
+//                     },
+//                     WorkerIngestMessage::Status(resp) => {
+//                         let mut count = HashMap::<FilterID, usize>::new();
+//                         for (id, _) in active.values() {
+//                             count.insert(*id, 1 + count.get(id).unwrap_or(&0));
+//                         }
+//                         let mut status = HashMap::<FilterID, IngestWatchStatus>::new();
+//                         for (id, num) in count {
+//                             status.insert(id, IngestWatchStatus {
+//                                 queue: num,
+//                                 per_minute: match counters.get_mut(&id){
+//                                     Some(count) => count.value() as f64/((start.elapsed().as_secs_f64()/60.0).clamp(1.0, 60.0)),
+//                                     None => 0.0,
+//                                 }
+//                             });
+//                         }
+//                         _ = resp.send(status);
+//                     },
+//                     // WorkerIngestMessage::ListPending(resp) => {
+//                     //     let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
+//                     //     for (id, task) in active.values() {
+//                     //         match count.entry(*id) {
+//                     //             hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push(task.info.hash.clone()); },
+//                     //             hash_map::Entry::Vacant(entry) => { entry.insert(vec![task.info.hash.clone()]); },
+//                     //         }
+//                     //     }
+//                     //     _ = resp.send(count);
+//                     // },
+//                 }
+//             },
 
-            response = query.join_next(), if !query.is_empty() => {
-                debug!("response from {id}");
-                let response = match response {
-                    Some(response) => response,
-                    None => continue,
-                };
+//             response = query.join_next(), if !query.is_empty() => {
+//                 debug!("response from {id}");
+//                 let response = match response {
+//                     Some(response) => response,
+//                     None => continue,
+//                 };
 
-                let response: IngestFilesResponse = match response {
-                    Ok(Ok(resp)) => resp.json().await?,
-                    Ok(Err(err)) => {
-                        error!("Ingest error: {err}");
-                        continue;
-                    },
-                    Err(err) => {
-                        error!("Ingest error: {err}");
-                        continue;
-                    },
-                };
+//                 let response: IngestFilesResponse = match response {
+//                     Ok(Ok(resp)) => resp.json().await?,
+//                     Ok(Err(err)) => {
+//                         error!("Ingest error: {err}");
+//                         continue;
+//                     },
+//                     Err(err) => {
+//                         error!("Ingest error: {err}");
+//                         continue;
+//                     },
+//                 };
 
-                // Pull out the tasks that have been finished
-                debug!("response from {id}: process {} completed", response.completed.len());
-                for (targets, response_value) in [(response.completed, true), (response.rejected, false)] {
-                    for (targeted_filter, hash) in targets {
-                        if let Some((filter, task)) = active.remove(&hash) {
-                            // its possible for a file to be queued for multiple filters when the expiry date
-                            // moves, so if the filter id doesn't match, we have sent it twice for different days
-                            // and this isn't the one we are waiting for
-                            if filter != targeted_filter {
-                                continue
-                            }
-                            // Otherwise this is the filter we are waiting for send a response to all waiters
-                            for response in task.response {
-                                _ = response.send(Ok(response_value));
-                            }
-                            match counters.entry(filter) {
-                                hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
-                                hash_map::Entry::Vacant(entry) => {
-                                    let mut counter = crate::counters::WindowCounter::new(60 * 60);
-                                    counter.increment(1);
-                                    entry.insert(counter);
-                                },
-                            }
-                        }
-                    }
-                }
+//                 // Pull out the tasks that have been finished
+//                 debug!("response from {id}: process {} completed", response.completed.len());
+//                 for (targets, response_value) in [(response.completed, true), (response.rejected, false)] {
+//                     for (targeted_filter, hash) in targets {
+//                         if let Some((filter, task)) = active.remove(&hash) {
+//                             // its possible for a file to be queued for multiple filters when the expiry date
+//                             // moves, so if the filter id doesn't match, we have sent it twice for different days
+//                             // and this isn't the one we are waiting for
+//                             if filter != targeted_filter {
+//                                 continue
+//                             }
+//                             // Otherwise this is the filter we are waiting for send a response to all waiters
+//                             for response in task.response {
+//                                 _ = response.send(Ok(response_value));
+//                             }
+//                             match counters.entry(filter) {
+//                                 hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
+//                                 hash_map::Entry::Vacant(entry) => {
+//                                     let mut counter = crate::counters::WindowCounter::new(60 * 60);
+//                                     counter.increment(1);
+//                                     entry.insert(counter);
+//                                 },
+//                             }
+//                         }
+//                     }
+//                 }
 
-                // for (targeted_filter, hash) in response.rejected {
-                //     if let Some((filter, task)) = active.remove(&hash) {
-                //         // its possible for a file to be queued for multiple filters when the expiry date
-                //         // moves, so if the filter id doesn't match, we have sent it twice for different days
-                //         // and this isn't the one we are waiting for
-                //         if filter != targeted_filter {
-                //             continue
-                //         }
-                //         // Otherwise this is the filter we are waiting for send a response to all waiters
-                //         for response in task.response {
-                //             _ = response.send(Ok(false));
-                //         }
-                //         match counters.entry(filter) {
-                //             hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
-                //             hash_map::Entry::Vacant(entry) => {
-                //                 let mut counter = crate::counters::WindowCounter::new(60 * 60);
-                //                 counter.increment(1);
-                //                 entry.insert(counter);
-                //             },
-                //         }
-                //     }
-                // }
+//                 if response.storage_pressure {
+//                     continue
+//                 }
 
+//                 // Check if there is room in existing filters
+//                 debug!("response from {id}: check existing");
+//                 let mut backlocked_groups = vec![];
+//                 {
+//                     let mut filter_pending = response.filter_pending;
+//                     let mut unassigned = core.pending_assignments.write().await;
+//                     for (group, queue) in unassigned.iter_mut() {
+//                         if queue.is_empty() {
+//                             continue
+//                         }
+//                         for filter in response.expiry_groups.get(group).unwrap_or(&vec![]) {
+//                             if response.filter_size.get(filter).unwrap_or(&u64::MAX) >= &core.config.filter_item_limit {
+//                                 continue
+//                             }
 
-                if response.storage_pressure {
-                    continue
-                }
+//                             if let Some(pending) = filter_pending.get_mut(filter) {
+//                                 while pending.len() < core.config.per_filter_pending_limit as usize {
+//                                     match queue.pop_front() {
+//                                         Some(task) => {
+//                                             pending.insert(task.info.hash.clone());
+//                                             active.insert(task.info.hash.clone(), (*filter, task));
+//                                         },
+//                                         None => break
+//                                     }
+//                                 }
+//                             }
+//                         }
+//                         if !queue.is_empty() {
+//                             backlocked_groups.push(group.clone());
+//                         }
+//                     }
+//                 }
 
-                // Check if there is room in existing filters
-                debug!("response from {id}: check existing");
-                let mut backlocked_groups = vec![];
-                {
-                    let mut filter_pending = response.filter_pending;
-                    let mut unassigned = core.pending_assignments.write().await;
-                    for (group, queue) in unassigned.iter_mut() {
-                        if queue.is_empty() {
-                            continue
-                        }
-                        for filter in response.expiry_groups.get(group).unwrap_or(&vec![]) {
-                            if response.filter_size.get(filter).unwrap_or(&u64::MAX) >= &core.config.filter_item_limit {
-                                continue
-                            }
+//                 let mut last_id = FilterID::NULL;
+//                 for ids in response.expiry_groups.values() {
+//                     for id in ids {
+//                         last_id = last_id.max(*id);
+//                     }
+//                 }
 
-                            if let Some(pending) = filter_pending.get_mut(filter) {
-                                while pending.len() < core.config.per_filter_pending_limit as usize {
-                                    match queue.pop_front() {
-                                        Some(task) => {
-                                            pending.insert(task.info.hash.clone());
-                                            active.insert(task.info.hash.clone(), (*filter, task));
-                                        },
-                                        None => break
-                                    }
-                                }
-                            }
-                        }
-                        if !queue.is_empty() {
-                            backlocked_groups.push(group.clone());
-                        }
-                    }
-                }
+//                 // Check if any of the expiry groups we couldn't fit in existing filters can take more filters
+//                 debug!("response from {id}: check backlogs");
+//                 'groups: for group in backlocked_groups {
+//                     for limit in 0..core.config.per_worker_group_duplication {
+//                         if response.expiry_groups.get(&group).unwrap_or(&vec![]).len() <= limit as usize {
+//                             last_id = last_id.next();
+//                             debug!("response from {id}: create filter {last_id}");
+//                             core.client.put(address.http("/index/create")?)
+//                             .json(&CreateIndexRequest {
+//                                 filter_id: last_id,
+//                                 expiry: group,
+//                             })
+//                             .send().await?;
+//                             continue 'groups
+//                         }
+//                     }
+//                 }
 
-                let mut last_id = FilterID::NULL;
-                for ids in response.expiry_groups.values() {
-                    for id in ids {
-                        last_id = last_id.max(*id);
-                    }
-                }
+//                 debug!("response from {id}: finished result");
+//             },
+//             _ = query_interval.tick() => {
+//                 // Pull out expired tasks
+//                 let today = ExpiryGroup::today();
+//                 for hash in active.keys().cloned().collect_vec() {
+//                     if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
+//                         if entry.get().1.info.expiry <= today {
+//                             let (_, task) = entry.remove();
+//                             for resp in task.response {
+//                                 _ = resp.send(Ok(false));
+//                             }
+//                         }
+//                     }
+//                 }
 
-                // Check if any of the expiry groups we couldn't fit in existing filters can take more filters
-                debug!("response from {id}: check backlogs");
-                'groups: for group in backlocked_groups {
-                    for limit in 0..core.config.per_worker_group_duplication {
-                        if response.expiry_groups.get(&group).unwrap_or(&vec![]).len() <= limit as usize {
-                            last_id = last_id.next();
-                            debug!("response from {id}: create filter {last_id}");
-                            core.client.put(address.http("/index/create")?)
-                            .json(&CreateIndexRequest {
-                                filter_id: last_id,
-                                expiry: group,
-                            })
-                            .send().await?;
-                            continue 'groups
-                        }
-                    }
-                }
+//                 // Only one query at a time
+//                 if !query.is_empty() {
+//                     continue
+//                 }
 
-                debug!("response from {id}: finished result");
-            },
-            _ = query_interval.tick() => {
-                // Pull out expired tasks
-                let today = ExpiryGroup::today();
-                for hash in active.keys().cloned().collect_vec() {
-                    if let hash_map::Entry::Occupied(entry) = active.entry(hash) {
-                        if entry.get().1.info.expiry <= today {
-                            let (_, task) = entry.remove();
-                            for resp in task.response {
-                                _ = resp.send(Ok(false));
-                            }
-                        }
-                    }
-                }
+//                 // Check if there is work
+//                 if active.is_empty() && core.pending_assignments.read().await.is_empty() {
+//                     continue
+//                 }
 
-                // Only one query at a time
-                if !query.is_empty() {
-                    continue
-                }
-
-                // Check if there is work
-                if active.is_empty() && core.pending_assignments.read().await.is_empty() {
-                    continue
-                }
-
-                //
-                let request = core.client.post(address.http("/files/ingest")?)
-                .json(&IngestFilesRequest{
-                    files: active.values().map(|(filter, task)|{
-                        (*filter, task.info.clone())
-                    }).collect_vec()
-                });
-                query.spawn(async move {
-                    let result = request.send().await?;
-                    anyhow::Ok(result)
-                });
-            }
-        }
-    }
-}
+//                 //
+//                 let request = core.client.post(address.http("/files/ingest")?)
+//                 .json(&IngestFilesRequest{
+//                     files: active.values().map(|(filter, task)|{
+//                         (*filter, task.info.clone())
+//                     }).collect_vec()
+//                 });
+//                 query.spawn(async move {
+//                     let result = request.send().await?;
+//                     anyhow::Ok(result)
+//                 });
+//             }
+//         }
+//     }
+// }
 
 /// Message to interact with search worker
 pub enum SearcherMessage {
