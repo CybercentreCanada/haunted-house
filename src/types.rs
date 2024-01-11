@@ -11,6 +11,8 @@ use crate::access::AccessControl;
 use crate::error::ErrorKinds;
 
 
+pub type JsonMap = serde_json::Map<String, serde_json::Value>;
+
 /// A binary representation of a 256 bit hash. Heap allocated.
 #[derive(SerializeDisplay, DeserializeFromStr, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub struct Sha256(Box<[u8; 32]>);

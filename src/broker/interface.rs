@@ -517,7 +517,7 @@ pub (crate) struct FilterStatus {
 pub (crate) struct StatusReport {
     /// Status of the check stage of ingestion
     pub ingest_check: IngestCheckStatus,
-    pub fetcher: Option<FetchStatus>,
+    pub fetcher: FetchStatus,
     /// Status for the per-worker ingestion watcher
     pub ingest_watchers: HashMap<WorkerID, HashMap<FilterID, IngestWatchStatus>>,
     /// Number of active searches

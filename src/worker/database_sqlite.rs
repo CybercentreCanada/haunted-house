@@ -231,9 +231,9 @@ impl BufferedSQLite {
                 }
 
                 for x in collectors {
-                    x.await;
+                    x.await??;
                 }
-                response.send(Ok(()));
+                _ = response.send(Ok(()));
             },
         };
         Ok(())

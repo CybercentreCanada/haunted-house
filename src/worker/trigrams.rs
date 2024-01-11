@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::iter::Peekable;
 
 use anyhow::Result;
-use aws_config::retry::ErrorKind;
 use log::error;
 use tokio::sync::{Semaphore, RwLock};
 use tokio::task::JoinHandle;

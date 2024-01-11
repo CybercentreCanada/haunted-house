@@ -128,33 +128,35 @@ pub struct FieldExtractor(Vec<String>);
 
 /// Pull file information from an assemblyline server
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AssemblylineConfig {
+#[serde(default)]
+pub struct Datastore {
     /// Url to connect to elasticsearch server
     pub url: String,
-    /// Username to authenticate with
-    pub username: String,
-    /// API key to authenticate with
-    pub apikey: String,
-    /// CA certificate to talk to assemblyline
-    #[serde(default)]
-    pub tls: assemblyline_client::TLSSettings,
     /// Seconds between polling calls to fetch more file data
-    #[serde(default="default_poll_interval")]
     pub poll_interval: f64,
     /// Maximum number of pending ingestion tasks
-    #[serde(default="default_concurrent_tasks")]
     pub concurrent_tasks: usize,
     /// How many items to get from assemblyline interface with each call
-    #[serde(default="default_batch_size")]
     pub batch_size: usize,
+
+    pub ca_cert: Option<String>,
+
+    pub connect_unsafe: bool,
 }
 
-/// default value for poll_interval
-fn default_poll_interval() -> f64 { 5.0 }
-/// default value for concurrent_tasks
-fn default_concurrent_tasks() -> usize { 30000 }
-/// default value for batch_size
-fn default_batch_size() -> usize { 2000 }
+impl Default for Datastore {
+    fn default() -> Self {
+        Self { 
+            url: Default::default(), 
+            poll_interval: 5.0, 
+            concurrent_tasks: 30000, 
+            batch_size: 2000, 
+            ca_cert: None, 
+            connect_unsafe: false 
+        }
+    }
+}
+
 /// default value for per_filter_pending_limit
 fn default_per_filter_pending_limit() -> u64 { 1000 }
 /// default value for per_worker_group_duplication
@@ -180,8 +182,12 @@ pub struct BrokerSettings {
     /// TLS settings for the outward facing API
     pub tls: Option<TLSConfig>,
 
+    pub datastore: Datastore,
+    pub classification_path: Option<PathBuf>,
+    pub classification: Option<String>,
+
     /// Configuration for the assemblyline system to tie into
-    pub assemblyline: Option<AssemblylineConfig>,
+    // pub assemblyline: Option<AssemblylineConfig>,
 
     /// List of workers controlled by the broker server
     pub workers: HashMap<WorkerID, WorkerAddress>,
@@ -217,7 +223,9 @@ impl Default for BrokerSettings {
             workers: [
                 (WorkerID::from("worker-1".to_owned()), WorkerAddress::from("worker-0:4000"))
             ].into(),
-            assemblyline: None,
+            datastore: Datastore::default(),
+            classification_path: None,
+            classification: None,
             worker_certificate: WorkerTLSConfig::AllowAll,
             filter_item_limit: default_filter_item_limit(),
             per_filter_pending_limit: default_per_filter_pending_limit(),
@@ -227,6 +235,18 @@ impl Default for BrokerSettings {
             yara_batch_size: default_yara_batch_size(),
             bind_address: Some("localhost:4443".to_owned()),
             tls: None
+        }
+    }
+}
+
+impl BrokerSettings {
+    pub fn load_classification_config(&self) -> Result<String> {
+        if let Some(classification) = &self.classification {
+            Ok(classification.clone())
+        } else if let Some(path) = &self.classification_path {
+            Ok(std::fs::read_to_string(path)?)
+        } else {
+            Err(crate::error::ErrorKinds::ClassificationConfigurationMissing.into())
         }
     }
 }

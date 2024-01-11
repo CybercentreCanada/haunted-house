@@ -10,19 +10,21 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use log::{error, info};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
-use assemblyline_client::{Client, JsonMap};
 
-use crate::config::AssemblylineConfig;
+use crate::error::ErrorKinds;
+use crate::types::JsonMap;
 use super::{HouseCore, FetchStatus, FetchControlMessage};
 
 /// Pull files from an assemblyline system
-pub (crate) async fn fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig, recv: mpsc::Receiver<FetchControlMessage>) {
+pub (crate) async fn fetch_agent(core: Arc<HouseCore>, recv: mpsc::Receiver<FetchControlMessage>) {
     let recv = Arc::new(Mutex::new(recv));
     loop {
-        match tokio::spawn(_fetch_agent(core.clone(), client.clone(), config.clone(), recv.clone())).await {
+        match tokio::spawn(_fetch_agent(core.clone(), recv.clone())).await {
             Ok(Ok(())) => break,
             Ok(Err(err)) => error!("Error in the fetch agent: {err}"),
             Err(err) => error!("Error in the fetch agent: {err}"),
@@ -81,9 +83,14 @@ struct PendingInfo {
 
 
 /// implementation loop to fetch files from assemblyline
-async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: AssemblylineConfig, control: Arc<Mutex<mpsc::Receiver<FetchControlMessage>>>) -> Result<()> {
+async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<FetchControlMessage>>>) -> Result<()> {
     let mut control = control.lock().await;
     info!("Fetch agent starting");
+
+    // connect to elasticsearch
+    let config = core.config.datastore.clone();
+    let client = Elastic::new(&config.url, config.ca_cert.as_deref(), config.connect_unsafe)?;
+    
     //
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
@@ -94,13 +101,12 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
     let mut search_counter = crate::counters::WindowCounter::new(60);
     let mut throughput_counter = crate::counters::WindowCounter::new(60);
     let mut retry_counter = crate::counters::WindowCounter::new(60);
-    let mut last_fetch_rows = 0;
+    let mut last_fetch_rows: i64 = 0;
 
-    // Get checkpoint for this source.
     // The checkpoint represents the earliest value for the seen.last field where
     // ALL unprocessed file entries must occur after this point. Many PROCESSED
     // entries may also occur after this point.
-    let mut checkpoint: DateTime<Utc> = core.get_checkpoint(&config).await?;
+    let mut checkpoint: DateTime<Utc> = core.get_checkpoint().await?;
 
     loop {
         // Update the checkpoint if needed
@@ -115,7 +121,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
             }
         }
         if old_checkpoint != checkpoint {
-            core.set_checkpoint(&config, checkpoint).await?;
+            core.set_checkpoint(checkpoint).await?;
         }
         while recent.len() > 100_000 {
             recent.pop_first();
@@ -131,20 +137,10 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
             };
 
             search_counter.increment(1);
-            let result = client.search
-                .file(format!("seen.last: [{} TO *]", seek_point.to_rfc3339()))
-                .sort("seen.last asc".to_owned())
-                .rows(config.batch_size)
-                .use_archive(true)
-                .field_list("classification,expiry_ts,sha256,seen.last".to_owned())
-                .search().await?;
-            last_fetch_rows = result.rows;
+            let result = client.fetch_files(seek_point, config.batch_size).await?;
+            last_fetch_rows = result.len() as i64;
 
-            for item in result.items {
-                let file = match FetchedFile::extract(&item) {
-                    Some(file) => file,
-                    None => continue,
-                };
+            for file in result {
                 if recent.contains(&file) {
                     continue
                 }
@@ -213,3 +209,133 @@ async fn _fetch_agent(core: Arc<HouseCore>, client: Arc<Client>, config: Assembl
         }
     }
 }
+
+
+#[derive(Deserialize)]
+struct SearchResult {
+    // took: u64,
+    timed_out: bool,
+    hits: SearchResultHits
+}
+
+#[derive(Deserialize)]
+struct SearchResultHits {
+    // total: SearchResultHitTotals,
+    // max_score: f64,
+    hits: Vec<SearchResultHitItem>,
+}
+
+// #[derive(Deserialize)]
+// struct SearchResultHitTotals {
+//     value: i64,
+//     relation: String,
+// }
+
+#[derive(Deserialize)]
+struct SearchResultHitItem {
+    _index: String,
+    _id: String,
+    _score: f64,
+    fields: JsonMap,
+}
+
+struct Elastic {
+    client: reqwest::Client,
+    host: reqwest::Url,
+}
+
+
+impl Elastic {
+
+    fn new(host: &str, ca_cert: Option<&str>, connect_unsafe: bool) -> Result<Self> {
+
+        let mut builder = reqwest::Client::builder();
+
+        if let Some(ca_cert) = ca_cert {
+            let cert = reqwest::Certificate::from_pem(ca_cert.as_bytes())?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        if connect_unsafe {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        Ok(Self {
+            client: builder.build()?,
+            host: host.parse()?,
+        })
+    }
+
+    async fn fetch_files(&self, seek_point: chrono::DateTime<chrono::Utc>, batch_size: usize) -> Result<Vec<FetchedFile>> {
+        let path = "file,file-hot/_search";
+        let mut attempt: u64 = 0;
+        const MAX_DELAY: std::time::Duration = Duration::from_secs(60);
+
+        loop {
+            attempt += 1;
+
+            // Build and dispatch the request
+            let result = self.client.request(reqwest::Method::GET, self.host.join(path)?)
+            .json(&json!({
+                "query": {
+                    "bool": {
+                        "must": {
+                            "query_string": {
+                                "query": format!("seen.last: [{} TO *]", seek_point.to_rfc3339())
+                            }
+                        },
+                        // 'filter': filter_queries
+                    }
+                },
+                "size": batch_size,
+                "sort": "seen.last:asc",
+                "fields": "classification,expiry_ts,sha256,seen.last"
+            })).send().await;
+
+            // Handle connection errors with a retry, let other non http errors bubble up
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => {
+                    // always retry for connect and timeout errors
+                    if err.is_connect() || err.is_timeout() {
+                        error!("Error connecting to datastore: {err}");
+                        let delay = MAX_DELAY.min(Duration::from_secs_f64((attempt as f64).powf(2.0)/5.0));
+                        tokio::time::sleep(delay).await;
+                        continue
+                    }
+
+                    return Err(err.into())
+                },
+            };
+
+            // Handle server side http status errors with retry, let other error codes bubble up, decode successful bodies
+            let status = response.status();
+            let body: SearchResult = match response.error_for_status() {
+                Ok(response) => response.json().await?,
+                Err(err) => {
+                    if status.is_server_error() {
+                        error!("Server error in datastore: {err}");
+                        let delay = MAX_DELAY.min(Duration::from_secs_f64((attempt as f64).powf(2.0)/5.0));
+                        tokio::time::sleep(delay).await;
+                        continue                        
+                    }
+
+                    return Err(err.into())
+                },
+            };
+
+            // read the body of our response
+            let mut out = vec![];
+            if body.timed_out {
+                continue
+            }
+            for row in body.hits.hits {
+                out.push(FetchedFile::extract(&row.fields).ok_or(ErrorKinds::MalformedResponse)?)
+            }
+            return Ok(out)
+        }
+        
+        
+    }
+}
+

@@ -41,6 +41,10 @@ pub enum ErrorKinds {
     CouldNotParseAccessStringTrailing(String, String),
     /// Yara signature error
     YaraRuleError(String),
+    /// An API call returned a response that is considered malformed
+    MalformedResponse,
+    /// No configuration for the classification system was given
+    ClassificationConfigurationMissing
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -124,7 +128,7 @@ impl From<boreal_parser::error::Error> for ErrorKinds {
 }
 
 impl From<tokio::sync::AcquireError> for ErrorKinds {
-    fn from(value: tokio::sync::AcquireError) -> Self {
+    fn from(_value: tokio::sync::AcquireError) -> Self {
         Self::TokioResourceClosed
     }
 }
