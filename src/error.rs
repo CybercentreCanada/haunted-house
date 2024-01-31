@@ -35,6 +35,8 @@ pub enum ErrorKinds {
     ChannelError(String),
     /// Error raised when a tokio resource has shut down
     TokioResourceClosed,
+    /// No configuration for the classification system was given
+    ClassificationConfigurationError(String),
     /// An access control could not be parsed from the given string
     CouldNotParseAccessString(String, String),
     /// An access control could not be parsed from the given string because part of the string couldn't be consumed
@@ -43,8 +45,6 @@ pub enum ErrorKinds {
     YaraRuleError(String),
     /// An API call returned a response that is considered malformed
     MalformedResponse,
-    /// No configuration for the classification system was given
-    ClassificationConfigurationMissing
 }
 
 impl std::fmt::Display for ErrorKinds {
@@ -133,6 +133,18 @@ impl From<tokio::sync::AcquireError> for ErrorKinds {
     }
 }
 
+impl From<assemblyline_markings::errors::Errors> for ErrorKinds {
+    fn from(value: assemblyline_markings::errors::Errors) -> Self {
+        use assemblyline_markings::errors::Errors::*;
+        match value {
+            InvalidClassification(err) => Self::CouldNotParseAccessString("".to_owned(), err),
+            InvalidDefinition(err) => Self::ClassificationConfigurationError(err),
+            ClassificationNameEmpty => Self::CouldNotParseAccessString("".to_owned(), "name empty".to_owned()),
+        }
+    }
+}
+
+
 impl poem::error::ResponseError for ErrorKinds {
     fn status(&self) -> http::StatusCode {
         http::StatusCode::INTERNAL_SERVER_ERROR
@@ -141,3 +153,9 @@ impl poem::error::ResponseError for ErrorKinds {
 
 /// A result that always uses the crate's error type
 pub type Result<T> = std::result::Result<T, ErrorKinds>;
+
+
+pub trait Context {
+    fn context(self, message: &str) -> Self;
+}
+

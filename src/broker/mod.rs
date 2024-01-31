@@ -3,10 +3,9 @@
 //!
 pub mod interface;
 pub mod auth;
-mod database;
-mod database_sqlite;
 mod fetcher;
 mod yara_query;
+mod elastic;
 
 use std::collections::{HashSet, HashMap, hash_map, BTreeSet, VecDeque};
 use std::str::FromStr;
@@ -14,6 +13,8 @@ use std::sync::Arc;
 
 use assemblyline_markings::classification::ClassificationParser;
 use assemblyline_markings::config::ClassificationConfig;
+use assemblyline_models::ExpandingClassification;
+use assemblyline_models::datastore::retrohunt as models;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, SinkExt};
 use itertools::Itertools;
@@ -24,40 +25,39 @@ use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::{Serialize, Deserialize};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock, watch};
 use anyhow::{Result, Context};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::access::AccessControl;
-use crate::broker::interface::{SearchRequestResponse, SearchProgress};
+use crate::broker::elastic::Elastic;
 use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig};
+use crate::query::Query;
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
 use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, CreateIndexRequest, IngestFilesRequest, IngestFilesResponse, FilterSearchRequest, FilterSearchResponse, YaraSearchResponse};
 
 use self::auth::Authenticator;
-use self::database::Database;
-use self::interface::{InternalSearchStatus, SearchRequest, StatusReport, FilterStatus};
+use self::interface::{SearchRequest, StatusReport, FilterStatus, SearchProgress};
+use self::yara_query::parse_yara_signature;
 
 /// Entry point function to the broker
-pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
+pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
     // Initialize authenticator
     info!("Initializing Authenticator");
     let auth = Authenticator::from_config(config.authentication.clone())?;
 
     // Initialize database
     info!("Connecting to database.");
-    let database = match &config.database {
-        crate::config::Database::SQLite{path} => Database::new_sqlite(path).await?,
-        crate::config::Database::SQLiteTemp{..} => Database::new_sqlite_temp().await?,
-    };
+    let ec = &config.datastore;
+    let client = Elastic::new(&ec.url, ec.ca_cert.as_deref(), ec.connect_unsafe, ec.archive_access)?;
 
     // Start server core
     info!("Starting server core.");
-    let core = HouseCore::new(database,auth, config.clone()).await
+    let core = HouseCore::new(client,auth, config.clone()).await
         .context("Error launching core.")?;
 
     // Start http interface
@@ -76,7 +76,7 @@ pub async fn main(config: crate::config::BrokerSettings) -> Result<()> {
 /// Bundle of values tracking a search
 /// The handle for the search task
 /// the channel for communicating with that task
-type SearchInfo = (JoinHandle<()>, mpsc::Sender<SearcherMessage>);
+type SearchInfo = (JoinHandle<()>, watch::Receiver<SearchProgress>);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FetchStatus {
@@ -97,7 +97,7 @@ pub enum FetchControlMessage {
 /// Information encapsulating the broker state
 pub struct HouseCore {
     /// Connection to the database where searches are stored
-    pub database: Database,
+    pub database: Elastic,
     /// HTTP client for talking to workers
     pub client: ClientWithMiddleware,
     /// Websocket connector info for connecting to workers
@@ -107,7 +107,7 @@ pub struct HouseCore {
     /// configuration information tuning the system behaviour
     pub config: BrokerSettings,
     /// Classification engine if that configuration was available
-    pub access_engine: ClassificationParser,
+    pub access_engine: Arc<ClassificationParser>,
     /// Queue of files waiting to be ingested
     pub ingest_queue: mpsc::UnboundedSender<IngestMessage>,
     /// Queue of files waiting to be ingested
@@ -124,7 +124,7 @@ pub struct HouseCore {
 
 impl HouseCore {
     /// Start the broker server
-    pub async fn new(database: Database, authenticator: Authenticator, config: BrokerSettings) -> Result<Arc<Self>> {
+    pub (crate) async fn new(database: Elastic, authenticator: Authenticator, config: BrokerSettings) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         // setup pool for yara assignments
@@ -178,12 +178,10 @@ impl HouseCore {
         );
 
         // Load classification system
-        let definition = config.load_classification_config()?;
-        let classification: ClassificationConfig = serde_json::from_str(&definition).unwrap();
+        let access_engine = config.classification.init()?;
 
         // Build a classification engine
         let (fetch_send, fetch_recv) = mpsc::channel(64);
-        let access_engine = ClassificationParser::new(classification)?;
 
         // Create core object
         let core = Arc::new(Self {
@@ -205,10 +203,13 @@ impl HouseCore {
         {
             info!("Starting search workers");
             let mut searches = core.running_searches.write().await;
-            for code in core.database.list_active_searches().await? {
-                let (send, recv) = mpsc::channel(64);
-                let handle = tokio::task::spawn(search_worker(core.clone(), recv, code.clone()));
-                searches.insert(code, (handle, send));
+            for mut search in core.database.list_active_searches().await? {
+                let (send, recv) = watch::channel(SearchProgress::Starting {  });
+                let code = search.key.clone();
+                search.started_time = chrono::Utc::now();
+                core.database.save_search(&search).await?;
+                let handle = tokio::task::spawn(search_worker(core.clone(), send, search));
+                searches.insert(code, (handle, recv));
             }
         }
 
@@ -236,17 +237,46 @@ impl HouseCore {
     }
 
     /// Initialize a search in the database and start the process
-    pub async fn initialize_search(self: &Arc<Self>, req: SearchRequest) -> Result<InternalSearchStatus> {
+    pub (crate) async fn initialize_search(self: &Arc<Self>, req: SearchRequest) -> Result<String> {
+        let (query, warnings) = parse_yara_signature(&req.yara_signature)?;
+        self.prepare_access(req.search_classification.as_str())?;
+
+        let (start_group, end_group) = match req.indices {
+            models::IndexCatagory::Hot => (ExpiryGroup::min(), ExpiryGroup::before_archive()),
+            models::IndexCatagory::Archive => (ExpiryGroup::before_archive(), ExpiryGroup::max()),
+            models::IndexCatagory::HotAndArchive => (ExpiryGroup::min(), ExpiryGroup::max()),
+        };
+
         // Create a record for the search
         let code = hex::encode(uuid::Uuid::new_v4().as_bytes());
-        let res = self.database.initialize_search(&code, &req).await?;
+        let search = models::Retrohunt {
+            indices: req.indices,
+            classification: ExpandingClassification::new(req.classification.as_str().to_owned())?,
+            search_classification: req.search_classification,
+            creator: req.creator,
+            description: assemblyline_models::Text(req.description),
+            expiry_ts: req.expiry_ts,
+            start_group: start_group.to_u32(),
+            end_group: end_group.to_u32(),
+            created_time: chrono::Utc::now(),
+            started_time: chrono::Utc::now(),
+            completed_time: None,
+            key: code.clone(),
+            raw_query: serde_json::to_string(&query)?,
+            yara_signature: req.yara_signature,
+            errors: vec![],
+            warnings,
+            finished: false,
+            truncated: false,
+        };
+        self.database.save_search(&search).await?;
 
         // Start the search worker
         let mut searches = self.running_searches.write().await;
-        let (send, recv) = mpsc::channel(64);
-        let handle = tokio::task::spawn(search_worker(self.clone(), recv, code.clone()));
-        searches.insert(code, (handle, send));
-        return Ok(res)
+        let (send, recv) = watch::channel(SearchProgress::Starting {  });
+        let handle = tokio::task::spawn(search_worker(self.clone(), send, search));
+        searches.insert(code.clone(), (handle, recv));
+        return Ok(code)
     }
 
     /// Parse a classification string as user access flags
@@ -319,6 +349,7 @@ impl HouseCore {
             info: FileInfo{
                 hash: Sha256::from_str(&file.sha256)?,
                 access: self.prepare_classification(&file.classification)?,
+                access_string: file.classification.clone(),
                 expiry: ExpiryGroup::create(&file.expiry)
             },
             response: vec![send]
@@ -327,16 +358,23 @@ impl HouseCore {
     }
 
     /// Get the date to resume reading file records from
-    pub async fn get_checkpoint(&self) -> Result<DateTime<Utc>> {
-        Ok(match self.database.fetch_value("checkpoint").await? {
-            Some(value) => DateTime::parse_from_rfc3339(&String::from_utf8(value)?)?.into(),
-            None => DateTime::<Utc>::MIN_UTC,
+    pub (crate) async fn get_checkpoint(&self) -> Result<DateTime<Utc>> {
+        Ok(match tokio::fs::read_to_string(self.config.runtime_config_file()).await {
+            Ok(value) => DateTime::parse_from_rfc3339(&value)?.into(),
+            Err(err) => {
+                if let std::io::ErrorKind::NotFound = err.kind() {
+                    DateTime::<Utc>::MIN_UTC
+                } else {
+                    return Err(err.into())
+                }
+            },
         })
     }
 
     /// Set the date checkpoint for reading files
-    pub async fn set_checkpoint(&self, checkpoint: DateTime<Utc>) -> Result<()> {
-        self.database.store_value("checkpoint", checkpoint.to_rfc3339().as_bytes()).await
+    pub (crate) async fn set_checkpoint(&self, checkpoint: DateTime<Utc>) -> Result<()> {
+        tokio::fs::write(self.config.runtime_config_file(), checkpoint.to_rfc3339()).await?;
+        Ok(())
     }
 
     /// Send a task directly to a watcher for a particular worker.
@@ -345,38 +383,38 @@ impl HouseCore {
     /// Worker watchers are responsible for selecting their own tasks, this is used
     /// when a file is seen repeatedly and a watcher needs to be notified about a second task
     /// pointing at the same file
-    pub async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
+    pub (crate) async fn send_to_ingest_watcher(self: &Arc<Self>, worker: &WorkerID, task: IngestTask, filter_id: FilterID) -> Result<()> {
         let workers = self.worker_ingest.read().await;
         let channel = workers.get(worker).ok_or_else(|| anyhow::anyhow!("Worker list out of sync"))?;
         channel.send(WorkerIngestMessage::IngestMessage((task, filter_id)))?;
         return Ok(())
     }
 
-    /// Check the status of a search.
-    pub async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
-        // Try to find/probe a worker currently processing this search
-        let channel = {
-            let searches = self.running_searches.read().await;
-            if let Some((_, search)) = searches.get(&code) {
-                let (send, recv) = oneshot::channel();
-                _ = search.send(SearcherMessage::Status(send)).await;
-                Some(recv)
-            } else {
-                None
-            }
-        };
+    // /// Check the status of a search.
+    // pub (crate) async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
+    //     // Try to find/probe a worker currently processing this search
+    //     let channel = {
+    //         let searches = self.running_searches.read().await;
+    //         if let Some((_, search)) = searches.get(&code) {
+    //             let (send, recv) = oneshot::channel();
+    //             _ = search.send(SearcherMessage::Status(send)).await;
+    //             Some(recv)
+    //         } else {
+    //             None
+    //         }
+    //     };
 
-        // if a worker was found, wait for it's response
-        if let Some(recv) = channel {
-            match recv.await {
-                Ok(status) => return Ok(Some(status)),
-                Err(err) => { error!("{err}"); },
-            }
-        }
+    //     // if a worker was found, wait for it's response
+    //     if let Some(recv) = channel {
+    //         match recv.await {
+    //             Ok(status) => return Ok(Some(status)),
+    //             Err(err) => { error!("{err}"); },
+    //         }
+    //     }
 
-        // no worker found, fall back to reading results from the database
-        self.database.search_status(&code).await
-    }
+    //     // no worker found, fall back to reading results from the database
+    //     self.database.search_status(&code).await
+    // }
 
     /// Read the status of the system including all workers
     pub (crate) async fn status(self: &Arc<Self>) -> Result<StatusReport> {
@@ -972,43 +1010,59 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
     }
 }
 
-/// Message to interact with search worker
-pub enum SearcherMessage {
-    /// Request a status update from the search worker
-    Status(oneshot::Sender<InternalSearchStatus>)
-}
-
 /// Entrypoint for the search worker
-async fn search_worker(core: Arc<HouseCore>, mut input: mpsc::Receiver<SearcherMessage>, code: String) {
+async fn search_worker(core: Arc<HouseCore>, mut progress: watch::Sender<SearchProgress>, mut status: models::Retrohunt) {
     // Keep restarting the search until it completes
-    while let Err(err) = _search_worker(core.clone(), &mut input, &code).await {
+    while let Err(err) = _search_worker(core.clone(), &mut progress, &mut status).await {
         error!("Crash in search: {err}")
     }
+    _ = progress.send(SearchProgress::Finished { search: status });
 }
 
 /// impl for above
-async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<SearcherMessage>, code: &str) -> Result<()> {
+async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sender<SearchProgress>, status: &mut models::Retrohunt) -> Result<()> {
+    let code = status.key.clone();
     info!("Search {code}: Starting");
-    // Load the search status
-    let status = match core.database.search_record(code).await? {
-        Some(status) => status,
-        None => return Ok(()),
-    };
     if status.finished {
         return Ok(())
     }
 
+    // Make sure the search is initialized
+    let query: Query = match serde_json::from_str(&status.raw_query) {
+        Ok(query) => query,
+        Err(err) => {
+            core.database.fatal_error(status, format!("Could not load query: {err}")).await?;
+            return Ok(())
+        }
+    };
+    let start_group = ExpiryGroup::from(status.start_group);
+    let end_group = ExpiryGroup::from(status.end_group);
+    let search_view = match core.prepare_access(status.search_classification.as_str()) {
+        Ok(view) => view,
+        Err(err) => {
+            core.database.fatal_error(status, err.to_string()).await?;
+            return Ok(())
+        },
+    };
+
+    // Limit how often we update the progress watch, useless to do too often
+    let mut last_progress = std::time::Instant::now();
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
     // Open a connection for each worker
     info!("Search {code}: Filtering");
+    progress_sender.send(SearchProgress::Filtering { progress: 0.0 })?;
     let request_body = serde_json::to_string(&FilterSearchRequest{
-        expiry_group_range: (status.start_date.clone(), status.end_date.clone()),
-        query: status.query.clone(),
-        access: status.access.clone(),
+        expiry_group_range: (start_group, end_group),
+        query,
+        access: search_view,
     })?;
 
+    let mut workers = vec![];
     let mut result_stream = {
         let (client_sender, result_stream) = mpsc::channel(128);
         for (worker, address) in &core.config.workers {
+            workers.push(worker.clone());
             let address = address.websocket("/search/filter")?;
             let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
                 address.clone(), None, false, Some(core.ws_connector.clone())).await
@@ -1044,89 +1098,64 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
     };
 
     // Absorb messages from the workers until we have them all
-    let mut errors = vec![];
-    let mut complete: HashMap<WorkerID, HashSet<FilterID>> = Default::default();
-    let mut initial: HashMap<WorkerID, Vec<FilterID>> = Default::default();
-    let candidates = SqliteSet::<Sha256>::new_temp().await?;
-    loop {
-        tokio::select!{
-            message = input.recv() => {
-                // Read an update command
-                let message = match message {
-                    Some(message) => message,
-                    None => break
-                };
+    let candidates = SqliteSet::<FileInfo>::new_temp().await?;
+    {
+        let mut complete: HashMap<WorkerID, HashSet<FilterID>> = Default::default();
+        let mut initial: HashMap<WorkerID, Vec<FilterID>> = Default::default();
+        loop {
+            let (worker, message) = match result_stream.recv().await {
+                Some(message) => message,
+                None => break,
+            };
 
-                match message {
-                    SearcherMessage::Status(response) => {
-                        // Collect our progress for each worker's filtering
-                        // let mut workers = HashMap::new();
-                        let mut total: u64 = 0;
-                        let mut done: u64 = 0;
-                        for (worker, initial) in &initial {
-                            done += match complete.get(worker){
-                                Some(complete) => complete.len() as u64,
-                                None => 0,
-                            };
-                            total += initial.len() as u64;
-                        }
-
-                        // Send a summary of our progress on this search
-                        _ = response.send(InternalSearchStatus {
-                            view: status.view.clone(),
-                            resp: SearchRequestResponse {
-                                code: code.to_owned(),
-                                finished: false,
-                                errors: errors.clone(),
-                                warnings: status.warnings.clone(),
-                                hits: vec![],
-                                truncated: false,
-                                progress: (done, total),
-                                phase: SearchProgress::Filtering,
-                                query: status.query.to_string(),
-                            }
-                        });
-                    },
-                }
-            },
-            message = result_stream.recv() => {
-                let (worker, message) = match message {
-                    Some(message) => message,
-                    None => break,
-                };
-
-                info!("Search progress: {message:?}");
-                match message {
-                    FilterSearchResponse::Filters(items) => { initial.insert(worker, items); },
-                    FilterSearchResponse::Candidates(filter, hashes) => {
-                        candidates.insert_batch(&hashes).await?;
+            info!("Search progress: {message:?}");
+            match message {
+                FilterSearchResponse::Filters(items) => { initial.insert(worker, items); },
+                FilterSearchResponse::Candidates(filter, files) => {
+                    candidates.insert_batch(&files).await?;
+                    match complete.entry(worker) {
+                        hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(filter); },
+                        hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([filter])); },
+                    }
+                },
+                FilterSearchResponse::Error(filter, error) => {
+                    status.errors.push(error);
+                    if let Some(filter) = filter {
                         match complete.entry(worker) {
                             hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(filter); },
                             hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([filter])); },
                         }
-                    },
-                    FilterSearchResponse::Error(filter, error) => {
-                        errors.push(error);
-                        if let Some(filter) = filter {
-                            match complete.entry(worker) {
-                                hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(filter); },
-                                hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([filter])); },
-                            }
+                    }
+                },
+            }
+
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                let mut progress = 0.0;
+                for worker in &workers {
+                    if let Some(total) = initial.get(worker).map(Vec::len) {
+                        if let Some(current) = complete.get(worker).map(HashSet::len) {
+                            let worker_progress = current as f64/total as f64;
+                            progress += worker_progress / workers.len() as f64;
                         }
-                    },
+                    }
                 }
+                progress_sender.send(SearchProgress::Filtering { progress })?;
+                last_progress = std::time::Instant::now();
             }
         }
     }
 
     // Run through yara jobs
     info!("Search {code}: Yara");
+    progress_sender.send(SearchProgress::Yara { progress: 0.0 })?;
+    last_progress = std::time::Instant::now();
     let initial_total: u64 = candidates.len().await?;
+    let mut sent_hashes = 0;
 
     let mut hits: BTreeSet<Sha256> = Default::default();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
     let mut next_batch = None;
-    let truncated = loop {
+    loop {
 
         if next_batch.is_none() {
             let batch = candidates.pop_batch(core.config.yara_batch_size).await?;
@@ -1136,75 +1165,62 @@ async fn _search_worker(core: Arc<HouseCore>, input: &mut mpsc::Receiver<Searche
         }
 
         if next_batch.is_none() && requests.is_empty() {
-            break false;
+            break;
         }
 
         if hits.len() >= core.config.search_hit_limit {
-            break true;
+            status.truncated = true;
+            break;
         }
 
         tokio::select!{
-            message = input.recv() => {
-                // Read an update command
-                let message = match message {
-                    Some(message) => message,
-                    None => return Ok(())
-                };
-
-                match message {
-                    SearcherMessage::Status(response) => {
-                        _ = response.send(InternalSearchStatus {
-                            view: status.view.clone(),
-                            resp: SearchRequestResponse {
-                                code: code.to_owned(),
-                                finished: false,
-                                errors: errors.clone(),
-                                warnings: status.warnings.clone(),
-                                hits: hits.iter().cloned().map(|x|x.hex()).collect(),
-                                truncated: false,
-                                progress: (initial_total, candidates.len().await?),
-                                phase: SearchProgress::Yara,
-                                query: status.query.to_string(),
-                            }
-                        });
-                    },
-                }
-            },
             result = requests.join_next(), if !requests.is_empty() => {
                 let result = match result {
                     Some(Ok(Ok(message))) => message,
-                    Some(Ok(Err(err))) => { errors.push(err.to_string()); continue }
-                    Some(Err(err)) => { errors.push(err.to_string()); continue }
+                    Some(Ok(Err(err))) => { status.errors.push(err.to_string()); continue }
+                    Some(Err(err)) => { status.errors.push(err.to_string()); continue }
                     None => continue,
                 };
 
-                hits.extend(result.hits);
-                errors.extend(result.errors);
+                let mut new_hits = vec![];
+                for hit in result.hits {
+                    if hits.insert(hit.hash.clone()) {
+                        new_hits.push(hit);
+                    }
+                }
+                core.database.save_hits(&code, new_hits).await?;
+                status.errors.extend(result.errors);
             }
             permit = core.yara_permits.get(), if next_batch.is_some() => {
                 let id = thread_rng().gen();
                 let yara_rule = status.yara_signature.clone();
                 let core = core.clone();
-                let hashes = next_batch.take().unwrap();
+                let files = next_batch.take().unwrap();
+                sent_hashes += files.len();
                 requests.spawn(async move {
                     let permit = permit?;
                     let response = core.client.get(permit.1.http("/search/yara")?)
                     .json(&YaraTask{
                         id,
                         yara_rule,
-                        hashes
+                        files
                     }).send().await?;
                     let result: YaraSearchResponse = response.json().await?;
                     return anyhow::Ok(result);
                 });
             }
         }
+
+        if last_progress.elapsed() >= PROGRESS_INTERVAL {
+            progress_sender.send(SearchProgress::Yara { progress: sent_hashes as f64 / initial_total as f64 })?;
+            last_progress = std::time::Instant::now();
+        }
     };
 
     // Save results
     info!("Search {code}: Finishing");
-    core.database.finalize_search(&status.code, hits, errors, truncated).await?;
+    core.database.finalize_search(status).await?;
     let mut searches = core.running_searches.write().await;
-    searches.remove(code);
+    searches.remove(&code);
     return Ok(())
 }

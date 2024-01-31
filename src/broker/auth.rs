@@ -14,8 +14,6 @@ use serde::{Serialize, Deserialize};
 pub enum Role {
     /// This role allows access to searching interfaces
     Search,
-    /// This role allows access to ingestion interfaces
-    Ingest,
 }
 
 
@@ -23,7 +21,6 @@ impl Display for Role {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Role::Search => "Search",
-            Role::Ingest => "Ingest",
         })
     }
 }

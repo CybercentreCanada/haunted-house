@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use assemblyline_markings::classification::ClassificationParser;
 use log::{info, error};
 use sqlx::{SqlitePool, query_as, query};
 use sqlx::pool::{PoolOptions, PoolConnection};
@@ -29,10 +30,10 @@ pub enum SQLiteCommand {
     // FilterPendingCount{response: oneshot::Sender<HashMap<FilterID, u64>>},
     FilterPending{response: oneshot::Sender<HashMap<FilterID, HashSet<Sha256>>>},
     UpdateFileAccess{files: Vec<FileInfo>, response: BatchRespond<IngestStatusBundle>},
-    GetFileAccess{id: FilterID, hash: Sha256, response: Respond<Option<AccessControl>>},
+    GetFileAccess{id: FilterID, hash: Sha256, response: Respond<Option<(AccessControl, String)>>},
     CheckInsertStatus{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo, IngestStatus)>>},
     IngestFiles{files: Vec<(FilterID, FileInfo)>, response: BatchRespond<Vec<(FilterID, FileInfo)>>},
-    SelectFileHashes{id: FilterID, file_indices: Vec<u64>, access: HashSet<String>, response: Respond<Vec<Sha256>>},
+    SelectFiles{id: FilterID, file_indices: Vec<u64>, access: HashSet<String>, response: Respond<Vec<FileInfo>>},
     GetIngestBatch{id: FilterID, limit: u32, response: Respond<Vec<(u64, Sha256)>>},
     FinishedIngest{id: FilterID, files: Vec<(u64, Sha256)>, response: Respond<f64>},
     AbandonFiles{files: Vec<(FilterID, Sha256)>, response: Respond<()>},
@@ -41,10 +42,10 @@ pub enum SQLiteCommand {
 #[derive(Debug)]
 pub enum FilterCommand {
     DeleteFilter{response: oneshot::Sender<Result<()>>},
-    GetFileAccess{hash: Sha256, response: oneshot::Sender<Result<Option<AccessControl>>>},
+    GetFileAccess{hash: Sha256, response: oneshot::Sender<Result<Option<(AccessControl, String)>>>},
     CheckInsertStatus{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo, IngestStatus)>>>},
     IngestFiles{files: Vec<FileInfo>, response: oneshot::Sender<Result<Vec<(FilterID, FileInfo)>>>},
-    SelectFileHashes{file_indices: Vec<u64>, access: HashSet<String>, response: oneshot::Sender<Result<Vec<Sha256>>>},
+    SelectFiles{file_indices: Vec<u64>, access: HashSet<String>, response: oneshot::Sender<Result<Vec<FileInfo>>>},
     GetIngestBatch{limit: u32, response: oneshot::Sender<Result<Vec<(u64, Sha256)>>>},
     FinishedIngest{files: Vec<(u64, Sha256)>, response: oneshot::Sender<Result<f64>>},
     UpdateFileAccess{files: Vec<FileInfo>, response: oneshot::Sender<Result<IngestStatusBundle>>},
@@ -58,7 +59,7 @@ impl FilterCommand {
             FilterCommand::GetFileAccess { response, .. } => _ = response.send(Err(error)),
             FilterCommand::CheckInsertStatus { response, .. } => _ = response.send(Err(error)),
             FilterCommand::IngestFiles { response, .. } => _ = response.send(Err(error)),
-            FilterCommand::SelectFileHashes { response, .. } => _ = response.send(Err(error)),
+            FilterCommand::SelectFiles { response, .. } => _ = response.send(Err(error)),
             FilterCommand::GetIngestBatch { response, .. } => _ = response.send(Err(error)),
             FilterCommand::FinishedIngest { response, .. } => _ = response.send(Err(error)),
             FilterCommand::UpdateFileAccess { response, .. } => _ = response.send(Err(error)),
@@ -77,12 +78,13 @@ pub struct BufferedSQLite {
     filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>,
     _temp_dir: Option<tempfile::TempDir>,
     database_directory: PathBuf,
+    ce: Arc<ClassificationParser>,
 }
 
 
 impl BufferedSQLite {
 
-    pub async fn start(database_directory: PathBuf) -> Result<mpsc::Sender<SQLiteCommand>> {
+    pub async fn start(database_directory: PathBuf, ce: Arc<ClassificationParser>) -> Result<mpsc::Sender<SQLiteCommand>> {
 
         let path = database_directory.join("directory.sqlite");
 
@@ -108,11 +110,12 @@ impl BufferedSQLite {
             _temp_dir: None,
             database_directory: database_directory.clone(),
             filter_sizes: Arc::new(RwLock::new(Default::default())),
-            filter_pending: Arc::new(RwLock::new(Default::default()))
+            filter_pending: Arc::new(RwLock::new(Default::default())),
+            ce: ce.clone()
         };
 
         for (name, expiry) in db.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
-            db.workers.insert(name, FilterSQLWorker::start(&database_directory, name, expiry, db.filter_sizes.clone(), db.filter_pending.clone()).await?);
+            db.workers.insert(name, FilterSQLWorker::start(&database_directory, ce.clone(), name, expiry, db.filter_sizes.clone(), db.filter_pending.clone()).await?);
         }
 
         tokio::spawn(db.run());
@@ -211,8 +214,8 @@ impl BufferedSQLite {
             SQLiteCommand::GetFileAccess { id, hash, response } => {
                 self.send_filter(id, FilterCommand::GetFileAccess { hash, response }).await
             },
-            SQLiteCommand::SelectFileHashes { id, file_indices, access, response } => {
-                self.send_filter(id, FilterCommand::SelectFileHashes { file_indices, access, response }).await
+            SQLiteCommand::SelectFiles { id, file_indices, access, response } => {
+                self.send_filter(id, FilterCommand::SelectFiles { file_indices, access, response }).await
             },
             SQLiteCommand::GetIngestBatch { id, limit, response } => {
                 self.send_filter(id, FilterCommand::GetIngestBatch { limit, response }).await
@@ -257,7 +260,7 @@ impl BufferedSQLite {
             .bind(expiry.to_u32())
             .execute(&mut con).await?;
 
-        self.workers.insert(name, FilterSQLWorker::start(&self.database_directory, name, expiry.clone(), self.filter_sizes.clone(), self.filter_pending.clone()).await?);
+        self.workers.insert(name, FilterSQLWorker::start(&self.database_directory, self.ce.clone(), name, expiry.clone(), self.filter_sizes.clone(), self.filter_pending.clone()).await?);
 
         con.commit().await?;
 
@@ -327,12 +330,13 @@ struct FilterSQLWorker {
     channel: mpsc::Receiver<FilterCommand>,
     filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>,
     filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>,
+    ce: Arc<ClassificationParser>,
 }
 
 
 impl FilterSQLWorker {
 
-    pub async fn start(database_directory: &Path, id: FilterID, expiry: ExpiryGroup, filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>, filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>) -> Result<mpsc::Sender<FilterCommand>> {
+    pub async fn start(database_directory: &Path, ce: Arc<ClassificationParser>, id: FilterID, expiry: ExpiryGroup, filter_sizes: Arc<RwLock<HashMap<FilterID, u64>>>, filter_pending: Arc<RwLock<HashMap<FilterID, HashSet<Sha256>>>>) -> Result<mpsc::Sender<FilterCommand>> {
 
         let directory = database_directory.join(id.to_string());
         tokio::fs::create_dir_all(&directory).await?;
@@ -362,7 +366,8 @@ impl FilterSQLWorker {
             channel: reciver,
             // _temp_dir: None,
             filter_sizes,
-            filter_pending
+            filter_pending,
+            ce,
         };
 
         {
@@ -399,6 +404,7 @@ impl FilterSQLWorker {
             number INTEGER PRIMARY KEY AUTOINCREMENT,
             hash BLOB NOT NULL UNIQUE,
             access BLOB NOT NULL,
+            access_string BLOB NOT NULL,
             ingested BOOLEAN DEFAULT FALSE
         )").execute(&mut con).await?;
         sqlx::query("create index if not exists ingested ON files(ingested)").execute(&mut con).await?;
@@ -431,7 +437,7 @@ impl FilterSQLWorker {
             FilterCommand::GetFileAccess { hash, response } => { _ = response.send(self.get_file_access(&hash).await); },
             FilterCommand::CheckInsertStatus {files, response } => { _ = response.send(self.check_insert_status(files).await); },
             FilterCommand::IngestFiles { files, response } => { _ = response.send(self.ingest_files(files).await); },
-            FilterCommand::SelectFileHashes { file_indices, access, response } => { _ = response.send(self.select_file_hashes(&file_indices, &access).await); },
+            FilterCommand::SelectFiles { file_indices, access, response } => { _ = response.send(self.select_files(&file_indices, &access).await); },
             FilterCommand::GetIngestBatch { limit, response } => { _ = response.send(self.get_ingest_batch(limit).await); },
             FilterCommand::FinishedIngest { files, response } => { _ = response.send(self.finished_ingest(files).await); },
             FilterCommand::UpdateFileAccess { files, response } => { _ = response.send(self.update_file_access(files).await); },
@@ -446,11 +452,11 @@ impl FilterSQLWorker {
         Ok(())
     }
 
-    pub async fn get_file_access(&self, hash: &Sha256) -> Result<Option<AccessControl>> {
-        let row: Option<(String, )> = query_as("SELECT access FROM files WHERE hash = ?").bind(hash.as_bytes()).fetch_optional(&self.db).await?;
+    pub async fn get_file_access(&self, hash: &Sha256) -> Result<Option<(AccessControl, String)>> {
+        let row: Option<(String, String)> = query_as("SELECT access FROM files WHERE hash = ?").bind(hash.as_bytes()).fetch_optional(&self.db).await?;
 
         match row {
-            Some((row, )) => Ok(Some(AccessControl::from_str(&row)?)),
+            Some((access, access_string)) => Ok(Some((AccessControl::from_str(&access)?, access_string))),
             None => Ok(None)
         }
     }
@@ -530,24 +536,26 @@ impl FilterSQLWorker {
     }
 
     pub async fn _update_file_access(&self, conn: &mut PoolConnection<sqlx::Sqlite>, file: &FileInfo) -> Result<IngestStatus> {
-        let (access_string, ingested): (String, bool) = match query_as("SELECT access, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
+        let (raw_access, old_access_string, ingested): (String, String, bool) = match query_as("SELECT access, access_string, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
             Some(row) => row,
             None => return Ok(IngestStatus::Missing)
         };
 
-        let access = AccessControl::from_str(&access_string)?.or(&file.access).simplify();
-        let new_string = access.to_string();
-        if access_string == new_string {
+        let access = AccessControl::from_str(&raw_access)?.or(&file.access).simplify();
+        let new_access = access.to_string();
+        if raw_access == new_access {
             if ingested {
                 return Ok(IngestStatus::Ready)
             } else {
                 return Ok(IngestStatus::Pending(self.id))
             }
         }
+        let new_access_string = self.ce.min_classification(&old_access_string, &file.access_string, false)?;
 
-        let result = query("UPDATE files SET access = ? WHERE access = ? AND hash = ?")
-            .bind(new_string)
-            .bind(access_string)
+        let result = query("UPDATE files SET access = ?, access_string = ? WHERE access = ? AND hash = ?")
+            .bind(new_access)
+            .bind(new_access_string)
+            .bind(raw_access)
             .bind(file.hash.as_bytes())
             .execute(&mut *conn).await?;
         if result.rows_affected() > 0 {
@@ -561,16 +569,21 @@ impl FilterSQLWorker {
     }
 
 
-    pub async fn select_file_hashes(&self, indices: &Vec<u64>, view: &HashSet<String>) -> Result<Vec<Sha256>> {
-        let mut selected: Vec<Sha256> = vec![];
+    pub async fn select_files(&self, indices: &Vec<u64>, view: &HashSet<String>) -> Result<Vec<FileInfo>> {
+        let mut selected: Vec<FileInfo> = vec![];
         let mut conn = self.db.acquire().await?;
         for file_id in indices {
-            let row: Option<(String, Vec<u8>)> = sqlx::query_as("SELECT access, hash FROM files WHERE number = ?")
+            let row: Option<(String, String, Vec<u8>)> = sqlx::query_as("SELECT access, access_string, hash FROM files WHERE number = ?")
                 .bind(*file_id as i64).fetch_optional(&mut conn).await?;
-            if let Some((access, hash)) = row {
+            if let Some((access, access_string, hash)) = row {
                 let access = AccessControl::from_str(&access)?;
                 if access.can_access(view) {
-                    selected.push(Sha256::try_from(&hash[..])?);
+                    selected.push(FileInfo { 
+                        hash: Sha256::try_from(&hash[..])?, 
+                        access, 
+                        access_string, 
+                        expiry: self.expiry,
+                    });
                 }
             }
         }

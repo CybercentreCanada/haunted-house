@@ -10,13 +10,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use log::{error, info};
-use serde::Deserialize;
-use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
 
-use crate::error::ErrorKinds;
 use crate::types::JsonMap;
 use super::{HouseCore, FetchStatus, FetchControlMessage};
 
@@ -50,7 +47,7 @@ pub (crate) struct FetchedFile {
 
 impl FetchedFile {
     /// Build a fetched file object from the json data
-    fn extract(data: &JsonMap) -> Option<Self> {
+    pub fn extract(data: &JsonMap) -> Option<Self> {
         Some(Self{
             sha256: data.get("sha256")?.as_str()?.to_owned(),
             classification: data.get("classification")?.as_str()?.to_owned(),
@@ -86,10 +83,10 @@ struct PendingInfo {
 async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<FetchControlMessage>>>) -> Result<()> {
     let mut control = control.lock().await;
     info!("Fetch agent starting");
-
+    
     // connect to elasticsearch
     let config = core.config.datastore.clone();
-    let client = Elastic::new(&config.url, config.ca_cert.as_deref(), config.connect_unsafe)?;
+    let client = core.database.clone();
     
     //
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
@@ -210,132 +207,4 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     }
 }
 
-
-#[derive(Deserialize)]
-struct SearchResult {
-    // took: u64,
-    timed_out: bool,
-    hits: SearchResultHits
-}
-
-#[derive(Deserialize)]
-struct SearchResultHits {
-    // total: SearchResultHitTotals,
-    // max_score: f64,
-    hits: Vec<SearchResultHitItem>,
-}
-
-// #[derive(Deserialize)]
-// struct SearchResultHitTotals {
-//     value: i64,
-//     relation: String,
-// }
-
-#[derive(Deserialize)]
-struct SearchResultHitItem {
-    _index: String,
-    _id: String,
-    _score: f64,
-    fields: JsonMap,
-}
-
-struct Elastic {
-    client: reqwest::Client,
-    host: reqwest::Url,
-}
-
-
-impl Elastic {
-
-    fn new(host: &str, ca_cert: Option<&str>, connect_unsafe: bool) -> Result<Self> {
-
-        let mut builder = reqwest::Client::builder();
-
-        if let Some(ca_cert) = ca_cert {
-            let cert = reqwest::Certificate::from_pem(ca_cert.as_bytes())?;
-            builder = builder.add_root_certificate(cert);
-        }
-
-        if connect_unsafe {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        Ok(Self {
-            client: builder.build()?,
-            host: host.parse()?,
-        })
-    }
-
-    async fn fetch_files(&self, seek_point: chrono::DateTime<chrono::Utc>, batch_size: usize) -> Result<Vec<FetchedFile>> {
-        let path = "file,file-hot/_search";
-        let mut attempt: u64 = 0;
-        const MAX_DELAY: std::time::Duration = Duration::from_secs(60);
-
-        loop {
-            attempt += 1;
-
-            // Build and dispatch the request
-            let result = self.client.request(reqwest::Method::GET, self.host.join(path)?)
-            .json(&json!({
-                "query": {
-                    "bool": {
-                        "must": {
-                            "query_string": {
-                                "query": format!("seen.last: [{} TO *]", seek_point.to_rfc3339())
-                            }
-                        },
-                        // 'filter': filter_queries
-                    }
-                },
-                "size": batch_size,
-                "sort": "seen.last:asc",
-                "fields": "classification,expiry_ts,sha256,seen.last"
-            })).send().await;
-
-            // Handle connection errors with a retry, let other non http errors bubble up
-            let response = match result {
-                Ok(response) => response,
-                Err(err) => {
-                    // always retry for connect and timeout errors
-                    if err.is_connect() || err.is_timeout() {
-                        error!("Error connecting to datastore: {err}");
-                        let delay = MAX_DELAY.min(Duration::from_secs_f64((attempt as f64).powf(2.0)/5.0));
-                        tokio::time::sleep(delay).await;
-                        continue
-                    }
-
-                    return Err(err.into())
-                },
-            };
-
-            // Handle server side http status errors with retry, let other error codes bubble up, decode successful bodies
-            let status = response.status();
-            let body: SearchResult = match response.error_for_status() {
-                Ok(response) => response.json().await?,
-                Err(err) => {
-                    if status.is_server_error() {
-                        error!("Server error in datastore: {err}");
-                        let delay = MAX_DELAY.min(Duration::from_secs_f64((attempt as f64).powf(2.0)/5.0));
-                        tokio::time::sleep(delay).await;
-                        continue                        
-                    }
-
-                    return Err(err.into())
-                },
-            };
-
-            // read the body of our response
-            let mut out = vec![];
-            if body.timed_out {
-                continue
-            }
-            for row in body.hits.hits {
-                out.push(FetchedFile::extract(&row.fields).ok_or(ErrorKinds::MalformedResponse)?)
-            }
-            return Ok(out)
-        }
-        
-        
-    }
-}
 

@@ -1,8 +1,10 @@
 //! Layout and parsing tools for server configuration
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use anyhow::Result;
 
+use assemblyline_markings::classification::ClassificationParser;
 use serde::{Serialize, Deserialize};
 use crate::broker::auth::Role;
 use crate::types::{WorkerID, serialize_size, deserialize_size};
@@ -29,9 +31,6 @@ impl Default for Authentication {
             static_keys: vec![StaticKey {
                 key: hex::encode(uuid::Uuid::new_v4().as_bytes()),
                 roles: vec![Role::Search]
-            }, StaticKey {
-                key: hex::encode(uuid::Uuid::new_v4().as_bytes()),
-                roles: vec![Role::Ingest]
             }]
         }
     }
@@ -142,6 +141,7 @@ pub struct Datastore {
     pub ca_cert: Option<String>,
 
     pub connect_unsafe: bool,
+    pub archive_access: bool,
 }
 
 impl Default for Datastore {
@@ -152,7 +152,8 @@ impl Default for Datastore {
             concurrent_tasks: 30000, 
             batch_size: 2000, 
             ca_cert: None, 
-            connect_unsafe: false 
+            connect_unsafe: false, 
+            archive_access: true,
         }
     }
 }
@@ -170,24 +171,48 @@ fn default_yara_batch_size() -> u32 { 100 }
 /// default value for filter_item_limit
 fn default_filter_item_limit() -> u64 { 50_000_000 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ClassificationConfig {
+    pub classification_path: Option<PathBuf>,
+    pub classification: Option<String>,
+}
+
+impl ClassificationConfig {
+    pub fn load(&self) -> Result<String> {
+        if let Some(classification) = &self.classification {
+            Ok(classification.clone())
+        } else if let Some(path) = &self.classification_path {
+            Ok(std::fs::read_to_string(path)?)
+        } else {
+            Err(crate::error::ErrorKinds::ClassificationConfigurationError("Config missing".to_owned()).into())
+        }
+    }
+
+    pub fn init(&self) -> Result<Arc<ClassificationParser>> {
+        let definition = self.load()?;
+        let classification: assemblyline_markings::config::ClassificationConfig = serde_json::from_str(&definition)?;
+        let access_engine = Arc::new(ClassificationParser::new(classification)?);
+        assemblyline_markings::set_default(access_engine.clone());
+        Ok(access_engine)
+    }
+}
+
+
 /// Root configuration schema for broker server
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BrokerSettings {
     /// Configure API tokens for accessing the system
     pub authentication: Authentication,
-    /// Configure local database location
-    pub database: Database,
+    /// A location that persistant files can be saved
+    pub local_storage: PathBuf,
     /// Which address should the server present on
     pub bind_address: Option<String>,
     /// TLS settings for the outward facing API
     pub tls: Option<TLSConfig>,
 
     pub datastore: Datastore,
-    pub classification_path: Option<PathBuf>,
-    pub classification: Option<String>,
-
-    /// Configuration for the assemblyline system to tie into
-    // pub assemblyline: Option<AssemblylineConfig>,
+    #[serde(flatten)]
+    pub classification: ClassificationConfig,
 
     /// List of workers controlled by the broker server
     pub workers: HashMap<WorkerID, WorkerAddress>,
@@ -219,13 +244,12 @@ impl Default for BrokerSettings {
     fn default() -> Self {
         Self {
             authentication: Default::default(),
-            database: Default::default(),
+            local_storage: PathBuf::from("/data/"),
             workers: [
                 (WorkerID::from("worker-1".to_owned()), WorkerAddress::from("worker-0:4000"))
             ].into(),
             datastore: Datastore::default(),
-            classification_path: None,
-            classification: None,
+            classification: Default::default(),
             worker_certificate: WorkerTLSConfig::AllowAll,
             filter_item_limit: default_filter_item_limit(),
             per_filter_pending_limit: default_per_filter_pending_limit(),
@@ -240,14 +264,9 @@ impl Default for BrokerSettings {
 }
 
 impl BrokerSettings {
-    pub fn load_classification_config(&self) -> Result<String> {
-        if let Some(classification) = &self.classification {
-            Ok(classification.clone())
-        } else if let Some(path) = &self.classification_path {
-            Ok(std::fs::read_to_string(path)?)
-        } else {
-            Err(crate::error::ErrorKinds::ClassificationConfigurationMissing.into())
-        }
+    pub fn runtime_config_file(&self) -> PathBuf {
+        const CONFIG_NAME: &str = "runtime_config.txt";
+        self.local_storage.join(CONFIG_NAME)
     }
 }
 
@@ -332,7 +351,10 @@ pub struct WorkerSettings {
     pub ingest_batch_size: u32,
     /// How many files should be downloaded concurrently
     #[serde(default="default_parallel_file_downloads")]
-    pub parallel_file_downloads: usize
+    pub parallel_file_downloads: usize,
+
+    #[serde(flatten)]
+    pub classification: ClassificationConfig,
 }
 
 
@@ -343,6 +365,7 @@ impl Default for WorkerSettings {
             files: Default::default(),
             data_path: default_data_path(),
             data_limit: default_data_limit(),
+            classification: Default::default(),
             data_reserve: default_data_reserve(),
             initial_segment_size: default_initial_segment_size(),
             extended_segment_size: default_extended_segment_size(),

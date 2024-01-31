@@ -65,11 +65,17 @@ impl std::str::FromStr for Sha256 {
     }
 }
 
+impl rand::distributions::Distribution<Sha256> for rand::distributions::Standard {
+    fn sample<R: rand::prelude::Rng + ?Sized>(&self, rng: &mut R) -> Sha256 {
+        Sha256(Box::new(rng.gen()))
+    }
+}
+
 /// An identifier for grouping filter tables by the day they expire.
 /// Expiry is tracked with daily resolution. Finer units of time are ignored.
 /// The date is packed into an unsigned 32 bit number with the year occuping
 /// the higher 16 bits, and the day in the lower 16 bits.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 pub struct ExpiryGroup(u32);
 
 impl ExpiryGroup {
@@ -83,6 +89,21 @@ impl ExpiryGroup {
         })
     }
 
+    pub fn to_timestamp(&self) -> Option<DateTime<Utc>> {
+        let year = self.0 >> 16;
+        if year == 0xFFFF {
+            None
+        } else {
+            let day = self.0 & 0xFFFF;
+            Some(DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDate::from_yo_opt(year as i32, day)?.into(), Utc))
+        }
+    }
+
+    /// Get a point between real dates and the "date" used for retained values
+    pub fn before_archive() -> ExpiryGroup {
+        ExpiryGroup(u32::MAX-2)
+    }
+    
     /// Get the expiry group for items expiring today
     pub fn today() -> ExpiryGroup {
         ExpiryGroup::create(&Some(Utc::now()))
@@ -140,6 +161,8 @@ pub struct FileInfo {
     pub hash: Sha256,
     /// Access control that determines if a given search is allowed to know about this file.
     pub access: AccessControl,
+    /// The raw classification string that should have the same information as access but formatted for other systems.
+    pub access_string: String,
     /// Which day this file expires on.
     pub expiry: ExpiryGroup
 }

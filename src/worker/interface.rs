@@ -49,7 +49,7 @@ pub struct FilterSearchRequest {
 #[derive(Serialize, Deserialize)]
 pub enum FilterSearchResponse {
     Filters(Vec<FilterID>),
-    Candidates(FilterID, Vec<Sha256>),
+    Candidates(FilterID, Vec<FileInfo>),
     Error(Option<FilterID>, String),
 }
 
@@ -119,7 +119,7 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
 
 #[derive(Serialize, Deserialize)]
 pub struct YaraSearchResponse {
-    pub hits: Vec<Sha256>,
+    pub hits: Vec<FileInfo>,
     pub errors: Vec<String>,
 }
 
@@ -189,7 +189,7 @@ async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
         if let Some(expiry) = expiries.get(&filter) {
             for hash in hashes {
                 match state.database.get_file_access(filter, &hash).await {
-                    Ok(Some(access)) => {files.push(FileInfo { hash, access, expiry: expiry.clone() });}
+                    Ok(Some((access, access_string))) => {files.push(FileInfo { hash, access, access_string, expiry: expiry.clone() });}
                     Ok(None) => {},
                     Err(err) => {
                         error!("{err}");

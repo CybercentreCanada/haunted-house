@@ -374,7 +374,7 @@ impl WorkerState {
         if let Some((filter, _, _)) = self.filters.read().await.get(&id) {
             match filter.query(query).await {
                 Ok(file_indices) => {
-                    match self.database.select_file_hashes(id, &file_indices, &access).await {
+                    match self.database.select_files(id, &file_indices, &access).await {
                         Ok(files) => { _ = respond.send(FilterSearchResponse::Candidates(id, files)).await; },
                         Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())).await; }
                     };
@@ -384,14 +384,14 @@ impl WorkerState {
         }
     }
 
-    pub async fn run_yara(&self, yara_task: YaraTask) -> Result<(Vec<Sha256>, Vec<String>)> {
+    pub async fn run_yara(&self, yara_task: YaraTask) -> Result<(Vec<FileInfo>, Vec<String>)> {
         debug!("yara task {} starting", yara_task.id);
         let mut errors = vec![];
         let filter_handle = {
-            let (file_send, mut file_recv) = mpsc::unbounded_channel::<(Sha256, BlobHandle)>();
+            let (file_send, mut file_recv) = mpsc::unbounded_channel::<(FileInfo, BlobHandle)>();
 
             // Run the interaction with yara in a blocking thread
-            let filter_handle = tokio::task::spawn_blocking(move || -> Result<Vec<Sha256>> {
+            let filter_handle = tokio::task::spawn_blocking(move || -> Result<Vec<FileInfo>> {
                 debug!("yara task {} launched yara worker", yara_task.id);
                 // Compile the yara rules
                 let compiler = yara::Compiler::new()?
@@ -401,11 +401,11 @@ impl WorkerState {
 
                 // Try
                 let mut selected = vec![];
-                while let Some((hash, handle)) = file_recv.blocking_recv() {
+                while let Some((info, handle)) = file_recv.blocking_recv() {
                     debug!("yara task {} processing {}", yara_task.id, handle.id());
                     let result = rules.scan_file(handle.path(), 60 * 30)?;
                     if !result.is_empty() {
-                        selected.push(hash);
+                        selected.push(info);
                     }
                 }
                 debug!("yara task {} yara finished", yara_task.id);
@@ -413,12 +413,12 @@ impl WorkerState {
             });
 
             // Load the files and send them to the worker
-            for hash in yara_task.hashes {
+            for info in yara_task.files {
                 // download the file
-                let hash_string = hash.hex();
+                let hash_string = info.hash.hex();
                 debug!("yara task {} waiting for {}", yara_task.id, hash_string);
                 match self.file_cache.open(hash_string.clone()).await {
-                    Ok(blob) => file_send.send((hash, blob))?,
+                    Ok(blob) => file_send.send((info, blob))?,
                     Err(err) => {
                         let error_string = format!("File not available: {hash_string} {err}");
                         info!("{error_string}");

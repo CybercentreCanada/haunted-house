@@ -1,7 +1,9 @@
 
 use std::collections::{HashSet, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use assemblyline_markings::classification::ClassificationParser;
 use tokio::sync::oneshot;
 
 use super::database_sqlite::{SQLiteCommand, BufferedSQLite};
@@ -30,9 +32,8 @@ pub enum Database {
 }
 
 impl Database {
-
-    pub async fn new_sqlite(directory: PathBuf) -> Result<Self> {
-        Ok(Database::SQLite(BufferedSQLite::start(directory).await?))
+    pub async fn new_sqlite(directory: PathBuf, ce: Arc<ClassificationParser>) -> Result<Self> {
+        Ok(Database::SQLite(BufferedSQLite::start(directory, ce).await?))
     }
 
     pub async fn create_filter(&self, id: FilterID, expiry: &ExpiryGroup) -> Result<()> {
@@ -75,7 +76,7 @@ impl Database {
         }
     }
 
-    pub async fn get_file_access(&self, id: FilterID, hash: &Sha256) -> Result<Option<AccessControl>> {
+    pub async fn get_file_access(&self, id: FilterID, hash: &Sha256) -> Result<Option<(AccessControl, String)>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
@@ -193,11 +194,11 @@ impl Database {
         }
     }
 
-    pub async fn select_file_hashes(&self, id: FilterID, file_indices: &[u64], access: &HashSet<String>) -> Result<Vec<Sha256>> {
+    pub async fn select_files(&self, id: FilterID, file_indices: &[u64], access: &HashSet<String>) -> Result<Vec<FileInfo>> {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(SQLiteCommand::SelectFileHashes { id, file_indices: file_indices.to_owned(), access: access.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::SelectFiles { id, file_indices: file_indices.to_owned(), access: access.clone(), response: send }).await?;
                 resp.await?
             }
         }

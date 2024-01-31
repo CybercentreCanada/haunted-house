@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use anyhow::{Result, Context};
 use log::{info, error};
 use crate::blob_cache::BlobCache;
-use crate::types::Sha256;
+use crate::types::{FileInfo, Sha256};
 use crate::worker::database::Database;
 use crate::worker::manager::WorkerState;
 
@@ -24,7 +24,7 @@ mod filter_worker;
 pub struct YaraTask {
     pub id: i64,
     pub yara_rule: String,
-    pub hashes: Vec<Sha256>,
+    pub files: Vec<FileInfo>,
 }
 
 pub async fn main(config: crate::config::WorkerSettings) -> Result<()> {
@@ -54,10 +54,13 @@ pub async fn main(config: crate::config::WorkerSettings) -> Result<()> {
             return Err(anyhow::anyhow!("Couldn't resolve bind address: {}", bind_address));
         }
     };
-    info!("Status interface binding on: {bind_address}");
+    info!("Status interface will bind on: {bind_address}");
+
+    info!("Loading classification");
+    let ce = config.classification.init()?;
 
     info!("Setting up database.");
-    let database = Database::new_sqlite(config.get_database_directory()).await.context("setting up database")?;
+    let database = Database::new_sqlite(config.get_database_directory(), ce).await.context("setting up database")?;
 
     info!("Spawing processing daemons.");
     let (set_running, running) = tokio::sync::watch::channel(true);
