@@ -433,7 +433,7 @@ impl Elastic {
             Ok(response) => response,
             Err(err) => {
                 // always retry for connect and timeout errors
-                if err.is_connect() || err.is_timeout() {
+                if err.is_connect() || err.is_timeout() || err.is_request() {
                     error!("Error connecting to datastore: {err}");
                     let delay = MAX_DELAY.min(Duration::from_secs_f64((*attempt as f64).powf(2.0)/5.0));
                     tokio::time::sleep(delay).await;
@@ -529,7 +529,7 @@ impl Elastic {
     #[cfg(test)]
     async fn wipe_index(&self, index: &str) -> Result<()> {
         debug!("Wipe operation started for collection: {}", index.to_ascii_uppercase());
-        if self.does_index_exist(&index).await? {
+        if self.does_index_exist(&index).await.context("does_index_exist")? {
             let url = self.host.join(&index)?;
             if let Err(err) = self.make_request(&mut 0, Method::DELETE, &url).await {
                 if let ElasticError::HTTPError{code: StatusCode::NOT_FOUND, ..} =  &err {
