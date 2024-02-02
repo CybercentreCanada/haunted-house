@@ -383,6 +383,7 @@ impl TrigramSet {
 /// A bitset over 2^16 values
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Chunk {
+    Empty,
     /// Bitset encoded as indices of each set bit
     Added(Vec<u16>),
     /// Bitset incoded as a literal bit flag per value
@@ -415,6 +416,7 @@ impl Eq for Chunk {
 
 /// Iterator over the set indices in the bitset chunk
 enum ChunkIter<'a> {
+    Empty,
     /// Iterate over encoded indices directly
     Added(std::slice::Iter<'a, u16>),
     /// Use bitset set bit index iterator directly
@@ -429,6 +431,7 @@ impl Iterator for ChunkIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
+            ChunkIter::Empty => None,
             ChunkIter::Added(iter) => iter.next().copied(),
             ChunkIter::Mask(iter) => iter.next().map(|v|v as u16),
             ChunkIter::Removed(iter, skip_list) => {
@@ -451,7 +454,7 @@ impl Iterator for ChunkIter<'_> {
 
 impl Chunk {
     /// Default empty chunk
-    const EMPTY: Self = Self::Added(vec![]);
+    const EMPTY: Self = Self::Empty;
 
     #[cfg(test)]
     pub fn empty() -> Self { Self::EMPTY }
@@ -459,6 +462,7 @@ impl Chunk {
     /// Create an iterator over the indices of set bits
     pub fn iter(&self) -> ChunkIter {
         match self {
+            Chunk::Empty => ChunkIter::Empty,
             Chunk::Added(items) => ChunkIter::Added(items.iter()),
             Chunk::Mask(_, mask) => ChunkIter::Mask(mask.iter_ones()),
             Chunk::Removed(items) => ChunkIter::Removed(0..=u16::MAX, items.iter().peekable()),
@@ -468,6 +472,7 @@ impl Chunk {
     #[cfg(test)]
     pub fn memory(&self) -> usize {
         core::mem::size_of::<Self>() + match self {
+            Chunk::Empty => 0,
             Chunk::Added(items) => items.capacity() * core::mem::size_of::<u16>(),
             Chunk::Mask(_, _) => 1024 * core::mem::size_of::<u64>(),
             Chunk::Removed(items) => items.capacity() * core::mem::size_of::<u16>(),
@@ -475,8 +480,12 @@ impl Chunk {
     }
 
     /// Add a value to the bitset
+    #[inline]
     pub fn insert(&mut self, item: u16) {
         match self {
+            Chunk::Empty => {
+                *self = Chunk::Added(vec![item]);
+            }
             Chunk::Added(items) => { items.push(item); },
             Chunk::Mask(count, items) => {
                 if unsafe { !items.get_unchecked(item as usize) } {
@@ -498,6 +507,7 @@ impl Chunk {
     /// Adjust the encoding to suit the current content
     pub fn compact(&mut self) {
         match self {
+            Chunk::Empty => {}
             Chunk::Added(items) => {
                 items.sort_unstable();
                 items.dedup();
@@ -577,6 +587,7 @@ mod test {
     }
 
     // #[test] temporary remove for performance reasons
+    #[test]
     fn single_values() {
         for ii in 0..=0xFFFFFF {
             let mut bits = TrigramSet::new();
