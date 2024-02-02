@@ -163,7 +163,7 @@ fn default_per_filter_pending_limit() -> u64 { 1000 }
 /// default value for per_worker_group_duplication
 fn default_per_worker_group_duplication() -> u32 { 2 }
 /// default value for search_hit_limit
-fn default_search_hit_limit() -> usize { 50000 }
+fn default_search_hit_limit() -> u64 { 50000 }
 /// default value for yara_jobs_per_worker
 fn default_yara_jobs_per_worker() -> usize { 2 }
 /// default value for yara_batch_size
@@ -228,7 +228,7 @@ pub struct BrokerSettings {
     /// Maximum number of files that may be counted as hits for a single search
     /// before the result set is truncated
     #[serde(default="default_search_hit_limit")]
-    pub search_hit_limit: usize,
+    pub search_hit_limit: u64,
     /// Maximum number of concurrent yara jobs assigned to a worker node
     #[serde(default="default_yara_jobs_per_worker")]
     pub yara_jobs_per_worker: usize,

@@ -7,12 +7,11 @@ mod fetcher;
 mod yara_query;
 mod elastic;
 
-use std::collections::{HashSet, HashMap, hash_map, BTreeSet, VecDeque};
+use std::collections::{HashSet, HashMap, hash_map, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use assemblyline_markings::classification::ClassificationParser;
-use assemblyline_markings::config::ClassificationConfig;
 use assemblyline_models::ExpandingClassification;
 use assemblyline_models::datastore::retrohunt as models;
 use chrono::{DateTime, Utc};
@@ -32,7 +31,7 @@ use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::access::AccessControl;
-use crate::broker::elastic::Elastic;
+use crate::broker::elastic::Datastore;
 use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig};
 use crate::query::Query;
 use crate::sqlite_set::SqliteSet;
@@ -53,7 +52,7 @@ pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
     // Initialize database
     info!("Connecting to database.");
     let ec = &config.datastore;
-    let client = Elastic::new(&ec.url, ec.ca_cert.as_deref(), ec.connect_unsafe, ec.archive_access)?;
+    let client = Datastore::new(&ec.url, ec.ca_cert.as_deref(), ec.connect_unsafe, ec.archive_access)?;
 
     // Start server core
     info!("Starting server core.");
@@ -97,7 +96,7 @@ pub enum FetchControlMessage {
 /// Information encapsulating the broker state
 pub struct HouseCore {
     /// Connection to the database where searches are stored
-    pub database: Elastic,
+    pub database: Datastore,
     /// HTTP client for talking to workers
     pub client: ClientWithMiddleware,
     /// Websocket connector info for connecting to workers
@@ -124,7 +123,7 @@ pub struct HouseCore {
 
 impl HouseCore {
     /// Start the broker server
-    pub (crate) async fn new(database: Elastic, authenticator: Authenticator, config: BrokerSettings) -> Result<Arc<Self>> {
+    pub (crate) async fn new(database: Datastore, authenticator: Authenticator, config: BrokerSettings) -> Result<Arc<Self>> {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         // setup pool for yara assignments
@@ -207,7 +206,7 @@ impl HouseCore {
                 let (send, recv) = watch::channel(SearchProgress::Starting {  });
                 let code = search.key.clone();
                 search.started_time = chrono::Utc::now();
-                core.database.save_search(&search).await?;
+                core.database.retrohunt.save(&search.key, &search, None).await?;
                 let handle = tokio::task::spawn(search_worker(core.clone(), send, search));
                 searches.insert(code, (handle, recv));
             }
@@ -269,7 +268,7 @@ impl HouseCore {
             finished: false,
             truncated: false,
         };
-        self.database.save_search(&search).await?;
+        self.database.retrohunt.save(&search.key, &search, None).await?;
 
         // Start the search worker
         let mut searches = self.running_searches.write().await;
@@ -1152,7 +1151,8 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
     let initial_total: u64 = candidates.len().await?;
     let mut sent_hashes = 0;
 
-    let mut hits: BTreeSet<Sha256> = Default::default();
+    use super::broker::elastic::Result as ESResult;
+    let mut elastic_writes: JoinSet<ESResult<()>> = JoinSet::new();
     let mut requests: JoinSet<Result<YaraSearchResponse>> = JoinSet::new();
     let mut next_batch = None;
     loop {
@@ -1168,7 +1168,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
             break;
         }
 
-        if hits.len() >= core.config.search_hit_limit {
+        if core.database.count_retrohunt_hits(&code, core.config.search_hit_limit).await? >= core.config.search_hit_limit {
             status.truncated = true;
             break;
         }
@@ -1182,13 +1182,11 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
                     None => continue,
                 };
 
-                let mut new_hits = vec![];
-                for hit in result.hits {
-                    if hits.insert(hit.hash.clone()) {
-                        new_hits.push(hit);
-                    }
-                }
-                core.database.save_hits(&code, new_hits).await?;
+                let db = core.database.clone();
+                let code = code.clone();
+                elastic_writes.spawn(async move { Ok(db.save_hits(&code, result.hits).await?) });
+                // elastic_writes.spawn(core.database.clone().save_hits(&code, result.hits));
+                // core.database.save_hits(&code, result.hits).await?;
                 status.errors.extend(result.errors);
             }
             permit = core.yara_permits.get(), if next_batch.is_some() => {
@@ -1216,6 +1214,9 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
             last_progress = std::time::Instant::now();
         }
     };
+
+    // wait for database activity to finish
+    while let Some(result) = elastic_writes.join_next().await { result??; }
 
     // Save results
     info!("Search {code}: Finishing");
