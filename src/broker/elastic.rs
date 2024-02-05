@@ -70,13 +70,15 @@ impl Datastore {
         data.errors.push(error);
         data.finished = true;
         data.completed_time = Some(chrono::Utc::now());
-        self.retrohunt.save(&data.key, data, None).await
+        self.retrohunt.save(&data.key, data, None).await?;
+        Ok(())
     }
 
     pub async fn finalize_search(&self, data: &mut models::Retrohunt) -> Result<()> {
         data.finished = true;
         data.completed_time = Some(chrono::Utc::now());
-        self.retrohunt.save(&data.key, data, None).await
+        self.retrohunt.save(&data.key, data, None).await?;
+        Ok(())
     }
 
     pub async fn count_retrohunt_hits(&self, search: &str, limit: u64) -> Result<u64> {
@@ -555,6 +557,19 @@ impl<Schema: DSType> Clone for Collection<Schema> {
     }
 }
 
+enum SaveOperation {
+    Create,
+    Version(Option<(i64, i64)>)
+}
+
+impl From<(i64, i64)> for SaveOperation {
+    fn from(value: (i64, i64)) -> Self { Self::Version(Some(value)) }
+}
+
+impl From<Option<(i64, i64)>> for SaveOperation {
+    fn from(value: Option<(i64, i64)>) -> Self { Self::Version(value) }
+}
+
 impl<Schema: DSType> Collection<Schema> {
     fn new(index: Index, connection: Elastic) -> Self {
         Collection { index, connection, _type: Default::default() }
@@ -576,7 +591,7 @@ impl<Schema: DSType> Collection<Schema> {
     // :param version: version of the document to save over, if the version check fails this will raise an exception
     // :return: True if the document was saved properly
     // """
-    pub async fn save(&self, key: &str, data: &Schema, version: Option<&str>) -> Result<()> {
+    pub async fn save(&self, key: &str, data: &Schema, version: impl Into<SaveOperation>) -> Result<bool> {
         if key.contains(" ") {
             return Err(ElasticError::BadKey(key.to_owned()))
         }
@@ -585,42 +600,84 @@ impl<Schema: DSType> Collection<Schema> {
         let mut operation = "index";
         let mut parsed_version = None;
 
-        if let Some(version) = version {
-            if version == CREATE_TOKEN {
+        match version.into() {
+            SaveOperation::Create => {
                 operation = "create";
-            } else {
-                let mut parts = version.split("---");
-                let seq_no: i64 = parts.next().ok_or(ElasticError::BadDocumentVersion)?.parse().map_err(|_| ElasticError::BadDocumentVersion)?;
-                let primary_term: i64 = parts.next().ok_or(ElasticError::BadDocumentVersion)?.parse().map_err(|_| ElasticError::BadDocumentVersion)?;
-                parsed_version = Some((seq_no, primary_term))
+            },
+            SaveOperation::Version(version) => {
+                parsed_version = version;
             }
+            // } else {
+            //     let mut parts = version.split("---");
+            //     let seq_no: i64 = parts.next().ok_or(ElasticError::BadDocumentVersion)?.parse().map_err(|_| ElasticError::BadDocumentVersion)?;
+            //     let primary_term: i64 = parts.next().ok_or(ElasticError::BadDocumentVersion)?.parse().map_err(|_| ElasticError::BadDocumentVersion)?;
+            //     parsed_version = Some((seq_no, primary_term))
+            // }
         }
 
-        let body = serde_json::to_string(data)?;
+        // serialize the body
+        // let body = serde_json::to_string(data)?;
 
-        // index_list = self.get_index_list(index_type)
-        for index in self.connection.get_index_list(self.index, Some(IndexCatagory::Hot))? {
-            let mut url = if operation == "index" {
-                self.connection.host.join(&format!("{}/_doc/{key}", index))?
-            } else {
-                self.connection.host.join(&format!("{}/_create/{key}", index))?
-            };
+        // Hot indices should always return a single index
+        let index_list = self.connection.get_index_list(self.index, Some(IndexCatagory::Hot))?;
+        let index = &index_list[0];
 
+        // build the url for the operation type
+        let mut url = if operation == "index" {
+            self.connection.host.join(&format!("{}/_doc/{key}", index))?
+        } else {
+            self.connection.host.join(&format!("{}/_create/{key}", index))?
+        };
+
+        url.query_pairs_mut()
+            .append_pair("op_type", operation)
+            .append_pair("require_alias", "true");
+
+        if let Some((seq_no, primary_term)) = parsed_version {
             url.query_pairs_mut()
-                .append_pair("raise_conflicts", "true")
-                .append_pair("op_type", operation)
-                .append_pair("require_alias", "true");
-
-            if let Some((seq_no, primary_term)) = parsed_version {
-                url.query_pairs_mut()
-                    .append_pair("if_seq_no", &seq_no.to_string())
-                    .append_pair("if_primary_term", &primary_term.to_string());
-            }
-
-            self.make_request_json(Method::PUT, &url, &body).await?;
+                .append_pair("if_seq_no", &seq_no.to_string())
+                .append_pair("if_primary_term", &primary_term.to_string());
         }
 
-        return Ok(())
+        return match self.make_request_json(Method::PUT, &url, &data).await {
+            Ok(_) => Ok(true),
+            Err(ElasticError::HTTPError { code: StatusCode::CONFLICT, .. }) => Ok(false),
+            Err(err) => Err(err)
+        }
+    }
+
+    fn is_index_not_found_error(message: &str) -> bool {
+        let mut message: JsonMap = match serde_json::from_str(&message) {
+            Ok(message) => message,
+            _ => return false,
+        };
+
+        let error = match message.remove("error") {
+            Some(serde_json::Value::Object(error)) => error,
+            _ => return false,
+        };
+
+        match error.get("type") {
+            Some(serde_json::Value::String(value)) => value == "index_not_found_exception",
+            _ => false
+        }
+    }
+
+    async fn make_request(&self, method: reqwest::Method, url: &reqwest::Url) -> Result<reqwest::Response> {
+        let mut attempt = 0;
+        loop {
+            match self.connection.make_request(&mut attempt, method.clone(), url).await {
+                Ok(response) => break Ok(response),
+                Err(ElasticError::HTTPError { code: StatusCode::NOT_FOUND, message, path }) => {
+                    if Self::is_index_not_found_error(&message) {
+                        self.ensure_collection().await?;
+                        continue    
+                    }
+                    break Err(ElasticError::HTTPError { path, code: StatusCode::NOT_FOUND, message })
+                },
+                Err(err) => break Err(err)    
+            }
+        }     
     }
 
     async fn make_request_json<R: Serialize>(&self, method: reqwest::Method, url: &reqwest::Url, body: &R) -> Result<reqwest::Response> {
@@ -628,9 +685,12 @@ impl<Schema: DSType> Collection<Schema> {
         loop {
             match self.connection.make_request_json(&mut attempt, method.clone(), url, body).await {
                 Ok(response) => break Ok(response),
-                Err(ElasticError::HTTPError { code: StatusCode::NOT_FOUND, .. }) => {
-                    self.ensure_collection().await?;
-                    continue
+                Err(ElasticError::HTTPError { code: StatusCode::NOT_FOUND, message, path }) => {
+                    if Self::is_index_not_found_error(&message) {
+                        self.ensure_collection().await?;
+                        continue    
+                    }
+                    break Err(ElasticError::HTTPError { path, code: StatusCode::NOT_FOUND, message })
                 },
                 Err(err) => break Err(err)    
             }
@@ -689,6 +749,28 @@ impl<Schema: DSType> Collection<Schema> {
         }
 
         Ok(output)
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<(Schema, (i64, i64))>> {
+        //
+        for index in self.get_index_list(None)? {
+            // prepare the url
+            let url = self.connection.host.join(&format!("{index}/_doc/{id}"))?;
+
+            // fetch all the documents
+            let response: GetResponse<Schema, ()> = match self.make_request(Method::GET, &url).await {
+                Ok(response) => response.json().await?,
+                Err(ElasticError::HTTPError { code: StatusCode::NOT_FOUND, .. }) => continue,
+                Err(err) => return Err(err)
+            };
+
+            // return the document if found
+            if let Some(doc) = response._source {
+                return Ok(Some((doc, (response._seq_no, response._primary_term))))
+            }
+        }
+
+        return Ok(None)
     }
 
     /// This function should test if the collection that you are trying to access does indeed exist
@@ -889,7 +971,7 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
 
     pub async fn execute(self) -> Result<SearchResult<FieldType, SourceType>> {
         let indices = self.collection.get_joined_index(self.catagories)?;
-        let path = format!("{indices}/_search", );
+        let path = format!("{indices}/_search");
         let mut url = self.collection.connection.host.join(&path)?;
         let body = self.prepare_body();
 
@@ -1206,7 +1288,7 @@ pub enum ElasticError {
     JSON(serde_json::Error),
     MalformedResponse,
     BadKey(String),
-    BadDocumentVersion,
+    // BadDocumentVersion,
     SerializeError(ModelError),
     ArchiveDisabled(&'static str),
     IndexHasNoArchive(Index),
@@ -1225,7 +1307,7 @@ impl std::fmt::Display for ElasticError {
             ElasticError::JSON(error) => f.write_fmt(format_args!("Issue with serialize or deserialize: {}", error)),
             ElasticError::MalformedResponse => f.write_str("A server response was not formatted as expected"),
             ElasticError::BadKey(key) => f.write_fmt(format_args!("tried to save document with invalid key: {key}")),
-            ElasticError::BadDocumentVersion => f.write_str("An invalid document version string was encountered"),
+            // ElasticError::BadDocumentVersion => f.write_str("An invalid document version string was encountered"),
             ElasticError::ArchiveDisabled(message) => f.write_str(message),
             ElasticError::IndexHasNoArchive(index) => f.write_fmt(format_args!("The index [{index}] has no archive, but one was requested.")),
             ElasticError::MappingError(err) => f.write_fmt(format_args!("Mapping error: {err}")),
@@ -1300,7 +1382,11 @@ mod test {
         // connect
         let ds = Datastore::new("http://elastic:password@localhost:9200", None, false, true).unwrap();
 
-        // delete old index
+        // delete old index, we'll recreate with a direct operation in the index
+        ds.connection.wipe(Index::RetrohuntHit, IndexCatagory::Hot).await.unwrap();
+        assert!(ds.retrohunt_hit.get("osntehuo.cenuhdon.chu").await.unwrap().is_none());
+
+        // delete old index, we'll recreate wih a bulk operation        
         ds.connection.wipe(Index::RetrohuntHit, IndexCatagory::Hot).await.unwrap();
 
         // Load a few random objects into the database
@@ -1392,6 +1478,25 @@ mod test {
             total += 1;
         }
         assert_eq!(total, 1000);
+
+        // test get and save
+        let search = ds.retrohunt_hit.search::<()>("*:*")
+            .full_source(true)
+            .size(10)
+            .execute().await.unwrap();
+        assert_eq!(search.hits.hits.len(), 10);
+        for result in search.hits.hits {
+            let (mut doc, version) = ds.retrohunt_hit.get(&result._id).await.unwrap().unwrap();
+            assert_eq!(doc, result._source);
+            doc.expiry_ts = Some(chrono::Utc::now());
+            let bad_version = (version.0 - 1, version.1);
+            assert!(!ds.retrohunt_hit.save(&result._id, &doc, bad_version).await.unwrap());
+            assert!(ds.retrohunt_hit.save(&result._id, &doc, version).await.unwrap());
+            let (doc2, version2) = ds.retrohunt_hit.get(&result._id).await.unwrap().unwrap();
+            assert_eq!(doc, doc2);
+            assert_ne!(version, version2);
+        }
+        assert!(ds.retrohunt_hit.get("osntehuo.cenuhdon.chu").await.unwrap().is_none());
 
         // test that we recreate an index on search
         // delete index

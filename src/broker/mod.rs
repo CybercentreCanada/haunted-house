@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use assemblyline_markings::classification::ClassificationParser;
-use assemblyline_models::ExpandingClassification;
+use assemblyline_models::{ClassificationString, ExpandingClassification};
 use assemblyline_models::datastore::retrohunt as models;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, SinkExt};
@@ -497,6 +497,42 @@ impl HouseCore {
         })
     }
 
+    pub async fn repeat_search(self: &Arc<Self>, key: &str, classification: ClassificationString) -> Result<RepeatOutcome> {
+        loop {
+            // fetch the old value
+            let (mut search, version) = match self.database.retrohunt.get(key).await? {
+                Some(result) => result,
+                None => return Ok(RepeatOutcome::NotFound),
+            };
+
+            if !search.finished {
+                return Ok(RepeatOutcome::AlreadyRunning)
+            }
+
+            // update search doc
+            search.completed_time = None;
+            search.finished = false;
+            search.search_classification = ClassificationString::new(self.access_engine.max_classification(search.search_classification.as_str(), classification.as_str(), false)?)?;
+            search.started_time = Utc::now();
+            let key = search.key.clone();
+
+            // save it with version    
+            if self.database.retrohunt.save(&key, &search, version).await? {
+                let mut searches = self.running_searches.write().await;
+                let (send, recv) = watch::channel(SearchProgress::Starting {  });
+                let handle = tokio::task::spawn(search_worker(self.clone(), send, search));
+                searches.insert(key, (handle, recv));    
+                return Ok(RepeatOutcome::Started)
+            }
+        }
+    }
+
+}
+
+enum RepeatOutcome {
+    Started,
+    NotFound,
+    AlreadyRunning
 }
 
 /// A data struct encapsulate the ingestion of a file

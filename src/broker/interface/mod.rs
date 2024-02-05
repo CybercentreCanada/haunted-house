@@ -29,7 +29,7 @@ use crate::logging::LoggerMiddleware;
 use crate::types::{WorkerID, FilterID};
 use crate::worker::interface::StorageStatus;
 
-use super::{HouseCore, IngestCheckStatus, IngestWatchStatus, FetchStatus};
+use super::{FetchStatus, HouseCore, IngestCheckStatus, IngestWatchStatus, RepeatOutcome};
 use super::auth::Role;
 
 /// Extractor for HTTP Header holding a bearer token in the Authorization field
@@ -136,16 +136,9 @@ impl SearcherInterface {
         searches.get(code).map(|entry|entry.1.clone())
     }
 
-    // /// Given a user classification string get their access flags
-    // pub fn parse_user_classification(&self, classification: &str) -> Result<HashSet<String>> {
-    //     self.core.prepare_access(classification)
-    // }
-
-    // /// Given a user classification string get their access flags
-    // pub fn parse_data_classification(&self, classification: &str) -> Result<AccessControl> {
-    //     self.core.prepare_classification(classification)
-    // }
-
+    pub async fn repeat_search(&self, key: &str, classification: ClassificationString) -> Result<RepeatOutcome> {
+        self.core.repeat_search(key, classification).await
+    }
 }
 
 
@@ -187,7 +180,29 @@ async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Js
     }))
 }
 
+
+/// Parameters to request a retrohunt search
+#[derive(Deserialize)]
+pub struct RepeatSearchRequest {
+    /// key of search to repeat
+    pub key: String,
+    /// Maximum classification of results in the search
+    pub search_classification: ClassificationString,
+}
+
+/// API endpoint for starting a new search
+#[handler]
+async fn repeat_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<RepeatSearchRequest>) -> poem::Result<http::StatusCode> {
+    Ok(match interface.repeat_search(&request.key, request.search_classification).await? {
+        RepeatOutcome::Started => http::StatusCode::OK,
+        RepeatOutcome::NotFound => http::StatusCode::NOT_FOUND,
+        RepeatOutcome::AlreadyRunning => http::StatusCode::CONFLICT,
+    })
+}
+
+
 #[derive(Serialize)]
+#[serde(tag="type", rename="lowercase")]
 pub (crate) enum SearchProgress {
     Starting {},
     Filtering {
@@ -201,7 +216,7 @@ pub (crate) enum SearchProgress {
     },
 }
 
-/// API endpoint to open a websocket for high volume file ingestion
+/// Endpoint that providesa stream of status messages
 #[handler]
 async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>, ws: poem::web::websocket::WebSocket) -> poem::Result<impl IntoResponse> {
     let mut feed = match interface.search_status(&code).await {
@@ -285,6 +300,7 @@ pub async fn _serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<Hous
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
+        .at("/search/repeat/:code", get(repeat_search))
         .at("/status", get(get_status))
         .at("/status/detailed", get(get_detailed_status))
         .with(TokenMiddleware::new(core.clone()))
