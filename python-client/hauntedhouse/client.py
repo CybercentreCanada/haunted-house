@@ -57,13 +57,14 @@ class Client:
         response = result.json()
         return response['code']
 
-    def repeat_search(self, key: str, access_control: str):
+    def repeat_search(self, key: str, access_control: str, expiry):
         """Will trigger a search to rerun with the classification expanded to include the given value."""
         logger.info("Repeat retrohunt search %s", key)
         # Send the search request
         result = self.session.post(self.address + '/repeat/' + key, json={
             'key': key,
             'search_classification': access_control,
+            'expiry': expiry,
         })
         result.raise_for_status()
 
