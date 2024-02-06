@@ -1,4 +1,5 @@
 from __future__ import annotations
+import typing
 import logging
 import json
 
@@ -68,7 +69,7 @@ class Client:
         })
         result.raise_for_status()
 
-    def search_status(self, code: str) -> dict:
+    def search_status(self, code: str) -> typing.Generator[dict, None, None]:
         """Connect to the status websocket and stream the results."""
         # prepare connection info
         url = to_websocket(self.address) + '/search/' + code
