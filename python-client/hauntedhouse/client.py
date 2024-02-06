@@ -1,188 +1,87 @@
 from __future__ import annotations
-import asyncio
 import logging
-import uuid
-# import typing
+import json
 
-import arrow
-import aiohttp
 import requests
-import pydantic
+from websockets.sync.client import connect
 
 
 logger = logging.getLogger('hauntedhouse.client')
-FALSE_LEVELS = ['NULL', 'INV']
 
 
-class IngestError(RuntimeError):
-    ...
-
-
-class CouldNotParseRule(ValueError):
-    ...
-
-
-class DuplicateToken(KeyError):
-    ...
-
-
-class SearchStatus(pydantic.BaseModel):
-    code: str
-    finished: bool
-    warnings: list[str]
-    errors: list[str]
-    hits: list[str]
-    truncated: bool
-    phase: str
-    progress: tuple[int, int]
-    query: str
+def to_websocket(url: str) -> str:
+    """Switch an http url to websocket."""
+    if url.lower().startswith("https://"):
+        return 'wss://' + url[8:]
+    return 'wss://' + url
 
 
 class Client:
     def __init__(self, address: str, api_key: str, verify: bool = True):
         self.address = address
-        # self.access_engine = Classification(classification)
 
-        self.ingest_connection_lock = asyncio.Lock()
-        self.ingest_connection: None | aiohttp.ClientWebSocketResponse = None
-        self.ingest_task: None | asyncio.Task = None
-        self.ingest_futures: dict[str, asyncio.Future] = {}
+        self.session = requests.Session()
+        self.session.verify = verify
+        self.session.headers['Authorization'] = 'Bearer ' + api_key
 
-        conn = aiohttp.TCPConnector(limit=10, verify_ssl=verify)
-        self.session = aiohttp.ClientSession(
-            base_url=self.address,
-            headers={'Authorization': 'Bearer ' + api_key},
-            connector=conn
-        )
+    def close(self):
+        """Close requests session."""
+        self.session.close()
 
-        self.sync_session = requests.Session()
-        self.sync_session.verify = verify
-        self.sync_session.headers['Authorization'] = 'Bearer ' + api_key
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.close()
-
-    async def close(self):
-        await self.session.close()
-
-    async def start_search(self, yara_rule: str, access_control: str, archive_only=False) -> SearchStatus:
-
-        # If we only want archived material set the start date to the far future
-        start_date = None
+    def start_search(self, yara_rule: str, rule_classification: str, search_classification: str,
+                     creator: str, description: str, expiry, archive_only=False) -> str:
+        """Start a new search."""
+        logger.info("Start retrohunt search for %s", creator)
+        indices = 'hot_and_archive'
         if archive_only:
-            start_date = '9000-01-01T00:00:00.000'
+            indices = 'archive'
 
         # Send the search request
-        result = await self.session.post('/search/', json={
-            'view': access_control,
-            'classification': access_control,
+        result = self.session.post(self.address + '/search/', json={
+            # Classification for the retrohunt job
+            'classification': rule_classification,
+            # Maximum classification of results in the search
+            'search_classification': search_classification,
+            # User who created this retrohunt job
+            'creator': creator,
+            # Human readable description of this retrohunt job
+            'description': description,
+            # Expiry timestamp of this retrohunt job
+            'expiry_ts': expiry,
+            # What sorts of indices to run on
+            'indices': indices,
+            # Text of original yara signature run
             'yara_signature': yara_rule,
-            'start_date': start_date,
-            'end_date': None,
+        })
+        result.raise_for_status()
+        response = result.json()
+        return response['code']
+
+    def repeat_search(self, key: str, access_control: str):
+        """Will trigger a search to rerun with the classification expanded to include the given value."""
+        logger.info("Repeat retrohunt search %s", key)
+        # Send the search request
+        result = self.session.post(self.address + '/repeat/' + key, json={
+            'key': key,
+            'search_classification': access_control,
         })
         result.raise_for_status()
 
-        # Parse the message
-        return SearchStatus(**await result.json())
+    def search_status(self, code: str) -> dict:
+        """Connect to the status websocket and stream the results."""
+        # prepare connection info
+        url = to_websocket(self.address) + '/search/' + code
+        headers = {}
+        for name, value in self.session.headers.items():
+            if isinstance(value, bytes):
+                headers[name] = value.decode()
+            else:
+                headers[name] = value
 
-    def start_search_sync(self, yara_rule: str, access_control: str, archive_only=False) -> SearchStatus:
-
-        # If we only want archived material set the start date to the far future
-        start_date = None
-        if archive_only:
-            start_date = '9000-01-01T00:00:00.000'
-
-        # Send the search request
-        result = self.sync_session.post(self.address + '/search/', json={
-            'view': access_control,
-            'classification': access_control,
-            'yara_signature': yara_rule,
-            'start_date': start_date,
-            'end_date': None,
-        })
-        result.raise_for_status()
-
-        # Parse the message
-        return SearchStatus(**result.json())
-
-    async def search_status(self, code: str, access: str) -> SearchStatus:
-        # Send the request
-        result = await self.session.get('/search/' + code, json={'access': access})
-        result.raise_for_status()
-
-        # Parse the message
-        return SearchStatus(**await result.json())
-
-    def search_status_sync(self, code: str, access: str) -> SearchStatus:
-        # Send the request
-        result = self.sync_session.get(self.address + '/search/' + code, json={'access': access})
-        result.raise_for_status()
-
-        # Parse the message
-        return SearchStatus(**result.json())
-
-    async def ingest(self, sha256: str, classification: str, expiry, token: None | str = None):
-        token = str(token or uuid.uuid4().hex)
-        if token in self.ingest_futures:
-            raise DuplicateToken(token)
-
-        future: asyncio.Future[str] = asyncio.Future()
-        try:
-            if expiry is not None:
-                expiry = arrow.get(expiry).int_timestamp
-            ws = await self._get_ingest_socket()
-            self.ingest_futures[token] = future
-
-            body = {
-                'token': token,
-                'hash': sha256,
-                'access': classification,
-                'expiry': expiry,
-                'block': True,
-            }
-            await ws.send_json(body)
-            return future
-
-        except Exception:
-            self.ingest_futures.pop(token, None)
-            raise
-
-    async def _get_ingest_socket(self) -> aiohttp.ClientWebSocketResponse:
-        async with self.ingest_connection_lock:
-            if self.ingest_connection is None:
-                self.ingest_connection = await self.session.ws_connect("/ingest/stream/", protocols=['ingest-stream'])
-                self.ingest_task = asyncio.create_task(self._socket_listener(self.ingest_connection))
-                self.ingest_futures = {}
-            return self.ingest_connection
-
-    async def _socket_listener(self, ws: aiohttp.ClientWebSocketResponse):
-        while not ws.closed:
-            try:
-                message = await ws.receive_json()
-                # Figure out any token with the message
-                token = message.get('token', None)
-                if token is None:
-                    logger.error("Unknown message from ingest feed: %s", message)
-                    continue
-
-                # Find the future associated with the token
-                future = self.ingest_futures.pop(token, None)
-                if future is None:
-                    logger.error("Unexpected message from ingest feed: %s", message)
-                    continue
-
-                # Satisfy the future
-                if message.get('success'):
-                    future.set_result(message.get("token", ""))
-                else:
-                    future.set_exception(IngestError(message.get('error', '')))
-            except Exception:
-                logger.exception("Error in receiveed message")
-        self.ingest_connection = None
-
-        # Clear futures wating on this socket to complete
-        for future in self.ingest_futures.values():
-            future.cancel()
+        # Connect to status feed
+        with connect(url, additional_headers=headers) as ws:
+            while True:
+                message = json.loads(ws.recv())
+                yield message
+                if message.get('type', '') == 'finished':
+                    break
