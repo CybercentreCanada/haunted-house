@@ -21,24 +21,20 @@ use crate::error::ErrorKinds;
 
 
 /// Configures a blob storage location
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum BlobStorageConfig {
     /// Store blobs in a local temporary directory
-    TempDir{
-        /// How much space to dedicate to the temporary directory
-        size: u64
-    },
+    TempDir{ },
     /// Store blobs in a local directory
     Directory {
         /// Location on disk for the blob store
         path: PathBuf,
-        /// How much space to dedicate to the blob store
-        size: u64
     },
     /// Use an azure blob storage account
     Azure (AzureBlobConfig),
     /// Use an s3 server
     S3(S3Config),
+    URL(Vec<String>),
 }
 
 impl Default for BlobStorageConfig {
@@ -52,19 +48,116 @@ impl Default for BlobStorageConfig {
     }
 }
 
+fn url_to_other_config(urls: &Vec<String>) -> Result<BlobStorageConfig> {
+    if urls.len() != 1 {
+        return Err(ErrorKinds::FilestoreError("Only one filestore url expected.".to_string()).into())
+    }
+    let url = urls[0].clone();
+
+    let info = url::Url::parse(&url)?;
+    match info.scheme() {
+        "temp" => { 
+            Ok(BlobStorageConfig::TempDir {  })
+        },
+        "file" => { 
+            Ok(BlobStorageConfig::Directory { path: info.path().into() })
+        },
+        "azure" => {
+            let domain = info.domain().ok_or(ErrorKinds::FilestoreError("Azure requires domain".to_owned()))?;
+            let mut subdomain = domain.split(".");
+            let mut access_key = "".to_owned();
+            let mut use_emulator = false;
+
+            for (key, value) in info.query_pairs() {
+                match key.as_ref() {
+                    "access_key" => { access_key = value.to_string(); }
+                    "use_emulator" => { use_emulator = true; }
+                    _ => {}
+                }
+            }
+
+            Ok(BlobStorageConfig::Azure(AzureBlobConfig{
+                account: subdomain.next().unwrap().to_owned(),
+                access_key,
+                container: info.path().trim_start_matches("/").to_owned(),
+                use_emulator,
+            }))
+        },
+        "s3" => {
+            let auth = info.authority();
+            let (access_key_id, secret_access_key) = match auth.split_once("@") {
+                Some((auth, _)) => 
+                    match auth.split_once(":") {
+                        Some((id, key)) => (Some(id.to_string()), Some(key.to_string())),
+                        None => (None, None),
+                    }
+                None => (None, None)
+            };
+            let mut s3_bucket = None;
+            let mut use_ssl = true;
+            let mut aws_region = "".to_owned();
+
+            for (key, value) in info.query_pairs() {
+                match key.as_ref() {
+                    "s3_bucket" => { s3_bucket = Some(value.to_string()); },
+                    "use_ssl" => { use_ssl = value.trim().to_lowercase().parse()?; },
+                    "aws_region" => { aws_region = value.to_string(); },
+                    _ => {},
+                }
+            }
+
+            let s3_bucket = match s3_bucket {
+                Some(bucket) => bucket,
+                None => return Err(ErrorKinds::FilestoreError("s3 requires bucket name".to_owned()).into()),
+            };
+
+            let endpoint = match info.domain() {
+                Some(domain) => {
+                    let mut endpoint = domain.to_owned();
+                    if let Some(port) = info.port() {
+                        endpoint += &(":".to_string() + &port.to_string());
+                    }
+                    endpoint += info.path();
+                    Some(endpoint)
+                }
+                None => None,
+            };
+
+            Ok(BlobStorageConfig::S3(S3Config { 
+                access_key_id, 
+                secret_access_key,
+                endpoint_url: endpoint, 
+                region_name: aws_region, 
+                bucket: s3_bucket, 
+                no_tls_verify: !use_ssl 
+            }))
+        },
+        other => Err(anyhow::anyhow!("No such storage scheme: {}", other))
+    }
+}
+
 /// Setup a blob storage
 pub async fn connect(config: &BlobStorageConfig) -> Result<BlobStorage> {
+    let url_config;
+    let config = if let BlobStorageConfig::URL(urls) = config {
+        url_config = url_to_other_config(urls)?;
+        &url_config
+    } else {
+        config
+    };
+
     match config {
-        BlobStorageConfig::TempDir { .. } => {
+        BlobStorageConfig::TempDir { } => {
             LocalDirectory::new_temp().context("Error setting up local blob store")
         }
-        BlobStorageConfig::Directory { path, .. } => {
+        BlobStorageConfig::Directory { path } => {
             Ok(BlobStorage::Local(LocalDirectory::new(path.clone())))
         },
         BlobStorageConfig::Azure(azure) =>
             Ok(BlobStorage::Azure(AzureBlobStore::new(azure.clone()).await?)),
         BlobStorageConfig::S3(config) =>
             Ok(BlobStorage::S3(S3BlobStore::new(config.clone()).await?)),
+        BlobStorageConfig::URL(_) => panic!(),
     }
 }
 
@@ -285,7 +378,7 @@ pub struct AzureBlobStore {
 }
 
 /// Configure access to an azure blob store
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AzureBlobConfig {
     /// Azure account identifier
     pub account: String,
@@ -494,7 +587,7 @@ pub struct S3BlobStore {
 }
 
 /// Configuration to access s3 bucket
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct S3Config {
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
@@ -718,7 +811,7 @@ impl S3BlobStore {
 mod test {
     use std::io::Write;
 
-    use crate::storage::{AzureBlobStore, AzureBlobConfig};
+    use crate::storage::{url_to_other_config, AzureBlobConfig, AzureBlobStore, BlobStorageConfig, S3Config};
 
     use super::S3BlobStore;
 
@@ -899,4 +992,39 @@ mod test {
         let output_file = tempfile::NamedTempFile::new().unwrap();
         assert!(store.download("Not a file", output_file.path().to_owned()).await.is_err());
     }
+
+    #[test]
+    fn parse_azure_url() {
+        let config = url_to_other_config(&vec!["azure://assemblylinefilestore.blob.core.windows.net/devfiles?access_key=PassW0rd".to_owned()]).unwrap();
+        assert_eq!(config, BlobStorageConfig::Azure(AzureBlobConfig { 
+            account: "assemblylinefilestore".to_owned(), 
+            access_key: "PassW0rd".to_owned(), 
+            container: "devfiles".to_owned(), 
+            use_emulator: false, 
+        }));
+    }
+
+    #[test]
+    fn parse_s3_url() {
+        let config = url_to_other_config(&vec!["s3://UNAMe:Passwrd@filestore:9000?s3_bucket=al-cache&use_ssl=False".to_owned()]).unwrap();
+        assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
+            access_key_id: Some("UNAMe".to_owned()), 
+            secret_access_key: Some("Passwrd".to_owned()), 
+            endpoint_url: Some("filestore:9000".to_owned()),
+            region_name: "".to_string(), 
+            bucket: "al-cache".to_string(), 
+            no_tls_verify: true 
+        }));
+
+        let config = url_to_other_config(&vec!["s3://UNAMe:Passwrd@filestore.com:9000/carebear?s3_bucket=al-cache&use_ssl=False&aws_region=hats".to_owned()]).unwrap();
+        assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
+            access_key_id: Some("UNAMe".to_owned()), 
+            secret_access_key: Some("Passwrd".to_owned()), 
+            endpoint_url: Some("filestore.com:9000/carebear".to_owned()),
+            region_name: "hats".to_string(), 
+            bucket: "al-cache".to_string(), 
+            no_tls_verify: true 
+        }));
+    }
+
 }

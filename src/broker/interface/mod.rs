@@ -136,8 +136,8 @@ impl SearcherInterface {
         searches.get(code).map(|entry|entry.1.clone())
     }
 
-    pub async fn repeat_search(&self, key: &str, classification: ClassificationString) -> Result<RepeatOutcome> {
-        self.core.repeat_search(key, classification).await
+    pub async fn repeat_search(&self, key: &str, classification: ClassificationString, expiry: Option<DateTime<Utc>>) -> Result<RepeatOutcome> {
+        self.core.repeat_search(key, classification, expiry).await
     }
 }
 
@@ -188,12 +188,13 @@ pub struct RepeatSearchRequest {
     pub key: String,
     /// Maximum classification of results in the search
     pub search_classification: ClassificationString,
+    pub expiry: Option<DateTime<Utc>>,
 }
 
 /// API endpoint for starting a new search
 #[handler]
 async fn repeat_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<RepeatSearchRequest>) -> poem::Result<http::StatusCode> {
-    Ok(match interface.repeat_search(&request.key, request.search_classification).await? {
+    Ok(match interface.repeat_search(&request.key, request.search_classification, request.expiry).await? {
         RepeatOutcome::Started => http::StatusCode::OK,
         RepeatOutcome::NotFound => http::StatusCode::NOT_FOUND,
         RepeatOutcome::AlreadyRunning => http::StatusCode::CONFLICT,
@@ -211,7 +212,7 @@ pub (crate) enum SearchProgress {
     Yara {
         progress: f64, 
     },
-    Finished{
+    Finished {
         search: models::Retrohunt
     },
 }
@@ -300,7 +301,7 @@ pub async fn _serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<Hous
     let app = Route::new()
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
-        .at("/search/repeat/:code", get(repeat_search))
+        .at("/repeat/", post(repeat_search))
         .at("/status", get(get_status))
         .at("/status/detailed", get(get_detailed_status))
         .with(TokenMiddleware::new(core.clone()))

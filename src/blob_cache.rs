@@ -545,7 +545,6 @@ mod test {
         let cache_size = 1024;
         let storage = connect(&BlobStorageConfig::Directory {
             path: storage_dir.path().to_owned(),
-            size: 100 << 30
         }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
@@ -581,7 +580,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned(), size: 1 << 30 }).await.unwrap();
+        let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
         {
@@ -602,7 +601,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned(), size: 1 << 30 }).await.unwrap();
+        let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
         let mut rng = rand::thread_rng();

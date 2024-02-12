@@ -14,6 +14,7 @@ pub enum ErrorKinds {
     // IndexHasUnsupportedType,
     // IndexCorruptTable,
     // VarintIncomplete,
+    FilestoreError(String),
     /// A filter was requested which does not exist
     FilterUnknown(FilterID),
     /// An otherwise not distinguished error occurred with blob storage

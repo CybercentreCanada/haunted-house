@@ -9,7 +9,7 @@ use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
 use crate::query::Query;
 use crate::storage::BlobStorage;
-use crate::types::{ExpiryGroup, Sha256, FilterID, FileInfo};
+use crate::types::{ExpiryGroup, FilterID, FileInfo};
 
 use super::YaraTask;
 use super::database::{IngestStatus, Database, IngestStatusBundle};

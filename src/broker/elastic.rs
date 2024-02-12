@@ -17,7 +17,6 @@ use super::fetcher::FetchedFile;
 
 const MAX_DELAY: Duration = Duration::from_secs(60);
 const PIT_KEEP_ALIVE: &str = "5m";
-const CREATE_TOKEN: &str = "create";
 
 #[derive(Clone)]
 pub struct Datastore {
@@ -53,8 +52,7 @@ impl Datastore {
     pub (crate) async fn fetch_files(&self, seek_point: chrono::DateTime<chrono::Utc>, batch_size: usize) -> Result<Vec<FetchedFile>> {
         let result = self.file.search::<JsonMap>(&format!("seen.last: [{} TO *]", seek_point.to_rfc3339()))
             .size(batch_size)
-            .index_catagories(IndexCatagory::HotAndArchive)
-            .sort("seen.last:asc")
+            .sort(json!({"seen.last": "asc"}))
             .fields(vec!["classification", "expiry_ts", "sha256", "seen.last"])
             .execute().await?;
 
@@ -557,7 +555,8 @@ impl<Schema: DSType> Clone for Collection<Schema> {
     }
 }
 
-enum SaveOperation {
+#[allow(unused)]
+pub enum SaveOperation {
     Create,
     Version(Option<(i64, i64)>)
 }
@@ -930,8 +929,8 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
         self.track_total_hits = Some(hits); self
     }
 
-    pub fn sort(mut self, sort: &'a str) -> Self {
-        self.sort = vec![sort.into()]; self
+    pub fn sort(mut self, sort: serde_json::Value) -> Self {
+        self.sort = vec![sort]; self
     }
 
     pub fn fields(mut self, fields: Vec<&'a str>) -> Self {

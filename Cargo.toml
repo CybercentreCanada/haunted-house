@@ -1,6 +1,6 @@
 [package]
 name = "haunted-house"
-version = "0.0.37"
+version = "0.0.38"
 edition = "2021"
 default-run = "haunted-house"
 
@@ -41,7 +41,7 @@ nom = "7"
 hex = "0.4"
 parse-size = { version = "1", features = ["std"] }
 schemars = { version = "0.8.6", optional = true }
-serde_yaml = { version = "0.9", optional = true }
+# serde_yaml = { version = "0.9" }
 boreal-parser = "0.3"
 base64 = "0.21"
 strum = { version = "0.25", features = ["derive"] }
@@ -77,7 +77,7 @@ url = "2.4"
 # Assemblyline libraries
 # assemblyline-client = "0.1"
 assemblyline-markings = "0.1"
-assemblyline-models = { version = "0.1", path = "../assemblyline-rust/assemblyline-models/" }
+assemblyline-models = { version = "0.1" }
 
 # Cloud service libraries
 azure_core = "0.8"
@@ -99,7 +99,7 @@ assertor = "*"
 [features]
 #python = ["pyo3", "dep:pyo3-asyncio", "dep:pyo3-log"]
 #extension-module = ["python", "pyo3/extension-module"]
-serde_yaml = ["dep:serde_yaml"]
-operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
+#serde_yaml = ["dep:serde_yaml"]
+#operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
 #default = ["extension-module"]
 default = []

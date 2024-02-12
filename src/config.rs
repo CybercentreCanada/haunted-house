@@ -130,7 +130,7 @@ pub struct FieldExtractor(Vec<String>);
 #[serde(default)]
 pub struct Datastore {
     /// Url to connect to elasticsearch server
-    pub url: String,
+    pub url: Vec<String>,   
     /// Seconds between polling calls to fetch more file data
     pub poll_interval: f64,
     /// Maximum number of pending ingestion tasks
@@ -190,7 +190,7 @@ impl ClassificationConfig {
 
     pub fn init(&self) -> Result<Arc<ClassificationParser>> {
         let definition = self.load()?;
-        let classification: assemblyline_markings::config::ClassificationConfig = serde_json::from_str(&definition)?;
+        let classification = assemblyline_markings::config::ready_classification(Some(&definition))?;
         let access_engine = Arc::new(ClassificationParser::new(classification)?);
         assemblyline_markings::set_default(access_engine.clone());
         Ok(access_engine)

@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use anyhow::{Result, Context};
 use log::{info, error};
 use crate::blob_cache::BlobCache;
-use crate::types::{FileInfo, Sha256};
+use crate::types::FileInfo;
 use crate::worker::database::Database;
 use crate::worker::manager::WorkerState;
 

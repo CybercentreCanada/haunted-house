@@ -52,7 +52,11 @@ pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
     // Initialize database
     info!("Connecting to database.");
     let ec = &config.datastore;
-    let client = Datastore::new(&ec.url, ec.ca_cert.as_deref(), ec.connect_unsafe, ec.archive_access)?;
+    let client = if let Some(url) = ec.url.get(0) {
+        Datastore::new(url, ec.ca_cert.as_deref(), ec.connect_unsafe, ec.archive_access)?
+    } else {
+        return Err(anyhow::anyhow!("Datastore URL must be configured."));
+    };
 
     // Start server core
     info!("Starting server core.");
@@ -177,7 +181,7 @@ impl HouseCore {
         );
 
         // Load classification system
-        let access_engine = config.classification.init()?;
+        let access_engine = config.classification.init().context("loading classification configuration")?;
 
         // Build a classification engine
         let (fetch_send, fetch_recv) = mpsc::channel(64);
@@ -497,7 +501,7 @@ impl HouseCore {
         })
     }
 
-    pub async fn repeat_search(self: &Arc<Self>, key: &str, classification: ClassificationString) -> Result<RepeatOutcome> {
+    pub async fn repeat_search(self: &Arc<Self>, key: &str, classification: ClassificationString, expiry: Option<DateTime<Utc>>) -> Result<RepeatOutcome> {
         loop {
             // fetch the old value
             let (mut search, version) = match self.database.retrohunt.get(key).await? {
@@ -509,10 +513,21 @@ impl HouseCore {
                 return Ok(RepeatOutcome::AlreadyRunning)
             }
 
-            // update search doc
+            let new_classification = ClassificationString::new(self.access_engine.max_classification(search.search_classification.as_str(), classification.as_str(), false)?)?;
+            if new_classification == search.search_classification {
+                return Ok(RepeatOutcome::Started)
+            }
+
+            // Update expiry
+            search.expiry_ts = match (search.expiry_ts, expiry) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None
+            };
+
+            // update search doc to run again
             search.completed_time = None;
             search.finished = false;
-            search.search_classification = ClassificationString::new(self.access_engine.max_classification(search.search_classification.as_str(), classification.as_str(), false)?)?;
+            search.search_classification = new_classification;
             search.started_time = Utc::now();
             let key = search.key.clone();
 
@@ -529,7 +544,7 @@ impl HouseCore {
 
 }
 
-enum RepeatOutcome {
+pub enum RepeatOutcome {
     Started,
     NotFound,
     AlreadyRunning
