@@ -18,11 +18,14 @@ def to_websocket(url: str) -> str:
 
 
 class Client:
-    def __init__(self, address: str, api_key: str, verify: bool = True):
+    def __init__(self, address: str, api_key: str, verify: typing.Optional[str]):
         self.address = address
 
         self.session = requests.Session()
-        self.session.verify = verify
+        if verify:
+            self.session.verify = verify
+        else:
+            self.session.verify = False
         self.session.headers['Authorization'] = 'Bearer ' + api_key
 
     def close(self):
