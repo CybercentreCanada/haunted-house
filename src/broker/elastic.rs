@@ -9,9 +9,10 @@ use serde::{Deserialize, de::DeserializeOwned, Serialize};
 use serde_json::json;
 use serde_with::{SerializeDisplay, DeserializeFromStr};
 use struct_metadata::Described;
+use chrono::{DateTime, Utc};
 
 use crate::{error::Context, types::{FileInfo, JsonMap}};
-use assemblyline_models::{datastore::{self as models, retrohunt::IndexCatagory, RetrohuntHit}, ElasticMeta, meta::default_settings, ExpandingClassification, ModelError};
+use assemblyline_models::{datastore::{self as models, retrohunt::IndexCatagory, RetrohuntHit}, meta::default_settings, ElasticMeta, ExpandingClassification, ModelError};
 
 use super::fetcher::FetchedFile;
 
@@ -44,22 +45,37 @@ impl Datastore {
 
         let mut out = vec![];
         while let Some(search) = result.next().await? {
-            out.push(search._source);
+            out.push(search._source.ok_or(ElasticError::MalformedResponse)?);
         }
         Ok(out)
     }
 
     pub (crate) async fn fetch_files(&self, seek_point: chrono::DateTime<chrono::Utc>, batch_size: usize) -> Result<Vec<FetchedFile>> {
-        let result = self.file.search::<JsonMap>(&format!("seen.last: [{} TO *]", seek_point.to_rfc3339()))
+        #[derive(Debug, Deserialize, Default)]
+        struct Fields {
+            classification: Vec<String>,
+            expiry_ts: Vec<DateTime<Utc>>,
+            sha256: Vec<String>,
+            #[serde(alias="seen.last")]
+            seen: Vec<DateTime<Utc>>,
+        }
+
+        let result = self.file.search::<Fields>(&format!("seen.last: [{} TO *]", seek_point.to_rfc3339()))
             .size(batch_size)
+            .full_source(false)
             .sort(json!({"seen.last": "asc"}))
             .fields(vec!["classification", "expiry_ts", "sha256", "seen.last"])
             .execute().await?;
 
         // read the body of our response
         let mut out = vec![];
-        for row in result.hits.hits {
-            out.push(FetchedFile::extract(&row.fields).ok_or(ElasticError::MalformedResponse)?)
+        for mut row in result.hits.hits {
+            out.push(FetchedFile { 
+                seen: row.fields.seen.pop().ok_or(ElasticError::MalformedResponse)?, 
+                sha256: row.fields.sha256.pop().ok_or(ElasticError::MalformedResponse)?, 
+                classification: row.fields.classification.pop().ok_or(ElasticError::MalformedResponse)?, 
+                expiry: row.fields.expiry_ts.pop(),
+            })
         }
         return Ok(out)
     }
@@ -662,6 +678,13 @@ impl<Schema: DSType> Collection<Schema> {
         }
     }
 
+    async fn refresh(&self) -> Result<()> {
+        for index in self.get_index_list(None)? {
+            self.make_request(Method::POST, &self.connection.host.join(&format!("{index}/_refresh"))?).await?;
+        }
+        Ok(())
+    }
+
     async fn make_request(&self, method: reqwest::Method, url: &reqwest::Url) -> Result<reqwest::Response> {
         let mut attempt = 0;
         loop {
@@ -900,6 +923,7 @@ pub struct SearchBuilder<'a, FieldType, SourceType: DSType> {
     _source_data_type: PhantomData<SourceType>
 }
 
+#[allow(unused)]
 impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilder<'a, FieldType, SourceType> {
 
     pub fn new(collection: Collection<SourceType>, query: &'a str) -> Self {
@@ -1254,29 +1278,32 @@ pub struct SearchResult<FieldType: Default, SourceType> {
     pub hits: SearchResultHits<FieldType, SourceType>
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SearchResultHits<FieldType: Default, SourceType> {
     pub total: SearchResultHitTotals,
     pub max_score: Option<f64>,
     pub hits: Vec<SearchResultHitItem<FieldType, SourceType>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SearchResultHitTotals {
     pub value: u64,
     pub relation: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SearchResultHitItem<FieldType, SourceType> {
     pub _index: String,
     pub _id: String,
     pub _score: Option<f64>,
-    pub _source: SourceType,
+    #[serde(default="default_source")]
+    pub _source: Option<SourceType>,
     pub sort: serde_json::Value,
     #[serde(default)]
     pub fields: FieldType,
 }
+
+fn default_source<T>() -> Option<T> { None }
 
 #[derive(Debug)]
 pub enum ElasticError {
@@ -1366,16 +1393,66 @@ mod test {
 
     use super::{Datastore, Index};
     use assemblyline_markings::classification::ClassificationParser;
-    use assemblyline_models::{datastore::retrohunt::IndexCatagory, Sha256};
-    use rand::{thread_rng, Rng};
+    use assemblyline_models::{datastore::{file::Seen, retrohunt::IndexCatagory}, ExpandingClassification, Sha256};
+    use rand::{distributions::{Alphanumeric, DistString}, thread_rng, Rng};
     use serde::Deserialize;
 
     fn setup_classification() {
         assemblyline_markings::set_default(std::sync::Arc::new(ClassificationParser::new(serde_json::from_str(r#"{"enforce":true,"dynamic_groups":false,"dynamic_groups_type":"all","levels":[{"aliases":["OPEN"],"css":{"color":"default"},"description":"N/A","lvl":1,"name":"LEVEL 0","short_name":"L0"},{"aliases":[],"css":{"color":"default"},"description":"N/A","lvl":5,"name":"LEVEL 1","short_name":"L1"},{"aliases":[],"css":{"color":"default"},"description":"N/A","lvl":15,"name":"LEVEL 2","short_name":"L2"}],"required":[{"aliases":["LEGAL"],"description":"N/A","name":"LEGAL DEPARTMENT","short_name":"LE","require_lvl":null,"is_required_group":false},{"aliases":["ACC"],"description":"N/A","name":"ACCOUNTING","short_name":"AC","require_lvl":null,"is_required_group":false},{"aliases":[],"description":"N/A","name":"ORIGINATOR CONTROLLED","short_name":"ORCON","require_lvl":null,"is_required_group":true},{"aliases":[],"description":"N/A","name":"NO CONTRACTOR ACCESS","short_name":"NOCON","require_lvl":null,"is_required_group":true}],"groups":[{"aliases":[],"auto_select":false,"description":"N/A","name":"GROUP A","short_name":"A","solitary_display_name":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"GROUP B","short_name":"B","solitary_display_name":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"GROUP X","short_name":"X","solitary_display_name":"XX"}],"subgroups":[{"aliases":["R0"],"auto_select":false,"description":"N/A","name":"RESERVE ONE","short_name":"R1","require_group":null,"limited_to_group":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"RESERVE TWO","short_name":"R2","require_group":"X","limited_to_group":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"RESERVE THREE","short_name":"R3","require_group":null,"limited_to_group":"X"}],"restricted":"L2","unrestricted":"L0"}"#).unwrap()).unwrap()))
     }
+    
+    #[tokio::test]
+    async fn list_files() {
+        setup_classification();
+
+        // connect
+        let ds = Datastore::new("http://elastic:password@localhost:9200", None, false, true).unwrap();
+        ds.connection.wipe(Index::File, IndexCatagory::Hot).await.unwrap();
+
+        let mut prng = thread_rng();
+        for _ in 0..1000 {
+            let file = assemblyline_models::datastore::File { 
+                ascii: Alphanumeric.sample_string(&mut prng, 10), 
+                classification: ExpandingClassification::new("L2//R1".to_owned()).unwrap(), 
+                entropy: 0.0, 
+                expiry_ts: Some(chrono::Utc::now() + chrono::Duration::days(2)), 
+                is_section_image: true, 
+                is_supplementary: false,
+                comments: Default::default(),
+                label_categories: Default::default(),
+                labels: Default::default(),
+                hex: Alphanumeric.sample_string(&mut prng, 10), 
+                md5: prng.gen(), 
+                magic: Alphanumeric.sample_string(&mut prng, 10), 
+                mime: None, 
+                seen: Seen { 
+                    count: prng.gen::<u16>() as u64, 
+                    first: chrono::Utc::now(), 
+                    last: chrono::Utc::now() 
+                }, 
+                sha1: prng.gen(), 
+                sha256: prng.gen(), 
+                size: prng.gen::<u16>() as u64, 
+                ssdeep: prng.gen(), 
+                file_type: Alphanumeric.sample_string(&mut prng, 10), 
+                tlsh: None, 
+                from_archive: false, 
+                uri_info: None, 
+            };
+            ds.file.save(&file.sha256, &file, None).await.unwrap();
+        }
+        ds.file.refresh().await.unwrap();
+
+        let current = chrono::Utc::now() - chrono::Duration::days(2);
+        let files = ds.fetch_files(current, 500).await.unwrap();
+        assert_eq!(files.len(), 500);
+
+        let files = ds.fetch_files(current, 2500).await.unwrap();
+        assert_eq!(files.len(), 1000);
+    }
 
     #[tokio::test]
-    async fn basic_elastic_operations() {
+    async fn basic_elastic_operations_on_hits() {
         setup_classification();
 
         // connect
@@ -1441,10 +1518,11 @@ mod test {
         assert_eq!(search.hits.total.value, 50);
         assert_eq!(search.hits.hits.len(), 50);
         for item in search.hits.hits {
-            let info = subset.iter().find(|x|x.hash.to_string() == item._source.sha256.to_string()).unwrap();
+            let source = item._source.unwrap();
+            let info = subset.iter().find(|x|x.hash.to_string() == source.sha256.to_string()).unwrap();
             assert_eq!(item.fields.sha256, vec![info.hash.to_string().parse().unwrap()]);
             assert_eq!(item.fields.key, vec!["search_".to_string() + &info.hash.to_string()]);
-            assert_eq!(item._source.classification.as_str(), "L0");
+            assert_eq!(source.classification.as_str(), "L0");
         }
 
         // Do a search that returns all the results;
@@ -1486,7 +1564,7 @@ mod test {
         assert_eq!(search.hits.hits.len(), 10);
         for result in search.hits.hits {
             let (mut doc, version) = ds.retrohunt_hit.get(&result._id).await.unwrap().unwrap();
-            assert_eq!(doc, result._source);
+            assert_eq!(doc, result._source.unwrap());
             doc.expiry_ts = Some(chrono::Utc::now());
             let bad_version = (version.0 - 1, version.1);
             assert!(!ds.retrohunt_hit.save(&result._id, &doc, bad_version).await.unwrap());

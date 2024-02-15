@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
 
-use crate::types::JsonMap;
+use crate::types::Sha256;
 use super::{HouseCore, FetchStatus, FetchControlMessage};
 
 /// Pull files from an assemblyline system
@@ -45,30 +45,30 @@ pub (crate) struct FetchedFile {
 }
 
 
-impl FetchedFile {
-    /// Build a fetched file object from the json data
-    pub fn extract(data: &JsonMap) -> Option<Self> {
-        Some(Self{
-            sha256: data.get("sha256")?.as_str()?.to_owned(),
-            classification: data.get("classification")?.as_str()?.to_owned(),
-            expiry: extract_date(data, "expiry_ts"),
-            seen: extract_date(data.get("seen")?.as_object()?, "last")?,
-        })
-    }
-}
+// impl FetchedFile {
+//     /// Build a fetched file object from the json data
+//     pub fn extract(data: &JsonMap) -> Option<Self> {
+//         Some(Self{
+//             sha256: data.get("sha256")?.as_str()?.to_owned(),
+//             classification: data.get("classification")?.as_str()?.to_owned(),
+//             expiry: extract_date(data, "expiry_ts"),
+//             seen: extract_date(data.get("seen")?.as_object()?, "last")?,
+//         })
+//     }
+// }
 
-/// Extract a date value from a json field
-fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
-    match item.get(key) {
-        Some(item) => match DateTime::parse_from_rfc3339(item.as_str()?) {
-            Ok(expiry) => Some(expiry.into()),
-            Err(_) => {
-                return None
-            },
-        },
-        None => None,
-    }
-}
+// /// Extract a date value from a json field
+// fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
+//     match item.get(key) {
+//         Some(item) => match DateTime::parse_from_rfc3339(item.as_str()?) {
+//             Ok(expiry) => Some(expiry.into()),
+//             Err(_) => {
+//                 return None
+//             },
+//         },
+//         None => None,
+//     }
+// }
 
 /// How many times should ingesting a file be retried
 const RETRY_LIMIT: usize = 10;
@@ -146,7 +146,6 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                 match pending.entry(file.clone()) {
                     std::collections::btree_map::Entry::Occupied(_) => {}
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        println!("{} {}", file.sha256, file.seen);
                         entry.insert(PendingInfo{finished: false, retries: 0});
                         let core = core.clone();
                         running.spawn(async move {
