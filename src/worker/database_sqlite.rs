@@ -497,9 +497,10 @@ impl FilterSQLWorker {
             }
 
             // Insert the new file if it is not there
-            sqlx::query("INSERT INTO files(hash, access) VALUES(?, ?)")
+            sqlx::query("INSERT INTO files(hash, access, access_string) VALUES(?, ?, ?)")
                 .bind(file.hash.as_bytes())
                 .bind(file.access.to_string())
+                .bind(file.access_string.to_string())
                 .execute(&mut conn).await?;
 
             if let Some(size) = self.filter_sizes.write().await.get_mut(&self.id) {
@@ -578,15 +579,16 @@ impl FilterSQLWorker {
             if let Some((access, access_string, hash)) = row {
                 let access = AccessControl::from_str(&access)?;
                 if access.can_access(view) {
-                    selected.push(FileInfo { 
-                        hash: Sha256::try_from(&hash[..])?, 
-                        access, 
-                        access_string, 
+                    selected.push(FileInfo {
+                        hash: Sha256::try_from(&hash[..])?,
+                        access,
+                        access_string,
                         expiry: self.expiry,
                     });
                 }
             }
         }
+        info!("File selection complete [Filter {}]: {} input, {} selected", self.id, view.len(), selected.len());
         return Ok(selected)
     }
 

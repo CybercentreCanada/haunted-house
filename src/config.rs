@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use assemblyline_markings::classification::ClassificationParser;
+use log::info;
 use serde::{Serialize, Deserialize};
 use crate::broker::auth::Role;
 use crate::types::{WorkerID, serialize_size, deserialize_size};
@@ -171,18 +172,39 @@ fn default_yara_batch_size() -> u32 { 100 }
 /// default value for filter_item_limit
 fn default_filter_item_limit() -> u64 { 50_000_000 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct ClassificationConfig {
     pub classification_path: Option<PathBuf>,
     pub classification: Option<String>,
+    pub require_classification: bool,
 }
 
+impl Default for ClassificationConfig {
+    fn default() -> Self {
+        Self { 
+            classification_path: Default::default(), 
+            classification: Default::default(), 
+            require_classification: true 
+        }
+    }
+}
+
+
 impl ClassificationConfig {
-    pub fn load(&self) -> Result<String> {
+    pub fn load(&self) -> Result<Option<String>> {
         if let Some(classification) = &self.classification {
-            Ok(classification.clone())
+            Ok(Some(classification.clone()))
         } else if let Some(path) = &self.classification_path {
-            Ok(std::fs::read_to_string(path)?)
+            if path.is_file() {
+                Ok(Some(std::fs::read_to_string(path)?))
+            } else if !self.require_classification {
+                Ok(None)
+            } else {
+                Err(crate::error::ErrorKinds::ClassificationConfigurationError(format!("Could not read path: {path:?}")).into())
+            }
+        } else if !self.require_classification {
+            Ok(None)
         } else {
             Err(crate::error::ErrorKinds::ClassificationConfigurationError("Config missing".to_owned()).into())
         }
@@ -190,7 +212,12 @@ impl ClassificationConfig {
 
     pub fn init(&self) -> Result<Arc<ClassificationParser>> {
         let definition = self.load()?;
-        let classification = assemblyline_markings::config::ready_classification(Some(&definition))?;
+        let classification = assemblyline_markings::config::ready_classification(definition.as_deref())?;
+        if classification.enforce {
+            info!("An enforced classification is being loaded.");
+        } else {
+            info!("Classification disabled.");
+        }
         let access_engine = Arc::new(ClassificationParser::new(classification)?);
         assemblyline_markings::set_default(access_engine.clone());
         Ok(access_engine)
@@ -391,6 +418,10 @@ pub fn apply_variables(data: &str, vars: &HashMap<String, String>) -> Result<Str
     let mut input = data;
     let mut output: String = "".to_owned();
 
+    let vars: HashMap<String, String> = vars.iter()
+        .map(|(k, v)|(k.clone(), v.replace("\n", "\\n")))
+        .collect();
+
     while let Some(capture) = parser.captures(input) {
         // Include the input before the match
         let full_match = capture.get(0).unwrap();
@@ -441,7 +472,8 @@ mod test {
         // Simple substitution0
         let values = HashMap::from([
             ("Abc".to_owned(), "cats".to_owned()),
-            ("A_b".to_owned(), "rats".to_owned())
+            ("A_b".to_owned(), "rats".to_owned()),
+            ("MULTILINE_STRING".to_owned(), "abc\nabc".to_owned())
         ]);
         assert_eq!(apply_variables("abc123", &values).unwrap(), "abc123".to_owned());
         assert_eq!(apply_variables("abc${Abc}123", &values).unwrap(), "abccats123".to_owned());
@@ -469,5 +501,14 @@ mod test {
 
         // Handle complex value string
         assert_eq!(apply_variables(r#"abc${xyz:{\/$$_0[\}]-+}123"#, &values).unwrap(), "abc{\\/$$_0[}]-+123".to_owned());
+
+        // handle multiline string escaping
+        let json_string = apply_variables(r#"{
+            "param": "${MULTILINE_STRING}"
+        }"#, &values).unwrap();
+        assert_eq!(json_string, r#"{
+            "param": "abc\nabc"
+        }"#);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&json_string).unwrap(), serde_json::json!({"param": "abc\nabc"}));
     }
 }

@@ -1,4 +1,4 @@
-FROM rust:1.75.0-bookworm AS builder
+FROM rust:1.76.0-bookworm AS builder
 
 # Add more build tools
 RUN apt-get update && apt-get install -yy libclang-dev

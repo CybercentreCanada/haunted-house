@@ -12,7 +12,7 @@ use anyhow::{Result, Context};
 
 use chrono::{DateTime, Utc};
 use futures::SinkExt;
-use log::error;
+use log::{error, info};
 use poem::listener::{Listener, OpensslTlsConfig};
 use poem::web::websocket::Message;
 use poem::{post, EndpointExt, Endpoint, Middleware, Request, FromRequest, IntoResponse};
@@ -175,6 +175,7 @@ struct AddSearchResponse {
 /// API endpoint for starting a new search
 #[handler]
 async fn add_search(Data(interface): Data<&SearcherInterface>, Json(request): Json<SearchRequest>) -> poem::Result<Json<AddSearchResponse>> {
+    info!("classification enabled: {}", assemblyline_markings::get_default().unwrap().original_definition.enforce);
     Ok(Json(AddSearchResponse{
         code: interface.initialize_search(request).await?
     }))
@@ -281,6 +282,7 @@ pub (crate) struct StatusReport {
     pub filters: Vec<FilterStatus>,
     /// Storage information
     pub storage: HashMap<WorkerID, StorageStatus>,
+    pub timeouts: Vec<String>,
 }
 
 /// API endpoint for detailed system status

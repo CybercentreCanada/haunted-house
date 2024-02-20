@@ -154,7 +154,7 @@ async fn update_file_info(state: Data<&Arc<WorkerState>>, request: Json<UpdateFi
     Ok(Json(state.update_files(request.0.files).await?))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IngestFilesRequest {
     pub files: Vec<(FilterID, FileInfo)>
 }

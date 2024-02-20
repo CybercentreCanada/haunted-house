@@ -9,12 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use log::{error, info};
+use log::{debug, error, info};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
 
-use crate::types::Sha256;
 use super::{HouseCore, FetchStatus, FetchControlMessage};
 
 /// Pull files from an assemblyline system
@@ -32,7 +31,7 @@ pub (crate) async fn fetch_agent(core: Arc<HouseCore>, recv: mpsc::Receiver<Fetc
 
 /// Raw file details from assemblyline.
 /// Not yet parsed into formats that we will use internally.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub (crate) struct FetchedFile {
     /// When was this file last seen by the assemblyline system
     pub seen: DateTime<Utc>,
@@ -43,32 +42,6 @@ pub (crate) struct FetchedFile {
     /// Time of file expiry for this sighting
     pub expiry: Option<DateTime<Utc>>,
 }
-
-
-// impl FetchedFile {
-//     /// Build a fetched file object from the json data
-//     pub fn extract(data: &JsonMap) -> Option<Self> {
-//         Some(Self{
-//             sha256: data.get("sha256")?.as_str()?.to_owned(),
-//             classification: data.get("classification")?.as_str()?.to_owned(),
-//             expiry: extract_date(data, "expiry_ts"),
-//             seen: extract_date(data.get("seen")?.as_object()?, "last")?,
-//         })
-//     }
-// }
-
-// /// Extract a date value from a json field
-// fn extract_date(item: &JsonMap, key: &str) -> Option<DateTime<Utc>> {
-//     match item.get(key) {
-//         Some(item) => match DateTime::parse_from_rfc3339(item.as_str()?) {
-//             Ok(expiry) => Some(expiry.into()),
-//             Err(_) => {
-//                 return None
-//             },
-//         },
-//         None => None,
-//     }
-// }
 
 /// How many times should ingesting a file be retried
 const RETRY_LIMIT: usize = 10;
@@ -92,12 +65,14 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
     let mut recent: BTreeSet<FetchedFile> = Default::default();
-    let mut poll_interval = tokio::time::interval(Duration::from_secs_f64(config.poll_interval));
+    let poll_interval_time = Duration::from_secs_f64(config.poll_interval);
+    let mut poll_interval = tokio::time::interval(poll_interval_time);
 
     // metrics collectors
     let mut search_counter = crate::counters::WindowCounter::new(60);
     let mut throughput_counter = crate::counters::WindowCounter::new(60);
     let mut retry_counter = crate::counters::WindowCounter::new(60);
+    let mut last_fetch_time = std::time::Instant::now();
     let mut last_fetch_rows: i64 = 0;
 
     // The checkpoint represents the earliest value for the seen.last field where
@@ -125,7 +100,9 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
         }
 
         // If there is free space get extra jobs
-        if running.len() < config.concurrent_tasks {
+        if running.len() < config.concurrent_tasks && last_fetch_time.elapsed() >= poll_interval_time {
+            last_fetch_time = std::time::Instant::now();
+
             // Rather than searching at the current checkpoint we can search from the last seen at the tail
             // of items being processed. If nothing is being processed then the checkpoint is that value by default.
             let seek_point = match pending.last_key_value() {
@@ -136,6 +113,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             search_counter.increment(1);
             let result = client.fetch_files(seek_point, config.batch_size).await?;
             last_fetch_rows = result.len() as i64;
+            let mut launched = 0;
 
             for file in result {
                 if recent.contains(&file) {
@@ -148,6 +126,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(PendingInfo{finished: false, retries: 0});
                         let core = core.clone();
+                        launched += 1;
                         running.spawn(async move {
                             let resp = core.start_ingest(&file).await;
                             return (file, resp)
@@ -155,6 +134,8 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                     }
                 }
             }
+
+            debug!("Fetched {last_fetch_rows} rows, launched {launched} ingestions");
         }
 
         // wait for running jobs to finish
@@ -166,6 +147,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                     None => continue,
                 };
 
+                debug!("File ingest attempt: {file:?} {result:?}");
                 throughput_counter.increment(1);
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = pending.entry(file.clone()) {
                     entry.get_mut().retries += 1;

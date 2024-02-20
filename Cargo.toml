@@ -1,6 +1,6 @@
 [package]
 name = "haunted-house"
-version = "0.0.38"
+version = "0.0.39"
 edition = "2021"
 default-run = "haunted-house"
 
@@ -64,7 +64,7 @@ futures = "0.3"
 # Networking libraries
 poem = { version = "1.3", features = ["anyhow", "websocket", "openssl-tls"] }
 openssl = { version = "0.10" }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "native-tls"] }
 reqwest-middleware = "0.2"
 reqwest-retry = "0.2"
 http = "0.2"

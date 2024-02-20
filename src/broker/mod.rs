@@ -10,6 +10,7 @@ mod elastic;
 use std::collections::{HashSet, HashMap, hash_map, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use assemblyline_markings::classification::ClassificationParser;
 use assemblyline_models::{ClassificationString, ExpandingClassification};
@@ -143,42 +144,30 @@ impl HouseCore {
         // Stop flag
         // let (quit_trigger, quit_signal) = tokio::sync::watch::channel(false);
 
-        // Prepare our http client
-        let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(std::time::Duration::from_millis(50), std::time::Duration::from_secs(30))
-            .build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
-        let client = match &config.worker_certificate {
+        // Prepare tls settings for Websockets and HTTP
+        let connector = match &config.worker_certificate {
             WorkerTLSConfig::AllowAll => {
-                reqwest::Client::builder()
+                native_tls::TlsConnector::builder()
                 .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
                 .build()?
             },
             WorkerTLSConfig::Certificate(cert) => {
-                reqwest::Client::builder()
-                .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes())?)
+                native_tls::TlsConnector::builder()
+                .add_root_certificate(Certificate::from_pem(cert.as_bytes())?)
+                .danger_accept_invalid_hostnames(true)
                 .build()?
-            }
+            },
         };
-        let client = ClientBuilder::new(client)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build();
 
-        // Prepare websocket tls settings
-        let connector = Connector::NativeTls(
-            match &config.worker_certificate {
-                WorkerTLSConfig::AllowAll => {
-                    native_tls::TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .danger_accept_invalid_hostnames(true)
-                    .build()?
-                },
-                WorkerTLSConfig::Certificate(cert) => {
-                    native_tls::TlsConnector::builder()
-                    .add_root_certificate(Certificate::from_pem(cert.as_bytes())?)
-                    .build()?
-                },
-            }
-        );
+        // Prepare our http client
+        let client = reqwest::Client::builder().use_preconfigured_tls(connector.clone()).build()?;
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(std::time::Duration::from_millis(50), std::time::Duration::from_secs(30))
+            .build_with_total_retry_duration(chrono::Duration::days(1).to_std()?);
+        let client = ClientBuilder::new(client)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
 
         // Load classification system
         let access_engine = config.classification.init().context("loading classification configuration")?;
@@ -193,7 +182,7 @@ impl HouseCore {
             ingest_queue: send_ingest,
             config,
             client,
-            ws_connector: connector,
+            ws_connector: Connector::NativeTls(connector),
             worker_ingest: RwLock::new(Default::default()),
             pending_assignments: RwLock::new(Default::default()),
             running_searches: RwLock::new(Default::default()),
@@ -286,25 +275,27 @@ impl HouseCore {
     fn prepare_access(&self, access: &str) -> Result<HashSet<String>> {
         let ce = &self.access_engine;
 
-        let parts = ce.get_classification_parts(access, false, true, true)?;
 
         let mut terms = vec![];
 
-        terms.push(ce.get_classification_level_text(parts.level, false)?);
+        if ce.original_definition.enforce {
+            let parts = ce.get_classification_parts(access, false, true, true)?;
+            terms.push(ce.get_classification_level_text(parts.level, false)?);
 
-        /// classification levels that aren't real
-        const FALSE_LEVELS: [&str; 2] = ["NULL", "INV"];
+            /// classification levels that aren't real
+            const FALSE_LEVELS: [&str; 2] = ["NULL", "INV"];
 
-        let levels: Vec<String> = ce.levels()
-            .iter()
-            .filter(|(lvl, data)| **lvl <= parts.level && !FALSE_LEVELS.contains(&data.short_name.as_str()))
-            .map(|(_, data)|data.short_name.to_string())
-            .collect();
+            let levels: Vec<String> = ce.levels()
+                .iter()
+                .filter(|(lvl, data)| **lvl <= parts.level && !FALSE_LEVELS.contains(&data.short_name.as_str()))
+                .map(|(_, data)|data.short_name.to_string())
+                .collect();
 
-        terms.extend(levels);
-        terms.extend(parts.required);
-        terms.extend(parts.groups);
-        terms.extend(parts.subgroups);
+            terms.extend(levels);
+            terms.extend(parts.required);
+            terms.extend(parts.groups);
+            terms.extend(parts.subgroups);
+        }
 
         return Ok(terms.into_iter().collect())
     }
@@ -313,27 +304,29 @@ impl HouseCore {
     #[allow(clippy::comparison_chain)]
     fn prepare_classification(&self, classification: &str) -> Result<AccessControl> {
         let ce = &self.access_engine;
-
-        let parts = ce.get_classification_parts(classification, false, true, true)?;
-
         let mut top = vec![];
 
-        top.push(AccessControl::Token(ce.get_classification_level_text(parts.level, false)?));
+        if ce.original_definition.enforce {
+            let parts = ce.get_classification_parts(classification, false, true, true)?;
 
-        for item in parts.required {
-            top.push(AccessControl::Token(item))
-        }
 
-        if parts.groups.len() > 1 {
-            top.push(AccessControl::Or(parts.groups.into_iter().map(AccessControl::Token).collect()));
-        } else if parts.groups.len() == 1 {
-            top.push(AccessControl::Token(parts.groups[0].clone()));
-        }
+            top.push(AccessControl::Token(ce.get_classification_level_text(parts.level, false)?));
 
-        if parts.subgroups.len() > 1 {
-            top.push(AccessControl::Or(parts.subgroups.into_iter().map(AccessControl::Token).collect()));
-        } else if parts.subgroups.len() == 1 {
-            top.push(AccessControl::Token(parts.subgroups[0].clone()));
+            for item in parts.required {
+                top.push(AccessControl::Token(item))
+            }
+
+            if parts.groups.len() > 1 {
+                top.push(AccessControl::Or(parts.groups.into_iter().map(AccessControl::Token).collect()));
+            } else if parts.groups.len() == 1 {
+                top.push(AccessControl::Token(parts.groups[0].clone()));
+            }
+
+            if parts.subgroups.len() > 1 {
+                top.push(AccessControl::Or(parts.subgroups.into_iter().map(AccessControl::Token).collect()));
+            } else if parts.subgroups.len() == 1 {
+                top.push(AccessControl::Token(parts.subgroups[0].clone()));
+            }
         }
 
         Ok(if top.is_empty() {
@@ -421,9 +414,13 @@ impl HouseCore {
 
     /// Read the status of the system including all workers
     pub (crate) async fn status(self: &Arc<Self>) -> Result<StatusReport> {
+        const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
         // Send requests to workers for details we want from them
         let mut queries = JoinSet::new();
+        let mut timeouts = vec![];
         for (worker, worker_address) in self.config.workers.clone() {
+            timeouts.push(format!("worker-{worker}"));
             let request = self.client.get(worker_address.http("/status/detail")?)
             .header("Content-Type", "application/json")
             .send();
@@ -446,8 +443,13 @@ impl HouseCore {
 
         let mut ingest_watchers: HashMap<WorkerID, HashMap<FilterID, IngestWatchStatus>> = Default::default();
         for (id, sock) in watchers.into_iter() {
-            if let Ok(value) = sock.await {
-                ingest_watchers.insert(id, value);
+            match tokio::time::timeout(STATUS_TIMEOUT, sock).await {
+                Ok(Ok(value)) => {
+                    ingest_watchers.insert(id, value);
+                }
+                _ => {
+                    timeouts.push(format!("watcher-{id}"));
+                }
             }
         }
 
@@ -466,10 +468,20 @@ impl HouseCore {
         // gather responses from the workers
         let mut filters = vec![];
         let mut storage = HashMap::new();
-        while let Some(response) = queries.join_next().await {
+
+        loop {
+            let response = match tokio::time::timeout(STATUS_TIMEOUT, queries.join_next()).await {
+                Ok(Some(result)) => result,
+                _ => break,
+            };
+            
             let (worker, response) = response?;
             let response = response?;
-            let body: crate::worker::interface::DetailedStatus = response.json().await?;
+            let body: crate::worker::interface::DetailedStatus = match tokio::time::timeout(STATUS_TIMEOUT, response.json()).await {
+                Ok(result) => result?,
+                Err(_) => continue,
+            };
+            timeouts.retain(|x|x != &format!("worker-{worker}"));
             storage.insert(worker.clone(), body.storage);
             for (expiry, filter, size) in body.filters {
                 filters.push(FilterStatus{
@@ -498,6 +510,7 @@ impl HouseCore {
             fetcher: fetcher.await?,
             filters,
             storage,
+            timeouts,
         })
     }
 
@@ -1060,11 +1073,17 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
     }
 }
 
+const MILLISECOND: Duration = Duration::from_millis(1);
+const MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+
 /// Entrypoint for the search worker
 async fn search_worker(core: Arc<HouseCore>, mut progress: watch::Sender<SearchProgress>, mut status: models::Retrohunt) {
+    let mut timeout = MILLISECOND;
     // Keep restarting the search until it completes
     while let Err(err) = _search_worker(core.clone(), &mut progress, &mut status).await {
-        error!("Crash in search: {err}")
+        error!("Crash in search: {err:?}");
+        tokio::time::sleep(timeout).await;
+        timeout = MAX_DELAY.min(timeout * 2);
     }
     _ = progress.send(SearchProgress::Finished { search: status });
 }
@@ -1116,7 +1135,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
             let address = address.websocket("/search/filter")?;
             let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
                 address.clone(), None, false, Some(core.ws_connector.clone())).await
-                .context(format!("Unable to resolve worker name from: {address}"))?;
+                .context(format!("Unable to connect to worker: {address}"))?;
             let client_sender = client_sender.clone();
             let request_body = request_body.clone();
             let worker = worker.clone();
@@ -1219,7 +1238,8 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
             break;
         }
 
-        if core.database.count_retrohunt_hits(&code, core.config.search_hit_limit).await? >= core.config.search_hit_limit {
+        let hits = core.database.count_retrohunt_hits(&code, core.config.search_hit_limit).await?;
+        if hits >= core.config.search_hit_limit {
             status.truncated = true;
             break;
         }
@@ -1270,7 +1290,8 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
     while let Some(result) = elastic_writes.join_next().await { result??; }
 
     // Save results
-    info!("Search {code}: Finishing");
+    let hits = core.database.count_retrohunt_hits(&code, core.config.search_hit_limit).await?;
+    info!("Search {code}: Finishing, {hits} hits");
     core.database.finalize_search(status).await?;
     let mut searches = core.running_searches.write().await;
     searches.remove(&code);

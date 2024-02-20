@@ -2,7 +2,7 @@ use std::{collections::HashMap, marker::PhantomData, time::Duration};
 
 use http::{Method, StatusCode};
 use itertools::Itertools;
-use log::{error, debug, warn};
+use log::{debug, error, warn};
 use serde::{Deserialize, de::DeserializeOwned, Serialize};
 
 // use anyhow::Result;
