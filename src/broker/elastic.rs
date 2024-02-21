@@ -52,6 +52,7 @@ impl Datastore {
 
     pub (crate) async fn fetch_files(&self, seek_point: chrono::DateTime<chrono::Utc>, batch_size: usize) -> Result<Vec<FetchedFile>> {
         #[derive(Debug, Deserialize, Default)]
+        #[serde(default)]
         struct Fields {
             classification: Vec<String>,
             expiry_ts: Vec<DateTime<Utc>>,
