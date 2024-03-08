@@ -14,6 +14,7 @@ chrono = { version = "0.4", features = ["serde", "std"] }
 time = { version = "0.3" }
 rand = "0.8"
 itertools = "0.10"
+parking_lot = "0.12"
 
 # Environment interfaces
 tempfile = "3"

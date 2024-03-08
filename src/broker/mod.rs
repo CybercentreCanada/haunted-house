@@ -124,6 +124,8 @@ pub struct HouseCore {
     pub running_searches: RwLock<HashMap<String, SearchInfo>>,
     /// Pool of permits limiting the assignment of yara tasks to a fixed number per worker
     pub yara_permits: deadpool::unmanaged::Pool<(WorkerID, WorkerAddress)>,
+
+    pub resource_tracker: crate::timing::ResourceTracker,
 }
 
 impl HouseCore {
@@ -189,6 +191,7 @@ impl HouseCore {
             yara_permits,
             access_engine,
             fetcher_control_queue: fetch_send,
+            resource_tracker: crate::timing::ResourceTracker::start(),
         });
 
         // Revive search workers for ongoing searches
@@ -386,32 +389,6 @@ impl HouseCore {
         return Ok(())
     }
 
-    // /// Check the status of a search.
-    // pub (crate) async fn search_status(&self, code: String) -> Result<Option<InternalSearchStatus>> {
-    //     // Try to find/probe a worker currently processing this search
-    //     let channel = {
-    //         let searches = self.running_searches.read().await;
-    //         if let Some((_, search)) = searches.get(&code) {
-    //             let (send, recv) = oneshot::channel();
-    //             _ = search.send(SearcherMessage::Status(send)).await;
-    //             Some(recv)
-    //         } else {
-    //             None
-    //         }
-    //     };
-
-    //     // if a worker was found, wait for it's response
-    //     if let Some(recv) = channel {
-    //         match recv.await {
-    //             Ok(status) => return Ok(Some(status)),
-    //             Err(err) => { error!("{err}"); },
-    //         }
-    //     }
-
-    //     // no worker found, fall back to reading results from the database
-    //     self.database.search_status(&code).await
-    // }
-
     /// Read the status of the system including all workers
     pub (crate) async fn status(self: &Arc<Self>) -> Result<StatusReport> {
         const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -468,6 +445,8 @@ impl HouseCore {
         // gather responses from the workers
         let mut filters = vec![];
         let mut storage = HashMap::new();
+        let mut resources = HashMap::new();
+        resources.insert("broker".to_owned(), self.resource_tracker.read().await);
 
         loop {
             let response = match tokio::time::timeout(STATUS_TIMEOUT, queries.join_next()).await {
@@ -483,6 +462,7 @@ impl HouseCore {
             };
             timeouts.retain(|x|x != &format!("worker-{worker}"));
             storage.insert(worker.clone(), body.storage);
+            resources.insert(worker.to_string(), body.resources);
             for (expiry, filter, size) in body.filters {
                 filters.push(FilterStatus{
                     expiry: expiry.to_string(),
@@ -511,6 +491,7 @@ impl HouseCore {
             filters,
             storage,
             timeouts,
+            resources,
         })
     }
 

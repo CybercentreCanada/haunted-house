@@ -4,9 +4,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 use itertools::Itertools;
+use parking_lot::Mutex;
 
 use lazy_static::lazy_static;
+
+use crate::error::Result;
 
 lazy_static! {
     static ref LABELS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Default::default());
@@ -232,6 +237,7 @@ macro_rules! mark {
     }
 }
 pub(crate) use mark;
+use serde::{Deserialize, Serialize};
 
 /// A null capture object that doesn't actually do anything
 pub struct NullCapture {}
@@ -249,4 +255,143 @@ impl TimingCapture for NullCapture {
     fn new_id(&self, _label: &str) -> usize { 0 }
     fn add(&self, _index: usize, _value: f64) { }
     fn build(&self, _index: usize) -> Self::Mark { Self::new() }
+}
+
+const STAT_PATH: &str = "/sys/fs/cgroup/cpu.stat";
+
+async fn load_cgroup_cpu_usage() -> u64 {
+    let body = match tokio::fs::read_to_string(&STAT_PATH).await {
+        Ok(body) => body,
+        Err(_) => return 0,
+    };
+
+    for line in body.lines() {
+        if line.starts_with("usage_usec") {
+            return match &line[11..].parse() {
+                Ok(value) => *value,
+                Err(_) => 0,
+            }
+        }
+    }
+    0
+}
+
+async fn load_process_memory(pid: u64) -> u64 {
+    let path = format!("/proc/{pid}/status");
+    let body = match tokio::fs::read_to_string(&path).await {
+        Ok(body) => body,
+        Err(_) => return 0,
+    };
+    let parser = parse_size::Config::new().with_binary();
+
+    for line in body.lines() {
+        if line.starts_with("VmRSS:") {
+            return parser.parse_size(&line[6..].trim()).unwrap_or_default();
+        }
+    }
+    0
+}
+
+async fn load_memory() -> u64 {
+    let mut total: u64 = 0;
+    let mut iter = match tokio::fs::read_dir("/proc/").await {
+        Ok(iter) => iter,
+        Err(_) => return 0,
+    };
+
+    while let Ok(Some(dir)) = iter.next_entry().await {
+        let pid: u64 = match dir.file_name().to_string_lossy().parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        total += load_process_memory(pid).await;
+    }
+    total
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResourceReport {
+    memory: u64,
+    cpu_load_1m: f64,
+    cpu_load_5m: f64,
+    cpu_load_15m: f64,
+}
+
+const TIMESLOTS: usize = 16;
+const MINUTE: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Timestamps {
+    data: [u64; TIMESLOTS],
+    index: usize,
+}
+
+impl Timestamps {
+    fn read_gap(&self, gap: usize) -> u64 {
+        let current = self.data[self.index];
+        let previous = self.data[(self.index + TIMESLOTS - gap) % TIMESLOTS];
+        current - previous
+    } 
+}
+
+#[derive(Clone)]
+pub struct ResourceTracker {
+    cpu: Arc<Mutex<Timestamps>>,
+}
+
+impl ResourceTracker {
+    pub fn start() -> ResourceTracker {
+        let cpu = Arc::new(Mutex::new(Timestamps::default()));
+        let stamps = cpu.clone();
+        tokio::spawn(async move {
+            {
+                let initial = load_cgroup_cpu_usage().await;
+                let mut data = stamps.lock();
+                for index in 0..TIMESLOTS {
+                    data.data[index] = initial;
+                }
+            }
+
+            while Arc::strong_count(&stamps) > 1 {
+                tokio::time::sleep(MINUTE).await;
+                let count = load_cgroup_cpu_usage().await;
+                let mut data = stamps.lock();
+                data.index = (data.index + 1) % TIMESLOTS;
+                let index = data.index;
+                data.data[index] = count;
+            }
+        });
+        ResourceTracker { cpu }
+    }
+
+    pub async fn read(&self) -> ResourceReport {
+        let memory = load_memory().await;
+        let data = self.cpu.lock();
+        let min_1 = MINUTE.as_micros() as f64;
+        let min_5 = min_1 * 5.0;
+        let min_15 = min_1 * 15.0;
+        ResourceReport {
+            memory,
+            cpu_load_1m: data.read_gap(1) as f64/min_1,
+            cpu_load_5m: data.read_gap(5) as f64/min_5,
+            cpu_load_15m: data.read_gap(15) as f64/min_15,
+        }
+    }
+}
+
+
+#[tokio::test]
+async fn test_load_cgroup_cpu_usage() {
+    let t1 = load_cgroup_cpu_usage().await;
+    assert!(t1 > 0);
+    for i in 0..100000 {
+        i.to_string();
+    }
+    assert!(load_cgroup_cpu_usage().await > t1);
+}
+
+#[tokio::test]
+async fn test_load_memory() {
+    assert!(load_memory().await > 0);
 }

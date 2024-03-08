@@ -9,6 +9,7 @@ use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
 use crate::query::Query;
 use crate::storage::BlobStorage;
+use crate::timing::ResourceTracker;
 use crate::types::{ExpiryGroup, FilterID, FileInfo};
 
 use super::YaraTask;
@@ -26,6 +27,7 @@ pub struct WorkerState {
     pub file_cache: BlobCache,
     pub trigrams: Arc<TrigramCache>,
     pub config: WorkerSettings,
+    pub resource_tracker: ResourceTracker,
 }
 
 
@@ -43,6 +45,7 @@ impl WorkerState {
             file_storage,
             config,
             trigrams,
+            resource_tracker: ResourceTracker::start(),
         });
 
         // Start workers for every filter

@@ -26,6 +26,7 @@ use assemblyline_models::datastore::retrohunt as models;
 
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
+use crate::timing::ResourceReport;
 use crate::types::{WorkerID, FilterID};
 use crate::worker::interface::StorageStatus;
 
@@ -283,6 +284,7 @@ pub (crate) struct StatusReport {
     /// Storage information
     pub storage: HashMap<WorkerID, StorageStatus>,
     pub timeouts: Vec<String>,
+    pub resources: HashMap<String, ResourceReport>,
 }
 
 /// API endpoint for detailed system status

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
 use crate::query::Query;
+use crate::timing::ResourceReport;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID};
 use crate::worker::YaraTask;
 
@@ -229,7 +230,8 @@ pub (crate) struct StorageStatus {
 #[derive(Serialize, Deserialize)]
 pub (crate) struct DetailedStatus {
     pub filters: Vec<(ExpiryGroup, FilterID, u64)>,
-    pub storage: StorageStatus
+    pub storage: StorageStatus,
+    pub resources: ResourceReport,
 }
 
 #[handler]
@@ -244,7 +246,8 @@ async fn get_detail_status(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
 
     Ok(Json(DetailedStatus {
         filters,
-        storage: state.storage_status().await?
+        storage: state.storage_status().await?,
+        resources: state.resource_tracker.read().await,
     }))
 }
 
