@@ -2,6 +2,7 @@ from __future__ import annotations
 import typing
 import logging
 import json
+import ssl
 
 import requests
 from websockets.sync.client import connect
@@ -65,7 +66,7 @@ class Client:
         """Will trigger a search to rerun with the classification expanded to include the given value."""
         logger.info("Repeat retrohunt search %s", key)
         # Send the search request
-        result = self.session.post(self.address + '/repeat/' + key, json={
+        result = self.session.post(self.address + '/repeat/', json={
             'key': key,
             'search_classification': search_classification,
             'expiry': expiry,
@@ -83,8 +84,15 @@ class Client:
             else:
                 headers[name] = value
 
+        # Setup SSL settings
+        if isinstance(self.session.verify, str):
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.load_verify_locations(self.session.verify)
+        else:
+            ssl_context = self.session.verify
+
         # Connect to status feed
-        with connect(url, additional_headers=headers) as ws:
+        with connect(url, additional_headers=headers, ssl=ssl_context) as ws:
             while True:
                 message = json.loads(ws.recv())
                 yield message
