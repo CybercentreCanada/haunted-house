@@ -86,13 +86,18 @@ class Client:
 
         # Setup SSL settings
         if isinstance(self.session.verify, str):
+            # Create a context that expects a specific certificate
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.load_verify_locations(self.session.verify)
+        elif self.session.verify:
+            # Create a basic secure context
+            ssl_context = ssl.create_default_context()
         else:
-            ssl_context = self.session.verify
+            # Create a basic insecure context
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
         # Connect to status feed
-        with connect(url, additional_headers=headers, ssl=ssl_context) as ws:
+        with connect(url, additional_headers=headers, ssl_context=ssl_context) as ws:
             while True:
                 message = json.loads(ws.recv())
                 yield message
