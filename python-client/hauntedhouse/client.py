@@ -6,6 +6,7 @@ import ssl
 
 import requests
 from websockets.sync.client import connect
+from websockets.exceptions import ConnectionClosedOK
 
 
 logger = logging.getLogger('hauntedhouse.client')
@@ -97,9 +98,12 @@ class Client:
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
         # Connect to status feed
-        with connect(url, additional_headers=headers, ssl_context=ssl_context) as ws:
-            while True:
-                message = json.loads(ws.recv())
-                yield message
-                if message.get('type', '') == 'finished':
-                    break
+        try:
+            with connect(url, additional_headers=headers, ssl_context=ssl_context) as ws:
+                while True:
+                    message = json.loads(ws.recv())
+                    yield message
+                    if message.get('type', '') == 'finished':
+                        break
+        except ConnectionClosedOK:
+            pass
