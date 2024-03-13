@@ -119,7 +119,7 @@ impl Datastore {
                 key: key.clone(), 
                 classification: ExpandingClassification::new(info.access_string.clone())?,
                 sha256: info.hash.to_string().parse()?, 
-                expiry_ts: info.expiry.to_timestamp(), 
+                expiry_ts: info.expiry.as_timestamp(), 
                 search: search.to_owned() 
             })?;
             body += "\n";
@@ -171,7 +171,7 @@ impl Datastore {
                         body += "\n";
                         body += &serde_json::to_string(&RetrohuntHit{ 
                             classification: ExpandingClassification::new(ce.min_classification(source.classification.as_str(), &info.access_string, false)?)?,
-                            expiry_ts: match (source.expiry_ts, info.expiry.to_timestamp()) {
+                            expiry_ts: match (source.expiry_ts, info.expiry.as_timestamp()) {
                                 (Some(a), Some(b)) => Some(a.max(b)),
                                 _ => None,
                             },

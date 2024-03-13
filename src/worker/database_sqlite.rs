@@ -257,7 +257,7 @@ impl BufferedSQLite {
 
         sqlx::query("INSERT INTO filters(id, expiry) VALUES(?, ?) ON CONFLICT DO NOTHING")
             .bind(name.to_i64())
-            .bind(expiry.to_u32())
+            .bind(expiry.as_u32())
             .execute(&mut con).await?;
 
         self.workers.insert(name, FilterSQLWorker::start(&self.database_directory, self.ce.clone(), name, expiry.clone(), self.filter_sizes.clone(), self.filter_pending.clone()).await?);
@@ -269,16 +269,16 @@ impl BufferedSQLite {
 
     pub async fn get_filters(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<FilterID>> {
         let rows : Vec<(i64, )> = sqlx::query_as("SELECT id FROM filters WHERE ? <= expiry AND expiry <= ?")
-            .bind(first.to_u32())
-            .bind(last.to_u32())
+            .bind(first.as_u32())
+            .bind(last.as_u32())
             .fetch_all(&self.db).await?;
         Ok(rows.into_iter().map(|(id, )|FilterID::from(id)).collect())
     }
 
     pub async fn get_expiry(&self, first: &ExpiryGroup, last: &ExpiryGroup) -> Result<Vec<(FilterID, ExpiryGroup)>> {
         let rows : Vec<(i64, u32)> = sqlx::query_as("SELECT id, expiry FROM filters WHERE ? <= expiry AND expiry <= ?")
-            .bind(first.to_u32())
-            .bind(last.to_u32())
+            .bind(first.as_u32())
+            .bind(last.as_u32())
             .fetch_all(&self.db).await?;
         rows.into_iter().map(|(id, expiry)|Ok((FilterID::from(id), ExpiryGroup::from(expiry)))).collect()
     }

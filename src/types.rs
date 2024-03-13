@@ -10,7 +10,7 @@ use serde_with::{SerializeDisplay, DeserializeFromStr};
 use crate::access::AccessControl;
 use crate::error::ErrorKinds;
 
-
+/// Alias for serde_json mapping value
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 /// A binary representation of a 256 bit hash. Heap allocated.
@@ -89,7 +89,8 @@ impl ExpiryGroup {
         })
     }
 
-    pub fn to_timestamp(&self) -> Option<DateTime<Utc>> {
+    /// Convert an expiry group to the date of expiry
+    pub fn as_timestamp(&self) -> Option<DateTime<Utc>> {
         let year = self.0 >> 16;
         if year == 0xFFFF {
             None
@@ -135,7 +136,7 @@ impl ExpiryGroup {
 
     /// Convert into a raw integer value. This is only intended for
     /// serialization in contexts where we aren't using serde
-    pub fn to_u32(&self) -> u32 {
+    pub fn as_u32(&self) -> u32 {
         self.0
     }
 }

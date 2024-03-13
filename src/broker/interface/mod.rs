@@ -23,6 +23,7 @@ use poem::{get, handler, listener::TcpListener, web::Path, Route, Server};
 use serde::{Deserialize, Serialize};
 use assemblyline_models::ClassificationString;
 use assemblyline_models::datastore::retrohunt as models;
+use tokio::sync::watch;
 
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
@@ -132,9 +133,17 @@ impl SearcherInterface {
     }
 
     /// Get the status or results for a given search
-    pub async fn search_status(&self, code: &str) -> Option<tokio::sync::watch::Receiver<SearchProgress>> {
+    pub async fn search_status(&self, code: &str) -> Result<Option<watch::Receiver<SearchProgress>>> {
         let searches = self.core.running_searches.read().await;
-        searches.get(code).map(|entry|entry.1.clone())
+        if let Some(socket) = searches.get(code).map(|entry|entry.1.clone()) {
+            return Ok(Some(socket))
+        }
+        if let Some((search, _)) = self.core.database.retrohunt.get(code).await? {
+            let (_, mut reciever) = watch::channel(SearchProgress::Finished { search });
+            reciever.mark_changed();
+            return Ok(Some(reciever))
+        }
+        Ok(None)
     }
 
     pub async fn repeat_search(&self, key: &str, classification: ClassificationString, expiry: Option<DateTime<Utc>>) -> Result<RepeatOutcome> {
@@ -222,7 +231,7 @@ pub (crate) enum SearchProgress {
 /// Endpoint that providesa stream of status messages
 #[handler]
 async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Path<String>, ws: poem::web::websocket::WebSocket) -> poem::Result<impl IntoResponse> {
-    let mut feed = match interface.search_status(&code).await {
+    let mut feed = match interface.search_status(&code).await? {
         Some(feed) => feed,
         None => return Err(poem::http::StatusCode::NOT_FOUND.into()),
     };
