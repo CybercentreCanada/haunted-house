@@ -146,6 +146,7 @@ impl SearcherInterface {
         Ok(None)
     }
 
+    /// Rerun a search without creating a new record
     pub async fn repeat_search(&self, key: &str, classification: ClassificationString, expiry: Option<DateTime<Utc>>) -> Result<RepeatOutcome> {
         self.core.repeat_search(key, classification, expiry).await
     }

@@ -1,3 +1,5 @@
+//! Interface to elasticsearch where the searches and search results are stored
+
 use std::{collections::HashMap, marker::PhantomData, time::Duration};
 
 use http::{Method, StatusCode};
@@ -16,18 +18,26 @@ use assemblyline_models::{datastore::{self as models, retrohunt::IndexCatagory, 
 
 use super::fetcher::FetchedFile;
 
+/// Maximum time between retries when an error occurs
 const MAX_DELAY: Duration = Duration::from_secs(60);
+/// How long to keep point in time entries in elastic alive
 const PIT_KEEP_ALIVE: &str = "5m";
 
+/// High level interface to elastic with access broken out by index
 #[derive(Clone)]
 pub struct Datastore {
-    connection: Elastic,    
+    /// Wrapper around an elasticsearch server connection
+    connection: Elastic,
+    /// File records, may be held in multiple indices.
     pub file: Collection<models::File>,
+    /// Index that stores retrohunt jobs that are complete or in progress
     pub retrohunt: Collection<models::Retrohunt>,
+    /// Retrohunt search hits
     pub retrohunt_hit: Collection<RetrohuntHit>,
 }
 
 impl Datastore {
+    /// Connect to elasticsearch and build collection objects.
     pub fn new(host: &str, ca_cert: Option<&str>, connect_unsafe: bool, archive_access: bool) -> Result<Self> {
         let connection = Elastic::new(host, ca_cert, connect_unsafe, archive_access)?;
         Ok(Self{
@@ -38,6 +48,7 @@ impl Datastore {
         })
     }
 
+    /// List all searches that aren't marked finished
     pub async fn list_active_searches(&self) -> Result<Vec<models::Retrohunt>> {
         let mut result = self.retrohunt.search::<()>( "finished: false")
             .full_source(true)
@@ -50,13 +61,20 @@ impl Datastore {
         Ok(out)
     }
 
+    /// Fetch up to batch_size files that have been seen after the given time given
     pub (crate) async fn fetch_files(&self, seek_point: chrono::DateTime<chrono::Utc>, batch_size: usize) -> Result<Vec<FetchedFile>> {
+        /// List of fields in elasticsearch native layout returned by the query below
+        /// Elasticsearch returns lists for all fields in this context
         #[derive(Debug, Deserialize, Default)]
         #[serde(default)]
         struct Fields {
+            /// access control string for file
             classification: Vec<String>,
+            /// expiry date for file
             expiry_ts: Vec<DateTime<Utc>>,
+            /// file hash
             sha256: Vec<String>,
+            /// date of when the file was last seen
             #[serde(alias="seen.last")]
             seen: Vec<DateTime<Utc>>,
         }
@@ -81,6 +99,7 @@ impl Datastore {
         return Ok(out)
     }
 
+    /// Update and save a search indicating that it finished with a fatal error
     pub async fn fatal_error(&self, data: &mut models::Retrohunt, error: String) -> Result<()> {
         data.errors.push(error);
         data.finished = true;
@@ -89,6 +108,7 @@ impl Datastore {
         Ok(())
     }
 
+    /// Update and save a search indicating that it finished
     pub async fn finalize_search(&self, data: &mut models::Retrohunt) -> Result<()> {
         data.finished = true;
         data.completed_time = Some(chrono::Utc::now());
@@ -96,6 +116,7 @@ impl Datastore {
         Ok(())
     }
 
+    /// Count how many results have been saved for a given search
     pub async fn count_retrohunt_hits(&self, search: &str, limit: u64) -> Result<u64> {
         let search = self.retrohunt_hit.search::<()>(&format!("search: {search}"))
             .size(0)
@@ -103,7 +124,8 @@ impl Datastore {
             .execute().await?;
         Ok(search.hits.total.value)
     }
-    
+
+    /// Save all of the given search hits using batch operations wherever possible
     pub async fn save_hits(&self, search: &str, hits: Vec<FileInfo>) -> Result<()> {
         let index = &self.retrohunt_hit.get_index_list(Some(IndexCatagory::Hot)).unwrap()[0];
         let ce = assemblyline_markings::get_default().unwrap();
@@ -187,34 +209,35 @@ impl Datastore {
     }
 }
 
+/// Wrapper around an elastic connection
 #[derive(Clone)]
 struct Elastic {
+    /// http client being used to communicate with elasticsearch
     client: reqwest::Client,
+    /// Address of the elasticsearch server
     host: reqwest::Url,
+    /// Should the connection access indices intended for archiving
     archive_access: bool,
 }
 
+/// requirements for structs defining elasticsearch models
 pub trait DSType: Serialize + DeserializeOwned + Described<ElasticMeta> {}
 impl<T: Serialize + DeserializeOwned + Described<ElasticMeta>> DSType for T {}
 
+/// List of index groups this module communicates with
 #[derive(SerializeDisplay, DeserializeFromStr, strum::Display, strum::EnumString, PartialEq, Eq, Debug, Clone, Copy, Hash)]
 #[strum(serialize_all = "snake_case")]
 pub enum Index {
+    /// File records
     File,
+    /// Retrohunt search records
     Retrohunt,
+    /// Retrohunt results
     RetrohuntHit,
 }
 
 impl Index {
-    // /// is this an index that this module knows how to create
-    // fn can_create(&self) -> bool {
-    //     match self {
-    //         Index::File => false,
-    //         Index::Retrohunt => true,
-    //         Index::RetrohuntHit => true,
-    //     }
-    // }
-
+    /// Does the given index group have an archive index?
     fn archived(&self) -> bool {
         match self {
             Index::File => true,
@@ -223,6 +246,7 @@ impl Index {
         }
     }
 
+    /// Get the name of the archive index if there is one
     fn archive_name(&self) -> Option<String> {
         if self.archived() {
             Some(format!("{self}-ma"))
@@ -231,6 +255,7 @@ impl Index {
         }
     }
 
+    /// Check if the name given corresponds to an archive
     fn is_archive_index(&self, index: &str) -> bool {
         match self.archive_name() {
             Some(archive_index) => index.starts_with(&archive_index),
@@ -238,6 +263,7 @@ impl Index {
         }
     }
 
+    /// Get the number of replicas defined for this index
     fn replicas(&self, archive: bool) -> Option<u32> {
         let name = self.to_string().to_uppercase();
         let replicas: u32 = match std::env::var(format!("ELASTIC_{name}_REPLICAS")) {
@@ -258,6 +284,7 @@ impl Index {
         }
     }
 
+    /// Get the number of shards defined for this index
     fn shards(&self, archive: bool) -> Option<u32> {
         let name = self.to_string().to_uppercase();
         let shards: u32 = match std::env::var(format!("ELASTIC_{name}_SHARDS")) {
@@ -281,7 +308,7 @@ impl Index {
 
 
 impl Elastic {
-
+    /// create a new http connection pool for talking to elasticsearch
     pub fn new(host: &str, ca_cert: Option<&str>, connect_unsafe: bool, archive_access: bool) -> Result<Self> {
         let url: url::Url = host.parse()?;
         let mut builder = reqwest::Client::builder();
@@ -306,6 +333,7 @@ impl Elastic {
     //     Ok(self.get_index_list(index, catagory)?.join(","))
     // }
 
+    /// Get list of indices corresponding to index group
     fn get_index_list(&self, index: Index, catagory: Option<IndexCatagory>) -> Result<Vec<String>> {
         match catagory {
             // Default value
@@ -359,7 +387,7 @@ impl Elastic {
         }
     }
 
-
+    /// checking if an index of the given name exists
     pub async fn does_index_exist(&self, name: &str) -> Result<bool> {
         // self.with_retries(self.datastore.client.indices.exists, index=alias)
         let url = self.host.join(name)?;
@@ -376,6 +404,7 @@ impl Elastic {
         }
     }
 
+    /// Check if an alias with the given name is defined
     pub async fn does_alias_exist(&self, name: &str) -> Result<bool> {
         // self.with_retries(self.datastore.client.indices.exists_alias, name=alias)
         let url = self.host.join("_alias/")?.join(name)?;
@@ -383,6 +412,7 @@ impl Elastic {
         Ok(result.status() == reqwest::StatusCode::OK)
     }
 
+    /// Create an index alias
     pub async fn put_alias(&self, index: &str, name: &str) -> Result<()> {
         // self.with_retries(self.datastore.client.indices.put_alias, index=index, name=alias)
         let url = self.host.join(&format!("{index}/_alias/{name}"))?;
@@ -390,6 +420,7 @@ impl Elastic {
         Ok(())
     }
 
+    /// Get the settings map for creating a new index
     fn get_index_settings(&self, index: Index, archive: bool) -> serde_json::Value {
         default_settings(json!({
             "number_of_shards": index.shards(archive), // self.shards if not archive else self.archive_shards,
@@ -397,6 +428,7 @@ impl Elastic {
         }))
     }
 
+    /// Wait for an index responds with a given status level
     async fn wait_for_status(&self, index: &str, min_status: Option<&str>) -> Result<()> {
         let min_status = min_status.unwrap_or("yellow");
         let mut url = self.host.join("_cluster/health/")?.join(index)?;
@@ -425,6 +457,7 @@ impl Elastic {
         }
     }
 
+    /// start an index copy operation and wait for it to complete
     async fn safe_index_copy(&self, copy_method: CopyMethod, src: &str, target: &str, settings: Option<serde_json::Value>, min_status: Option<&str>) -> Result<()> {
         let min_status = min_status.unwrap_or("yellow");
         let mut url = self.host.join(&format!("{src}/{copy_method}/{target}"))?;
@@ -444,6 +477,7 @@ impl Elastic {
         self.wait_for_status(target, Some(min_status)).await
     }
 
+    /// Given an http query result decide whether to retry or extract the response
     async fn handle_result(attempt: &mut u64, result: reqwest::Result<reqwest::Response>) -> Result<Option<reqwest::Response>> {
         // Handle connection errors with a retry, let other non http errors bubble up
         let response = match result {
@@ -479,6 +513,7 @@ impl Elastic {
         }
     }
 
+    /// Start an http request with an empty body
     async fn make_request(&self, attempt: &mut u64, method: reqwest::Method, url: &reqwest::Url) -> Result<reqwest::Response> {
         loop {
             *attempt += 1;
@@ -495,6 +530,7 @@ impl Elastic {
         }     
     }
 
+    /// start an http request with a json body
     async fn make_request_json<R: Serialize>(&self, attempt: &mut u64, method: reqwest::Method, url: &reqwest::Url, body: &R) -> Result<reqwest::Response> {
         loop {
             *attempt += 1;
@@ -512,6 +548,7 @@ impl Elastic {
         }     
     }
 
+    /// start an http request with a binary body
     async fn make_request_data(&self, attempt: &mut u64, method: reqwest::Method, url: &reqwest::Url, body: &[u8]) -> Result<reqwest::Response> {
         // TODO: body can probably be a boxed stream of some sort which will be faster to clone
         loop {
@@ -546,8 +583,8 @@ impl Elastic {
     #[cfg(test)]
     async fn wipe_index(&self, index: &str) -> Result<()> {
         debug!("Wipe operation started for collection: {}", index.to_ascii_uppercase());
-        if self.does_index_exist(&index).await.context("does_index_exist")? {
-            let url = self.host.join(&index)?;
+        if self.does_index_exist(index).await.context("does_index_exist")? {
+            let url = self.host.join(index)?;
             if let Err(err) = self.make_request(&mut 0, Method::DELETE, &url).await {
                 if let ElasticError::HTTPError{code: StatusCode::NOT_FOUND, ..} =  &err {
                     return Ok(())
@@ -560,21 +597,28 @@ impl Elastic {
 
 }
 
+/// A wrapper around a specific collection of elastic indices with a common schema
 pub struct Collection<Schema: DSType> {
+    /// label for this collection
     index: Index,
+    /// elastic connection information with shared connection pool
     connection: Elastic,
+    /// zero size type marker to keep schema 
     _type: PhantomData<Schema>,
 }
 
 impl<Schema: DSType> Clone for Collection<Schema> {
     fn clone(&self) -> Self {
-        Self { index: self.index.clone(), connection: self.connection.clone(), _type: self._type.clone() }
+        Self { index: self.index, connection: self.connection.clone(), _type: self._type }
     }
 }
 
+/// Operation options for saving a document into an index
 #[allow(unused)]
 pub enum SaveOperation {
+    /// Only allow the save operation if the document is new
     Create,
+    /// Only allow the save operation if the version of the document being replaced matches the given version
     Version(Option<(i64, i64)>)
 }
 
@@ -587,28 +631,20 @@ impl From<Option<(i64, i64)>> for SaveOperation {
 }
 
 impl<Schema: DSType> Collection<Schema> {
+    /// Setup wrapper for inde group
     fn new(index: Index, connection: Elastic) -> Self {
         Collection { index, connection, _type: Default::default() }
     }
 
+    /// Create a search builder 
     pub fn search<'a, Fields: DeserializeOwned + Default>(&self, query: &'a str) -> SearchBuilder<'a, Fields, Schema> {
         SearchBuilder::<Fields, Schema>::new(self.clone(), query)
     }
     
-    // def save(self, key, data, version=None, index_type=Index.HOT):
-    // """
-    // Save a to document to the datastore using the key as its document id.
-    //
-    // The document data will be normalized before being saved in the datastore.
-    //
-    // :param index_type: Type of indices to target
-    // :param key: ID of the document to save
-    // :param data: raw data or instance of the model class to save as the document
-    // :param version: version of the document to save over, if the version check fails this will raise an exception
-    // :return: True if the document was saved properly
-    // """
+    /// Save a to document to the datastore using the key as its document id.
+    /// Return true if the document was saved properly
     pub async fn save(&self, key: &str, data: &Schema, version: impl Into<SaveOperation>) -> Result<bool> {
-        if key.contains(" ") {
+        if key.contains(' ') {
             return Err(ElasticError::BadKey(key.to_owned()))
         }
 
@@ -623,12 +659,6 @@ impl<Schema: DSType> Collection<Schema> {
             SaveOperation::Version(version) => {
                 parsed_version = version;
             }
-            // } else {
-            //     let mut parts = version.split("---");
-            //     let seq_no: i64 = parts.next().ok_or(ElasticError::BadDocumentVersion)?.parse().map_err(|_| ElasticError::BadDocumentVersion)?;
-            //     let primary_term: i64 = parts.next().ok_or(ElasticError::BadDocumentVersion)?.parse().map_err(|_| ElasticError::BadDocumentVersion)?;
-            //     parsed_version = Some((seq_no, primary_term))
-            // }
         }
 
         // serialize the body
@@ -662,8 +692,9 @@ impl<Schema: DSType> Collection<Schema> {
         }
     }
 
+    /// Is the message given an error about a missing index
     fn is_index_not_found_error(message: &str) -> bool {
-        let mut message: JsonMap = match serde_json::from_str(&message) {
+        let mut message: JsonMap = match serde_json::from_str(message) {
             Ok(message) => message,
             _ => return false,
         };
@@ -679,13 +710,16 @@ impl<Schema: DSType> Collection<Schema> {
         }
     }
 
-    async fn refresh(&self) -> Result<()> {
+    /// Call refresh on the indices in this collection
+    #[allow(unused)]
+    pub async fn refresh(&self) -> Result<()> {
         for index in self.get_index_list(None)? {
             self.make_request(Method::POST, &self.connection.host.join(&format!("{index}/_refresh"))?).await?;
         }
         Ok(())
     }
 
+    /// Make an http request with no body
     async fn make_request(&self, method: reqwest::Method, url: &reqwest::Url) -> Result<reqwest::Response> {
         let mut attempt = 0;
         loop {
@@ -703,6 +737,7 @@ impl<Schema: DSType> Collection<Schema> {
         }     
     }
 
+    /// Make an http request with a json body
     async fn make_request_json<R: Serialize>(&self, method: reqwest::Method, url: &reqwest::Url, body: &R) -> Result<reqwest::Response> {
         let mut attempt = 0;
         loop {
@@ -720,14 +755,17 @@ impl<Schema: DSType> Collection<Schema> {
         }     
     }
 
+    /// Get indices in this collection as a comma separated list
     fn get_joined_index(&self, catagory: Option<IndexCatagory>) -> Result<String> {
         Ok(self.get_index_list(catagory)?.join(","))
     }
 
+    /// Get indices in this collection
     pub fn get_index_list(&self, catagory: Option<IndexCatagory>) -> Result<Vec<String>> {
         self.connection.get_index_list(self.index, catagory)
     }
 
+    /// Get all the requested documents in as few queries as managable
     pub async fn multiget(&self, ids: &[&str]) -> Result<HashMap<String, GetResponse<Schema, ()>>> {
         if ids.is_empty() { return Ok(Default::default()) }
 
@@ -774,6 +812,7 @@ impl<Schema: DSType> Collection<Schema> {
         Ok(output)
     }
 
+    /// Fetch a single document and its current version numbers 
     pub async fn get(&self, id: &str) -> Result<Option<(Schema, (i64, i64))>> {
         //
         for index in self.get_index_list(None)? {
@@ -820,7 +859,7 @@ impl<Schema: DSType> Collection<Schema> {
                             if message.contains("resource_already_exists_exception") {
                                 warn!("Tried to create an index template that already exists: {}", alias.to_uppercase());    
                             } else {
-                                return Err(err.into()).context("put index bad request")
+                                return Err(err).context("put index bad request")
                             }
                         },
                         _ => return Err(err).context("put index other error")
@@ -856,11 +895,14 @@ impl<Schema: DSType> Collection<Schema> {
     }
 }
 
+/// Layout of the json response for multiget
 #[derive(Deserialize)]
 struct MGetResponse<Source, Fields> {
+    /// a list is returned with a normal get response for each requested document
     docs: Vec<GetResponse<Source, Fields>>,
 }
 
+/// Layout of the json response for get 
 #[derive(Deserialize)]
 #[allow(unused)]
 pub struct GetResponse<Source, Fields> {
@@ -886,9 +928,12 @@ pub struct GetResponse<Source, Fields> {
     pub _fields: Option<Fields>,
 }
 
+/// a default method so that Source doesn't need to be Default for the response to be
 fn default_none<Source>() -> Option<Source> { None }
 
+/// Methods supported for copying indices
 enum CopyMethod {
+    /// Copy the index by cloning it
     Clone,
 }
 
@@ -900,34 +945,50 @@ impl std::fmt::Display for CopyMethod {
     }
 }
 
+/// json response for command queries
 #[derive(Deserialize)]
 struct ElasticCommandResponse {
+    /// boolean field confirming the processing of the command
     acknowledged: bool,
 }
 
+/// Type used for the source parameter of searches
 #[allow(unused)]
 enum SourceParam<'a> {
+    /// Whether to include the source in the response or not
     Include(bool),
+    /// A field mask to select certain fields form the source
     Fields(&'a str),
 }
 
+/// Helper struct to build a search query 
 pub struct SearchBuilder<'a, FieldType, SourceType: DSType> {
+    /// Collection to target with search
     collection: Collection<SourceType>,
+    /// which index types in the collection should be searched
     catagories: Option<IndexCatagory>,
+    /// Query to run
     query: &'a str,
+    /// number of rows to return
     size: usize,
+    /// how to sort the documents
     sort: Vec<serde_json::Value>,
+    /// field mask to select fields from indexed data
     fields: Vec<&'a str>,
+    /// parameter to select fields from original data
     source: SourceParam<'a>,
+    /// Limit on number of hits to count towards total
     track_total_hits: Option<u64>,
+    /// zero size type marker for type used to parse field response
     _field_data_type: PhantomData<FieldType>,
+    /// zero size type marker for type used to parse source response
     _source_data_type: PhantomData<SourceType>
 }
 
 #[allow(unused)]
 impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilder<'a, FieldType, SourceType> {
-
-    pub fn new(collection: Collection<SourceType>, query: &'a str) -> Self {
+    /// Create a query helper with all default parameters
+    fn new(collection: Collection<SourceType>, query: &'a str) -> Self {
         Self {
             collection,
             catagories: None,
@@ -942,30 +1003,37 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
         }
     }
 
+    /// Set the index catagories for this search
     pub fn index_catagories(mut self, catagories: IndexCatagory) -> Self {
         self.catagories = Some(catagories); self
     }
 
+    /// set the maximum number of returned rows for this search
     pub fn size(mut self, size: usize) -> Self {
         self.size = size; self
     }
-    
+
+    /// set the limit on calculating the total result set size
     pub fn track_total_hits(mut self, hits: u64) -> Self {
         self.track_total_hits = Some(hits); self
     }
 
+    /// set the sort settings
     pub fn sort(mut self, sort: serde_json::Value) -> Self {
         self.sort = vec![sort]; self
     }
 
+    /// Set a mask for fields to extract from the indexed data
     pub fn fields(mut self, fields: Vec<&'a str>) -> Self {
         self.fields = fields; self
     }
 
+    /// Enable or disable retrieval of the full original document
     pub fn full_source(mut self, include: bool) -> Self {
         self.source = SourceParam::Include(include); self
     }
 
+    /// Helper function to transform parameters into a query body
     fn prepare_body(&self) -> JsonMap {
         let source = match self.source {
             SourceParam::Include(source) => json!(source),
@@ -993,6 +1061,7 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
         body
     }
 
+    /// Run the search fetching all results in a single query
     pub async fn execute(self) -> Result<SearchResult<FieldType, SourceType>> {
         let indices = self.collection.get_joined_index(self.catagories)?;
         let path = format!("{indices}/_search");
@@ -1019,6 +1088,7 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
         }        
     }
 
+    /// Scan over the result set in batches using a PIT to ensure consitency wrt other operations
     pub async fn scan(mut self) -> Result<ScanCursor<FieldType, SourceType>> {
         // create PIT
         let pit = {
@@ -1054,11 +1124,14 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
     }
 }
 
+/// elasticsearch response for query to create a PIT
 #[derive(Deserialize)]
 struct PITResponse {
+    /// ID code for this PIT to be used in subsequent queries
     id: String,
 }
 
+/// elasticsearch respons to status query
 #[derive(Deserialize)]
 #[allow(unused)]
 struct ElasticStatus {
@@ -1098,6 +1171,7 @@ struct ElasticStatus {
     pub active_shards_percent_as_number: f64,
 }
 
+/// elasticsearch response to a bulk operation query
 #[derive(Deserialize)]
 #[allow(unused)]
 struct BulkResponse {
@@ -1113,13 +1187,18 @@ struct BulkResponse {
 #[derive(Deserialize)]
 #[serde(rename_all="lowercase")]
 enum BulkResponseItem {
+    /// response to a create operation done via a bulk call 
     Create(BulkResponseItemData),
+    /// response to a delete operation done via a bulk call
     Delete(BulkResponseItemData),
+    /// response to an index operation done via a bulk call
     Index(BulkResponseItemData),
+    /// response to an update operation done via a bulk call 
     Update(BulkResponseItemData)
 }
 
 impl BulkResponseItem {
+    /// Extract inner response without respect to operation type
     fn into_data(self) -> BulkResponseItemData {
         match self {
             BulkResponseItem::Create(data) => data,
@@ -1130,6 +1209,7 @@ impl BulkResponseItem {
     }
 }
 
+/// elasticsearch response fragment for a portion of a bulk operation set
 #[derive(Deserialize)]
 #[allow(unused)]
 struct BulkResponseItemData {
@@ -1165,11 +1245,13 @@ struct BulkResponseItemData {
 }
 
 impl BulkResponseItemData {
+    /// check whether this individual operation was successful, can be different for every operation in a bulk call 
     fn is_success(&self) -> bool {
         self.result.is_some()
     }
 }
 
+/// Details about shards involved in completing an operation in a bulk call
 #[derive(Deserialize)]
 #[allow(unused)]
 struct BulkResponseItemShards {
@@ -1181,6 +1263,7 @@ struct BulkResponseItemShards {
     pub failed: i64,
 }
 
+/// Error information from an operation in a bulk call
 #[derive(Deserialize, Debug)]
 #[allow(unused)]
 struct BulkResponseItemError {
@@ -1197,20 +1280,28 @@ struct BulkResponseItemError {
     pub index: String,
 }
 
-
+/// Cursor over results to a query on a PIT 
 pub struct ScanCursor<FieldType, SourceType> {
+    /// connection pool for the elasticsearch server
     client: Elastic,
+    /// url of the index where the query is being run
     url: reqwest::Url,
+    /// body describing query being run
     query_body: JsonMap,
+    /// PIT id for data snapshot being searched
     pit: String,
+    /// number of items returned in each batch
     size: usize,
+    /// sort entry used as search cursor
     search_after: Option<serde_json::Value>,
+    /// flag indicating search has completed
     finished: bool,
+    /// batch of search results currently being traversed
     current_batch: Vec<SearchResultHitItem<FieldType, SourceType>>,
 }
 
 impl<FieldType: DeserializeOwned + Default, SourceType: DeserializeOwned> ScanCursor<FieldType, SourceType> {
-
+    /// Fetch the next item in the search, making additional calls to elasticsearch as needed
     pub async fn next(&mut self) -> Result<Option<SearchResultHitItem<FieldType, SourceType>>> {
         match self.current_batch.pop() {
             Some(item) => Ok(Some(item)),
@@ -1223,6 +1314,7 @@ impl<FieldType: DeserializeOwned + Default, SourceType: DeserializeOwned> ScanCu
         }
     }
 
+    /// Fetch the next batch of items from elasticsearch, helper for next method
     async fn next_batch(&mut self) -> Result<()> {
         // Add pit and search_after
         self.query_body.insert("pit".to_owned(), json!({
@@ -1259,10 +1351,11 @@ impl<FieldType: DeserializeOwned + Default, SourceType: DeserializeOwned> ScanCu
 }
 
 impl<FieldType, SourceType> Drop for ScanCursor<FieldType, SourceType> {
+    /// clear the PIT when the cursor is dropped
     fn drop(&mut self) {
-        // clear the PIT
         let client = self.client.clone();
         let pit = self.pit.clone();
+        // spawn a new async task to make the PIT delete call, since drop is sync
         tokio::spawn(async move {
             let url = client.host.join("_pit").unwrap();
             _ = client.make_request_json(&mut 0, reqwest::Method::DELETE, &url, &json!({
@@ -1272,40 +1365,61 @@ impl<FieldType, SourceType> Drop for ScanCursor<FieldType, SourceType> {
     }
 }
 
+/// elasticsearch response for a search query
 #[derive(Deserialize)]
 pub struct SearchResult<FieldType: Default, SourceType> {
+    /// time taken to complete search call
     pub took: u64,
+    /// flag indicating the search timed out rather than completed
     pub timed_out: bool,
+    /// hits returned for the search
     pub hits: SearchResultHits<FieldType, SourceType>
 }
 
+/// hits section for an elasticsearch response to a search query
 #[derive(Debug, Deserialize)]
 pub struct SearchResultHits<FieldType: Default, SourceType> {
+    /// information on the total number of matching documents as distinct from the potentially more limited set returned
     pub total: SearchResultHitTotals,
+    /// Score indicating the quality of match in the search
     pub max_score: Option<f64>,
+    /// list of items returned by the search
     pub hits: Vec<SearchResultHitItem<FieldType, SourceType>>,
 }
 
+/// total hit value with form of total for a search
 #[derive(Debug, Deserialize)]
 pub struct SearchResultHitTotals {
+    /// number of or bound on the total size of the matching document set
     pub value: u64,
+    /// operation decribing the nature of the bound given (is it the exact number or bound)
+    /// TODO replace with enum
     pub relation: String,
 }
 
+/// entry returned for a single document matched by a search 
 #[derive(Debug, Deserialize)]
 pub struct SearchResultHitItem<FieldType, SourceType> {
+    /// index document was returned from (search may be over many indices)
     pub _index: String,
+    /// document id
     pub _id: String,
+    /// score describing the match of this result to the search parameters
     pub _score: Option<f64>,
+    /// the source document (or fields of the source document) requested in the search 
     #[serde(default="default_source")]
     pub _source: Option<SourceType>,
+    /// entry describing this document's position in the sorting of the result set, useful for pagination 
     pub sort: serde_json::Value,
+    /// Fields returned by the search from the indexed data (as opposed to source document)
     #[serde(default)]
     pub fields: FieldType,
 }
 
+/// helper function to handle empty source response when SourceType is not Default
 fn default_source<T>() -> Option<T> { None }
 
+/// Enumeration describing each type of error that can occur accessing elasticsearch
 #[derive(Debug)]
 pub enum ElasticError {
     FailedToCreateIndex(String, String),
@@ -1315,7 +1429,6 @@ pub enum ElasticError {
     JSON(serde_json::Error),
     MalformedResponse,
     BadKey(String),
-    // BadDocumentVersion,
     SerializeError(ModelError),
     ArchiveDisabled(&'static str),
     IndexHasNoArchive(Index),
@@ -1354,28 +1467,28 @@ impl From<reqwest::Error> for ElasticError {
                 ElasticError::HTTPError { path, code, message }
             },
             None => ElasticError::OtherHttpClient(value),
-        }
+        }.into()
     }
 }
 
 impl From<url::ParseError> for ElasticError {
-    fn from(value: url::ParseError) -> Self { Self::URL(value) }
+    fn from(value: url::ParseError) -> Self { ElasticError::URL(value).into() }
 }
 
 impl From<serde_json::Error> for ElasticError {
-    fn from(value: serde_json::Error) -> Self { Self::JSON(value) }
+    fn from(value: serde_json::Error) -> Self { ElasticError::JSON(value).into() }
 }
 
 impl From<assemblyline_models::ModelError> for ElasticError {
-    fn from(value: assemblyline_models::ModelError) -> Self { Self::SerializeError(value) }
+    fn from(value: assemblyline_models::ModelError) -> Self { ElasticError::SerializeError(value).into() }
 }
 
 impl From<assemblyline_models::meta::MappingError> for ElasticError {
-    fn from(value: assemblyline_models::meta::MappingError) -> Self { Self::MappingError(value) }
+    fn from(value: assemblyline_models::meta::MappingError) -> Self { ElasticError::MappingError(value).into() }
 }
 
 impl From<assemblyline_markings::errors::Errors> for ElasticError {
-    fn from(value: assemblyline_markings::errors::Errors) -> Self { Self::ClassificationError(value) }
+    fn from(value: assemblyline_markings::errors::Errors) -> Self { ElasticError::ClassificationError(value).into() }
 }
 
 pub (crate) type Result<T> = std::result::Result<T, ElasticError>;
@@ -1477,7 +1590,7 @@ mod test {
                 expiry: ExpiryGroup::today() 
             });
         }
-        let mut subset: Vec<FileInfo> = hits[0..50].iter().cloned().collect();
+        let mut subset: Vec<FileInfo> = hits[0..50].to_vec();
         ds.save_hits("search", hits).await.unwrap();
 
         // Update some of those files

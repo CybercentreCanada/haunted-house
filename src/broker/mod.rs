@@ -53,7 +53,7 @@ pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
     // Initialize database
     info!("Connecting to database.");
     let ec = &config.datastore;
-    let client = if let Some(url) = ec.url.get(0) {
+    let client = if let Some(url) = ec.url.first() {
         Datastore::new(url, ec.ca_cert.as_deref(), ec.connect_unsafe, ec.archive_access)?
     } else {
         return Err(anyhow::anyhow!("Datastore URL must be configured."));
@@ -391,6 +391,7 @@ impl HouseCore {
 
     /// Read the status of the system including all workers
     pub (crate) async fn status(self: &Arc<Self>) -> Result<StatusReport> {
+        /// How long to wait for elements of the status report to load
         const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
         // Send requests to workers for details we want from them
@@ -495,6 +496,7 @@ impl HouseCore {
         })
     }
 
+    /// Rerun a new search, possibly with changes to parameters, without creating a new search record
     pub async fn repeat_search(self: &Arc<Self>, key: &str, classification: ClassificationString, expiry: Option<DateTime<Utc>>) -> Result<RepeatOutcome> {
         loop {
             // fetch the old value
@@ -507,10 +509,8 @@ impl HouseCore {
                 return Ok(RepeatOutcome::AlreadyRunning)
             }
 
+            // Update search access level
             let new_classification = ClassificationString::new(self.access_engine.max_classification(search.search_classification.as_str(), classification.as_str(), false)?)?;
-            if new_classification == search.search_classification {
-                return Ok(RepeatOutcome::Started)
-            }
 
             // Update expiry
             search.expiry_ts = match (search.expiry_ts, expiry) {
@@ -538,9 +538,13 @@ impl HouseCore {
 
 }
 
+/// Outcome of trying to repeat a search
 pub enum RepeatOutcome {
+    /// When a search has been started again
     Started,
+    /// When the search targeted can't be found
     NotFound,
+    /// When the search in question is currently running
     AlreadyRunning
 }
 
@@ -557,7 +561,7 @@ impl IngestTask {
     /// Merge two tasks that refer to the same file
     pub fn merge(&mut self, task: IngestTask) {
         // merge the metadata about the file
-        self.info.expiry = self.info.expiry.clone().max(task.info.expiry);
+        self.info.expiry = self.info.expiry.max(task.info.expiry);
         self.info.access = self.info.access.or(&task.info.access).simplify();
         // collect all the response channels into one list
         self.response.extend(task.response);
