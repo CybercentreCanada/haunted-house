@@ -40,7 +40,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(SQLiteCommand::CreateFilter { id, expiry: expiry.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::CreateFilter { id, expiry: *expiry, response: send }).await?;
                 resp.await?
             }
         }
@@ -50,7 +50,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(SQLiteCommand::GetFilters { first: first.clone(), last: last.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::GetFilters { first: *first, last: *last, response: send }).await?;
                 resp.await?
             }
         }
@@ -60,7 +60,7 @@ impl Database {
         match self {
             Database::SQLite(chan) => {
                 let (send, resp) = oneshot::channel();
-                chan.send(SQLiteCommand::GetExpiry { first: first.clone(), last: last.clone(), response: send }).await?;
+                chan.send(SQLiteCommand::GetExpiry { first: *first, last: *last, response: send }).await?;
                 resp.await?
             }
         }

@@ -154,7 +154,7 @@ impl BufferedSQLite {
 
     async fn handle_message(&mut self, message: SQLiteCommand) -> Result<()> {
         match message {
-            SQLiteCommand::CreateFilter { id, expiry, response } => { _ = response.send(self.create_filter(id, &expiry).await); },
+            SQLiteCommand::CreateFilter { id, expiry, response } => { _ = response.send(self.create_filter(id, expiry).await); },
             SQLiteCommand::GetFilters { first, last, response } => { _ = response.send(self.get_filters(&first, &last).await); },
             SQLiteCommand::GetExpiry { first, last, response } => { _ = response.send(self.get_expiry(&first, &last).await); },
             SQLiteCommand::DeleteFilter { id, response } => { _ = response.send(self.delete_filter(id).await); },
@@ -251,7 +251,7 @@ impl BufferedSQLite {
         }
     }
 
-    pub async fn create_filter(&mut self, name: FilterID, expiry: &ExpiryGroup) -> Result<()> {
+    pub async fn create_filter(&mut self, name: FilterID, expiry: ExpiryGroup) -> Result<()> {
         let mut con = self.db.begin().await?;
         info!("Creating filter {name} ({})", name.to_i64());
 
@@ -260,7 +260,7 @@ impl BufferedSQLite {
             .bind(expiry.as_u32())
             .execute(&mut con).await?;
 
-        self.workers.insert(name, FilterSQLWorker::start(&self.database_directory, self.ce.clone(), name, expiry.clone(), self.filter_sizes.clone(), self.filter_pending.clone()).await?);
+        self.workers.insert(name, FilterSQLWorker::start(&self.database_directory, self.ce.clone(), name, expiry, self.filter_sizes.clone(), self.filter_pending.clone()).await?);
 
         con.commit().await?;
 

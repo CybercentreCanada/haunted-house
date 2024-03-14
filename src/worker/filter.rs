@@ -931,15 +931,15 @@ impl Iterator for TrigramCursor<'_> {
     }
 }
 
-fn into_trigrams(bytes: &Vec<u8>) -> Vec<u32> {
+fn into_trigrams(bytes: &[u8]) -> Vec<u32> {
     if bytes.len() < 3 {
         return vec![];
     }
     let mut trigrams = vec![];
     let mut trigram: u32 = (bytes[0] as u32) << 8 | (bytes[1] as u32);
 
-    for index in 2..bytes.len() {
-        trigram = (trigram & 0x00FFFF) << 8 | (bytes[index] as u32);
+    for byte in bytes.iter().skip(2) {
+        trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
         trigrams.push(trigram);
     }
 
@@ -958,7 +958,7 @@ fn union(base: &mut Vec<u64>, other: &Vec<u64>) {
 /// Calculate the intersection of two sets of numbers into the the first set
 ///
 /// list must be ordered
-fn intersection(base: &mut Vec<u64>, other: &Vec<u64>) {
+fn intersection(base: &mut Vec<u64>, other: &[u64]) {
 
     let mut base_read_index = 0;
     let mut base_write_index = 0;
@@ -1161,7 +1161,7 @@ mod test {
         Ok(())
     }
 
-    // #[test] temporary remove for performance reasons
+    #[test]
     fn multiple_writes() -> Result<()> {
         // let x = setup_global_subscriber();
 
@@ -1225,7 +1225,7 @@ mod test {
         Ok(())
     }
 
-    // #[test] temporary remove for performance reasons
+    #[test]
     fn duplicate_batch() -> Result<()> {
         let data = TrigramSet::random(thread_rng().gen());
 
@@ -1311,7 +1311,7 @@ mod test {
         return Ok(())
     }
 
-    // #[test] temporary remove for performance reasons
+    #[test]
     fn out_of_order_batch_reversed() -> Result<()> {
         let mut bits = TrigramSet::new();
         bits.insert(0);
@@ -1397,7 +1397,7 @@ mod test {
     //     Ok(())
     // }
 
-    // #[test] temporary remove for performance reasons
+    #[test]
     fn collector() {
         let mut objects = vec![];
         for ii in 0..256 {
@@ -1457,10 +1457,10 @@ mod test {
 
     #[test]
     fn test_into_trigrams() {
-        assert_eq!(into_trigrams(&vec![]), Vec::<u32>::new());
-        assert_eq!(into_trigrams(&vec![0x10, 0xff]), Vec::<u32>::new());
-        assert_eq!(into_trigrams(&vec![0x10, 0xff, 0x44]), vec![0x10ff44]);
-        assert_eq!(into_trigrams(&vec![0x10, 0xff, 0x44, 0x22]), vec![0x10ff44, 0xff4422]);
+        assert_eq!(into_trigrams(&[]), Vec::<u32>::new());
+        assert_eq!(into_trigrams(&[0x10, 0xff]), Vec::<u32>::new());
+        assert_eq!(into_trigrams(&[0x10, 0xff, 0x44]), vec![0x10ff44]);
+        assert_eq!(into_trigrams(&[0x10, 0xff, 0x44, 0x22]), vec![0x10ff44, 0xff4422]);
     }
 
     #[test]
@@ -1516,52 +1516,52 @@ mod test {
     fn test_intersection() {
         {
             let mut base = vec![];
-            intersection(&mut base, &vec![]);
+            intersection(&mut base, &[]);
             assert!(base.is_empty());
         }
         {
             let mut base = vec![0x0];
-            intersection(&mut base, &vec![]);
+            intersection(&mut base, &[]);
             assert!(base.is_empty());
         }
         {
             let mut base = vec![];
-            intersection(&mut base, &vec![0x0]);
+            intersection(&mut base, &[0x0]);
             assert!(base.is_empty());
         }
         {
             let mut base = vec![0x0, 0x1];
-            intersection(&mut base, &vec![]);
+            intersection(&mut base, &[]);
             assert!(base.is_empty());
         }
         {
             let mut base = vec![];
-            intersection(&mut base, &vec![0x0, 0x1]);
+            intersection(&mut base, &[0x0, 0x1]);
             assert!(base.is_empty());
         }
         {
             let mut base = vec![0x0];
-            intersection(&mut base, &vec![0x0]);
+            intersection(&mut base, &[0x0]);
             assert_eq!(base, vec![0x0]);
         }
         {
             let mut base = vec![0xff];
-            intersection(&mut base, &vec![0x0, 0xff]);
+            intersection(&mut base, &[0x0, 0xff]);
             assert_eq!(base, vec![0xff]);
         }
         {
             let mut base = vec![0xff];
-            intersection(&mut base, &vec![0xff, 0x0]);
+            intersection(&mut base, &[0xff, 0x0]);
             assert_eq!(base, vec![0xff]);
         }
         {
             let mut base = vec![0x0, 0x1];
-            intersection(&mut base, &vec![0x0, 0x1, 0xff]);
+            intersection(&mut base, &[0x0, 0x1, 0xff]);
             assert_eq!(base, vec![0x0, 0x1]);
         }
         {
             let mut base = vec![0x1, 0xff];
-            intersection(&mut base, &vec![0x0, 0x1]);
+            intersection(&mut base, &[0x0, 0x1]);
             assert_eq!(base, vec![0x1]);
         }
     }

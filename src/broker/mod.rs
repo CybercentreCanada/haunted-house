@@ -758,7 +758,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
     // Put the tasks not marked as processed or pending by any working into the queue
     let mut unassigned = core.pending_assignments.write().await;
     'next_task: for task in tasks.into_values() {
-        match unassigned.entry(task.info.expiry.clone()) {
+        match unassigned.entry(task.info.expiry) {
             hash_map::Entry::Occupied(mut entry) => {
                 for existing in entry.get_mut().iter_mut() {
                     if existing.info.hash == task.info.hash {
@@ -986,7 +986,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                             }
                         }
                         if !queue.is_empty() {
-                            backlocked_groups.push(group.clone());
+                            backlocked_groups.push(*group);
                         }
                     }
                 }
@@ -1240,9 +1240,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
 
                 let db = core.database.clone();
                 let code = code.clone();
-                elastic_writes.spawn(async move { Ok(db.save_hits(&code, result.hits).await?) });
-                // elastic_writes.spawn(core.database.clone().save_hits(&code, result.hits));
-                // core.database.save_hits(&code, result.hits).await?;
+                elastic_writes.spawn(async move { db.save_hits(&code, result.hits).await });
                 status.errors.extend(result.errors);
             }
             permit = core.yara_permits.get(), if next_batch.is_some() => {

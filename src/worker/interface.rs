@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context};
+use anyhow::Context;
 use futures::{SinkExt, StreamExt};
-use log::{error};
+use log::error;
 use poem::web::websocket::{WebSocket, Message};
 use poem::{handler, Route, get, EndpointExt, Server, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
@@ -19,7 +19,7 @@ use crate::timing::ResourceReport;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID};
 use crate::worker::YaraTask;
 
-use super::manager::{WorkerState};
+use super::manager::WorkerState;
 
 // use crate::config::TLSConfig;
 // use crate::interface::LoggerMiddleware;
@@ -36,7 +36,7 @@ pub struct CreateIndexRequest {
 
 #[handler]
 async fn create_index(state: Data<&Arc<WorkerState>>, request: Json<CreateIndexRequest>) -> poem::Result<()> {
-    state.create_index(request.filter_id, request.expiry.clone()).await?;
+    state.create_index(request.filter_id, request.expiry).await?;
     Ok(())
 }
 
@@ -190,7 +190,9 @@ async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
         if let Some(expiry) = expiries.get(&filter) {
             for hash in hashes {
                 match state.database.get_file_access(filter, &hash).await {
-                    Ok(Some((access, access_string))) => {files.push(FileInfo { hash, access, access_string, expiry: expiry.clone() });}
+                    Ok(Some((access, access_string))) => {
+                        files.push(FileInfo { hash, access, access_string, expiry: *expiry });
+                    },
                     Ok(None) => {},
                     Err(err) => {
                         error!("{err}");

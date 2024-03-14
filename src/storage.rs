@@ -439,12 +439,8 @@ impl AzureBlobStore {
             Ok(metadata) => metadata,
             Err(err) => {
                 match err.kind() {
-                    azure_storage::ErrorKind::HttpResponse { status, .. } => {
-                        if let azure_core::StatusCode::NotFound = status {
-                            return Ok(None)
-                        } else {
-                            return Err(err.into())
-                        }
+                    azure_storage::ErrorKind::HttpResponse { status: azure_core::StatusCode::NotFound, .. } => {
+                        return Ok(None)
                     },
                     _ => return Err(err.into())
                 }

@@ -11,8 +11,6 @@ use parking_lot::Mutex;
 
 use lazy_static::lazy_static;
 
-use crate::error::Result;
-
 lazy_static! {
     static ref LABELS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Default::default());
     static ref HERITAGE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Default::default());
@@ -257,8 +255,10 @@ impl TimingCapture for NullCapture {
     fn build(&self, _index: usize) -> Self::Mark { Self::new() }
 }
 
+/// Path where we expect to find cgroup cpu information within a container
 const STAT_PATH: &str = "/sys/fs/cgroup/cpu.stat";
 
+/// Load cpu load information from the cgroup fs interface or return 0
 async fn load_cgroup_cpu_usage() -> u64 {
     let body = match tokio::fs::read_to_string(&STAT_PATH).await {
         Ok(body) => body,
@@ -276,6 +276,7 @@ async fn load_cgroup_cpu_usage() -> u64 {
     0
 }
 
+/// Load the memory resident for a given PID
 async fn load_process_memory(pid: u64) -> u64 {
     let path = format!("/proc/{pid}/status");
     let body = match tokio::fs::read_to_string(&path).await {
@@ -285,13 +286,14 @@ async fn load_process_memory(pid: u64) -> u64 {
     let parser = parse_size::Config::new().with_binary();
 
     for line in body.lines() {
-        if line.starts_with("VmRSS:") {
-            return parser.parse_size(&line[6..].trim()).unwrap_or_default();
+        if let Some(line) = line.strip_prefix("VmRSS:") {
+            return parser.parse_size(line.trim()).unwrap_or_default();
         }
     }
     0
 }
 
+///
 async fn load_memory() -> u64 {
     let mut total: u64 = 0;
     let mut iter = match tokio::fs::read_dir("/proc/").await {
@@ -309,25 +311,35 @@ async fn load_memory() -> u64 {
     total
 }
 
-
+/// An estimate of resource consumption
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResourceReport {
+    /// Estimated memory used by all process in the resident container
     memory: u64,
+    /// CPU load for the last minute
     cpu_load_1m: f64,
+    /// CPU load for the last five minutes
     cpu_load_5m: f64,
+    /// CPU load for the last fifteen minutes
     cpu_load_15m: f64,
 }
 
+/// How many minutes to keep rolling checkpoints of cpu time
 const TIMESLOTS: usize = 16;
+/// One minute
 const MINUTE: Duration = Duration::from_secs(60);
 
+/// Track the cpu timer in a rolling buffer in minute increments
 #[derive(Default)]
 struct Timestamps {
+    /// Buffer for storing cpu time offsets
     data: [u64; TIMESLOTS],
+    /// which buffer slot was most recently written
     index: usize,
 }
 
 impl Timestamps {
+    /// Read the amount the cpu timer has advanced in last `gap` minutes.
     fn read_gap(&self, gap: usize) -> u64 {
         let current = self.data[self.index];
         let previous = self.data[(self.index + TIMESLOTS - gap) % TIMESLOTS];
@@ -335,12 +347,15 @@ impl Timestamps {
     } 
 }
 
+/// A struct that wraps a background task tracking cpu timer
 #[derive(Clone)]
 pub struct ResourceTracker {
+    /// Shared pointer to the cpu timer output
     cpu: Arc<Mutex<Timestamps>>,
 }
 
 impl ResourceTracker {
+    /// Start a background task that will try to estimate cpu usage
     pub fn start() -> ResourceTracker {
         let cpu = Arc::new(Mutex::new(Timestamps::default()));
         let stamps = cpu.clone();
@@ -365,6 +380,7 @@ impl ResourceTracker {
         ResourceTracker { cpu }
     }
 
+    /// Take a current snapshot of resource consumption estimates
     pub async fn read(&self) -> ResourceReport {
         let memory = load_memory().await;
         let data = self.cpu.lock();

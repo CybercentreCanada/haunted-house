@@ -100,7 +100,7 @@ impl Query {
         match self {
             Query::And(items) => Query::And(items.iter().map(|item| item.map_literals(map)).collect_vec()),
             Query::Or(items) => Query::Or(items.iter().map(|item| item.map_literals(map)).collect_vec()),
-            Query::Literal(bytes) => Query::Literal(map(&bytes)),
+            Query::Literal(bytes) => Query::Literal(map(bytes)),
             Query::MinOf(num, items) => Query::MinOf(*num, items.iter().map(|item| item.map_literals(map)).collect_vec()),
         }
     }

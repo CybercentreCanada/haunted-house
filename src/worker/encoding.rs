@@ -12,14 +12,14 @@ pub fn encode_value_into(mut value: u64, buffer: &mut Vec<u8>){
 }
 
 #[cfg(test)]
-pub fn encode(indices: &Vec<u64>) -> Vec<u8> {
+pub fn encode(indices: &[u64]) -> Vec<u8> {
     let mut buffer = vec![];
     encode_into(indices, &mut buffer);
     return buffer
 }
 
 /// pack a set of u64 into a buffer
-pub fn encode_into(indices: &Vec<u64>, buffer: &mut Vec<u8>) {
+pub fn encode_into(indices: &[u64], buffer: &mut Vec<u8>) {
     if indices.is_empty() {
         return;
     }
@@ -144,9 +144,9 @@ mod test {
         let mut prng = thread_rng();
         for ii in 1..100_000 {
             let num: u64 = prng.gen();
-            assert_eq!(encode(&vec![ii]).len() as u32, encoded_number_size(ii));
+            assert_eq!(encode(&[ii]).len() as u32, encoded_number_size(ii));
             if num != 0 {
-                assert_eq!(encode(&vec![num]).len() as u32, encoded_number_size(num));
+                assert_eq!(encode(&[num]).len() as u32, encoded_number_size(num));
             }
         }
     }

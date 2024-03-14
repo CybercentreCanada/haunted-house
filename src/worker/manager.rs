@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Result, Context};
 use chrono::DurationRound;
 use log::{debug, info, error};
-use tokio::sync::{mpsc, watch, Notify, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Notify, RwLock};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
@@ -22,7 +22,7 @@ use super::trigrams::TrigramCache;
 pub struct WorkerState {
     pub database: Database,
     pub running: watch::Receiver<bool>,
-    pub filters: tokio::sync::RwLock<HashMap<FilterID, (FilterWorker, Arc<Notify>, watch::Sender<bool>)>>,
+    pub filters: RwLock<HashMap<FilterID, FilterInfo>>,
     pub file_storage: BlobStorage,
     pub file_cache: BlobCache,
     pub trigrams: Arc<TrigramCache>,
@@ -30,6 +30,7 @@ pub struct WorkerState {
     pub resource_tracker: ResourceTracker,
 }
 
+type FilterInfo = (FilterWorker, Arc<Notify>, watch::Sender<bool>);
 
 impl WorkerState {
 
@@ -40,7 +41,7 @@ impl WorkerState {
         let new = Arc::new(Self {
             database,
             running,
-            filters: tokio::sync::RwLock::new(Default::default()),
+            filters: RwLock::new(Default::default()),
             file_cache,
             file_storage,
             config,

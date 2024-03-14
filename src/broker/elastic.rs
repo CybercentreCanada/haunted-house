@@ -306,7 +306,6 @@ impl Index {
     }
 }
 
-
 impl Elastic {
     /// create a new http connection pool for talking to elasticsearch
     pub fn new(host: &str, ca_cert: Option<&str>, connect_unsafe: bool, archive_access: bool) -> Result<Self> {
@@ -1420,6 +1419,7 @@ pub struct SearchResultHitItem<FieldType, SourceType> {
 fn default_source<T>() -> Option<T> { None }
 
 /// Enumeration describing each type of error that can occur accessing elasticsearch
+/// TODO simply this into kinds of errors rather than sources of errors
 #[derive(Debug)]
 pub enum ElasticError {
     FailedToCreateIndex(String, String),
@@ -1491,7 +1491,8 @@ impl From<assemblyline_markings::errors::Errors> for ElasticError {
     fn from(value: assemblyline_markings::errors::Errors) -> Self { ElasticError::ClassificationError(value).into() }
 }
 
-pub (crate) type Result<T> = std::result::Result<T, ElasticError>;
+/// Define result as defaulting to elastic error within this module
+pub (crate) type Result<T, E=ElasticError> = std::result::Result<T, E>;
 
 impl std::error::Error for ElasticError {}
 

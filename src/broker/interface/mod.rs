@@ -213,7 +213,7 @@ async fn repeat_search(Data(interface): Data<&SearcherInterface>, Json(request):
     })
 }
 
-
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize)]
 #[serde(tag="type", rename="lowercase")]
 pub (crate) enum SearchProgress {
@@ -248,13 +248,13 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
                     Err(_) => break,
                 }
             };
-            if let Err(_) = socket.send(Message::Text(status)).await {
+            if socket.send(Message::Text(status)).await.is_err() {
                 break
             }
             if finished {
                 break
             }
-            if let Err(_) = feed.changed().await {
+            if feed.changed().await.is_err() {
                 break;
             }
         }

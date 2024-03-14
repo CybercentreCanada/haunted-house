@@ -419,7 +419,7 @@ pub fn apply_variables(data: &str, vars: &HashMap<String, String>) -> Result<Str
     let mut output: String = "".to_owned();
 
     let vars: HashMap<String, String> = vars.iter()
-        .map(|(k, v)|(k.clone(), v.replace("\n", "\\n")))
+        .map(|(k, v)|(k.clone(), v.replace('\n', "\\n")))
         .collect();
 
     while let Some(capture) = parser.captures(input) {
