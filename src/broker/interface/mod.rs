@@ -139,7 +139,7 @@ impl SearcherInterface {
             return Ok(Some(socket))
         }
         if let Some((search, _)) = self.core.database.retrohunt.get(code).await? {
-            let (_, mut reciever) = watch::channel(SearchProgress::Finished { search });
+            let (_, mut reciever) = watch::channel(SearchProgress::Finished { key: code.to_owned(), search });
             reciever.mark_changed();
             return Ok(Some(reciever))
         }
@@ -217,14 +217,19 @@ async fn repeat_search(Data(interface): Data<&SearcherInterface>, Json(request):
 #[derive(Serialize)]
 #[serde(tag="type", rename="lowercase")]
 pub (crate) enum SearchProgress {
-    Starting {},
+    Starting {
+        key: String,
+    },
     Filtering {
+        key: String,
         progress: f64, 
     },
     Yara {
+        key: String,
         progress: f64, 
     },
     Finished {
+        key: String,
         search: models::Retrohunt
     },
 }

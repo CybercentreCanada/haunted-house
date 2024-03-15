@@ -199,7 +199,7 @@ impl HouseCore {
             info!("Starting search workers");
             let mut searches = core.running_searches.write().await;
             for mut search in core.database.list_active_searches().await? {
-                let (send, recv) = watch::channel(SearchProgress::Starting {  });
+                let (send, recv) = watch::channel(SearchProgress::Starting { key: search.key.clone() });
                 let code = search.key.clone();
                 search.started_time = chrono::Utc::now();
                 core.database.retrohunt.save(&search.key, &search, None).await?;
@@ -268,7 +268,7 @@ impl HouseCore {
 
         // Start the search worker
         let mut searches = self.running_searches.write().await;
-        let (send, recv) = watch::channel(SearchProgress::Starting {  });
+        let (send, recv) = watch::channel(SearchProgress::Starting { key: search.key.clone() });
         let handle = tokio::task::spawn(search_worker(self.clone(), send, search));
         searches.insert(code.clone(), (handle, recv));
         return Ok(code)
@@ -528,7 +528,7 @@ impl HouseCore {
             // save it with version    
             if self.database.retrohunt.save(&key, &search, version).await? {
                 let mut searches = self.running_searches.write().await;
-                let (send, recv) = watch::channel(SearchProgress::Starting {  });
+                let (send, recv) = watch::channel(SearchProgress::Starting { key: search.key.clone() });
                 let handle = tokio::task::spawn(search_worker(self.clone(), send, search));
                 searches.insert(key, (handle, recv));    
                 return Ok(RepeatOutcome::Started)
@@ -1070,7 +1070,7 @@ async fn search_worker(core: Arc<HouseCore>, mut progress: watch::Sender<SearchP
         tokio::time::sleep(timeout).await;
         timeout = MAX_DELAY.min(timeout * 2);
     }
-    _ = progress.send(SearchProgress::Finished { search: status });
+    _ = progress.send(SearchProgress::Finished { key: status.key.clone(), search: status });
 }
 
 /// impl for above
@@ -1105,7 +1105,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
 
     // Open a connection for each worker
     info!("Search {code}: Filtering");
-    progress_sender.send(SearchProgress::Filtering { progress: 0.0 })?;
+    progress_sender.send(SearchProgress::Filtering { key: code.clone(), progress: 0.0 })?;
     let request_body = serde_json::to_string(&FilterSearchRequest{
         expiry_group_range: (start_group, end_group),
         query,
@@ -1193,7 +1193,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
                         }
                     }
                 }
-                progress_sender.send(SearchProgress::Filtering { progress })?;
+                progress_sender.send(SearchProgress::Filtering { key: code.clone(), progress })?;
                 last_progress = std::time::Instant::now();
             }
         }
@@ -1201,7 +1201,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
 
     // Run through yara jobs
     info!("Search {code}: Yara");
-    progress_sender.send(SearchProgress::Yara { progress: 0.0 })?;
+    progress_sender.send(SearchProgress::Yara { key: code.clone(), progress: 0.0 })?;
     last_progress = std::time::Instant::now();
     let initial_total: u64 = candidates.len().await?;
     let mut sent_hashes = 0;
@@ -1264,7 +1264,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
         }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            progress_sender.send(SearchProgress::Yara { progress: sent_hashes as f64 / initial_total as f64 })?;
+            progress_sender.send(SearchProgress::Yara { key: code.clone(), progress: sent_hashes as f64 / initial_total as f64 })?;
             last_progress = std::time::Instant::now();
         }
     };
