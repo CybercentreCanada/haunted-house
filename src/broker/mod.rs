@@ -521,6 +521,8 @@ impl HouseCore {
             // update search doc to run again
             search.completed_time = None;
             search.finished = false;
+            search.errors.clear();
+            search.warnings.clear();
             search.search_classification = new_classification;
             search.started_time = Utc::now();
             let key = search.key.clone();
