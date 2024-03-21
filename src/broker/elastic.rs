@@ -127,6 +127,9 @@ impl Datastore {
 
     /// Save all of the given search hits using batch operations wherever possible
     pub async fn save_hits(&self, search: &str, hits: Vec<FileInfo>) -> Result<()> {
+        if hits.is_empty() {
+            return Ok(())
+        }
         let index = &self.retrohunt_hit.get_index_list(Some(IndexCatagory::Hot)).unwrap()[0];
         let ce = assemblyline_markings::get_default().unwrap();
 

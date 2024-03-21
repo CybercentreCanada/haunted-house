@@ -1103,7 +1103,7 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
 
     // Limit how often we update the progress watch, useless to do too often
     let mut last_progress = std::time::Instant::now();
-    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
     // Open a connection for each worker
     info!("Search {code}: Filtering");
