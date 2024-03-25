@@ -19,6 +19,13 @@ def to_websocket(url: str) -> str:
     return 'wss://' + url
 
 
+INDEX_GROUPS = [
+    'hot',
+    'archive',
+    'hot_and_archive'
+]
+
+
 class Client:
     def __init__(self, address: str, api_key: str, verify: typing.Optional[str]):
         self.address = address
@@ -35,12 +42,12 @@ class Client:
         self.session.close()
 
     def start_search(self, yara_rule: str, rule_classification: str, search_classification: str,
-                     creator: str, description: str, expiry, archive_only=False) -> str:
+                     creator: str, description: str, expiry, indices='hot_and_archive') -> str:
         """Start a new search."""
         logger.info("Start retrohunt search for %s", creator)
-        indices = 'hot_and_archive'
-        if archive_only:
-            indices = 'archive'
+        indices = indices.lower()
+        if indices not in INDEX_GROUPS:
+            raise ValueError(f"Index parameter set to {indices}, expected one of {INDEX_GROUPS}")
 
         # Send the search request
         result = self.session.post(self.address + '/search/', json={
