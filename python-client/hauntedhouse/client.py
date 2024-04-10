@@ -41,6 +41,12 @@ class Client:
         """Close requests session."""
         self.session.close()
 
+    def status(self) -> dict:
+        """Load the status blob from the haunted house instance."""
+        result = self.session.get(self.address + '/status/detailed')
+        result.raise_for_status()
+        return result.json()
+
     def start_search(self, yara_rule: str, rule_classification: str, search_classification: str,
                      creator: str, description: str, expiry, indices='hot_and_archive') -> str:
         """Start a new search."""
