@@ -41,9 +41,9 @@ class Client:
         """Close requests session."""
         self.session.close()
 
-    def status(self) -> dict:
+    def status(self, timeout=30.0) -> dict:
         """Load the status blob from the haunted house instance."""
-        result = self.session.get(self.address + '/status/detailed')
+        result = self.session.get(self.address + '/status/detailed', timeout=timeout)
         result.raise_for_status()
         return result.json()
 
