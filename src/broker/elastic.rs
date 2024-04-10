@@ -117,6 +117,15 @@ impl Datastore {
     }
 
     /// Count how many results have been saved for a given search
+    pub async fn count_files(&self, query: &str, limit: u64) -> Result<u64> {
+        let search = self.file.search::<()>(query)
+            .size(0)
+            .track_total_hits(limit)
+            .execute().await?;
+        Ok(search.hits.total.value)
+    }
+
+    /// Count how many results have been saved for a given search
     pub async fn count_retrohunt_hits(&self, search: &str, limit: u64) -> Result<u64> {
         let search = self.retrohunt_hit.search::<()>(&format!("search: {search}"))
             .size(0)

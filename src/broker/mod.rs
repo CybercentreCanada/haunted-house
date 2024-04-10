@@ -89,6 +89,7 @@ pub struct FetchStatus {
     last_minute_retries: i64,
     checkpoint_data: chrono::DateTime<chrono::Utc>,
     last_fetch_rows: i64,
+    pending_files: u64,
 }
 
 /// A message to the fetch worker

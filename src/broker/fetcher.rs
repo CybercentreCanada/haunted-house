@@ -170,11 +170,14 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             message = control.recv() => {
                 match message {
                     Some(FetchControlMessage::Status(respond)) => {
+                        let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
+
                         _ = respond.send(FetchStatus {
                             last_minute_searches: search_counter.value() as i64,
                             last_minute_throughput: throughput_counter.value() as i64,
                             last_minute_retries: retry_counter.value() as i64,
                             checkpoint_data: checkpoint,
+                            pending_files: pending,
                             last_fetch_rows,
                         });
                     },

@@ -1,6 +1,6 @@
 [package]
 name = "haunted-house"
-version = "0.0.45"
+version = "0.0.46"
 edition = "2021"
 default-run = "haunted-house"
 
