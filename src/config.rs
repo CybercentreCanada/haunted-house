@@ -362,7 +362,7 @@ pub struct WorkerSettings {
     pub data_path: PathBuf,
     /// A soft cap on the number of bytes of data to be saved by the worker.
     /// The worker should stop accepting new items when the size gets near this.
-    #[serde(default="default_data_limit")]
+    #[serde(default="default_data_limit", deserialize_with="deserialize_size", serialize_with="serialize_size")]
     pub data_limit: u64,
     /// How much space (bytes) should be reserved for transient storage
     #[serde(default="default_data_reserve")]
