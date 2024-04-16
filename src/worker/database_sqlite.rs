@@ -287,7 +287,7 @@ impl BufferedSQLite {
         let mut con = self.db.begin().await?;
 
         sqlx::query("DELETE FROM filters WHERE id = ?")
-            .bind(id.to_string())
+            .bind(id.to_i64())
             .execute(&mut con).await?;
 
         if let Some(channel) = self.workers.remove(&id) {

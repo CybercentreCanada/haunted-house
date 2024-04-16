@@ -18,7 +18,7 @@ use assemblyline_models::datastore::retrohunt as models;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, SinkExt};
 use itertools::Itertools;
-use log::{error, info, debug};
+use log::{debug, error, info, warn};
 use native_tls::Certificate;
 use rand::{thread_rng, Rng};
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
@@ -874,16 +874,6 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                         }
                         _ = resp.send(status);
                     },
-                    // WorkerIngestMessage::ListPending(resp) => {
-                    //     let mut count = HashMap::<FilterID, Vec<Sha256>>::new();
-                    //     for (id, task) in active.values() {
-                    //         match count.entry(*id) {
-                    //             hash_map::Entry::Occupied(mut entry) => { entry.get_mut().push(task.info.hash.clone()); },
-                    //             hash_map::Entry::Vacant(entry) => { entry.insert(vec![task.info.hash.clone()]); },
-                    //         }
-                    //     }
-                    //     _ = resp.send(count);
-                    // },
                 }
             },
 
@@ -907,7 +897,7 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                 };
 
                 // Pull out the tasks that have been finished
-                debug!("response from {id}: process {} completed", response.completed.len());
+                debug!("response from {id}: process {} completed, {} rejected", response.completed.len(), response.rejected.len());
                 for (targets, response_value) in [(response.completed, true), (response.rejected, false)] {
                     for (targeted_filter, hash) in targets {
                         if let Some((filter, task)) = active.remove(&hash) {
@@ -933,31 +923,8 @@ async fn _ingest_watcher(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceiv
                     }
                 }
 
-                // for (targeted_filter, hash) in response.rejected {
-                //     if let Some((filter, task)) = active.remove(&hash) {
-                //         // its possible for a file to be queued for multiple filters when the expiry date
-                //         // moves, so if the filter id doesn't match, we have sent it twice for different days
-                //         // and this isn't the one we are waiting for
-                //         if filter != targeted_filter {
-                //             continue
-                //         }
-                //         // Otherwise this is the filter we are waiting for send a response to all waiters
-                //         for response in task.response {
-                //             _ = response.send(Ok(false));
-                //         }
-                //         match counters.entry(filter) {
-                //             hash_map::Entry::Occupied(mut entry) => entry.get_mut().increment(1),
-                //             hash_map::Entry::Vacant(entry) => {
-                //                 let mut counter = crate::counters::WindowCounter::new(60 * 60);
-                //                 counter.increment(1);
-                //                 entry.insert(counter);
-                //             },
-                //         }
-                //     }
-                // }
-
-
                 if response.storage_pressure {
+                    warn!("response from {id}: UNDER STORAGE PRESSURE");
                     continue
                 }
 

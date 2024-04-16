@@ -128,19 +128,24 @@ impl WorkerState {
         info!("Deleting index {id}");
         // Stop the worker if running
         if let Some((worker, notify, running)) = self.filters.write().await.remove(&id) {
+            debug!("Deleting index {id}: Stop worker");
             _ = running.send(false);
             notify.notify_waiters();
             worker.join().await;
         }
 
         // Delete data behind the worker
+        debug!("Deleting index {id}: delete trigram file");
         ExtensibleTrigramFile::delete(self.config.get_filter_directory(), id).context("Delete trigram index")?;
 
         // Delete the trigram cache data
+        debug!("Deleting index {id}: expire trigram cache");
         self.trigrams.expire(id).await.context("flush trigram cache")?;
 
         // Delete the database info
+        debug!("Deleting index {id}: remove database entry");
         self.database.delete_filter(id).await.context("Delete file info database")?;
+        debug!("Deleting index {id}: finish");
         return Ok(())
     }
 
@@ -155,7 +160,7 @@ impl WorkerState {
     }
 
     pub async fn check_storage_pressure(&self) -> Result<bool> {
-        return Ok(self.get_free_storage().await? > self.config.data_reserve)
+        return Ok(self.get_free_storage().await? < self.config.data_reserve)
     }
 
     pub async fn get_used_storage(&self) -> Result<u64> {
@@ -169,28 +174,6 @@ impl WorkerState {
         let all_free = stats.blocks_available() * stats.block_size();
         Ok(self.config.data_limit.min(all_free))
     }
-
-    // pub async fn get_used_storage(&self) -> Result<u64> {
-    //     let mut total = 0u64;
-    //     let mut dirs = vec![self.config.data_path.clone()];
-    //     while let Some(dir) = dirs.pop() {
-    //         let mut listing = tokio::fs::read_dir(&dir).await?;
-    //         while let Some(file) = listing.next_entry().await? {
-    //             if let Ok(file_type) =  file.file_type().await {
-    //                 if file_type.is_dir() {
-    //                     dirs.push(file.path())
-    //                 }
-    //                 else if file_type.is_file() {
-    //                     if let Ok(meta) = file.metadata().await {
-    //                         total += meta.len();
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     return Ok(total)
-    // }
 
     pub (crate) async fn storage_status(&self) -> Result<StorageStatus> {
         let capacity = self.get_free_storage().await?;
