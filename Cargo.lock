@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "haunted-house"
-version = "0.0.49"
+version = "0.0.50"
 dependencies = [
  "anyhow",
  "assemblyline-markings",

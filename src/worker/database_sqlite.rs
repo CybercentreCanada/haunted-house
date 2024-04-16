@@ -621,7 +621,7 @@ impl FilterSQLWorker {
 
     pub async fn abandon_file(&self, file: Sha256) -> Result<()> {
         let mut transaction = self.db.begin().await?;
-        sqlx::query("DELETE FROM files WHERE sha256 = ?").bind(file.as_bytes()).execute(&mut transaction).await?;
+        sqlx::query("DELETE FROM files WHERE hash = ?").bind(file.as_bytes()).execute(&mut transaction).await?;
         let mut pending = self.filter_pending.write().await;
         if let Some(pending) = pending.get_mut(&self.id) {
             pending.remove(&file);
