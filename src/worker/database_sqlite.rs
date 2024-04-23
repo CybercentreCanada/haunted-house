@@ -453,7 +453,7 @@ impl FilterSQLWorker {
     }
 
     pub async fn get_file_access(&self, hash: &Sha256) -> Result<Option<(AccessControl, String)>> {
-        let row: Option<(String, String)> = query_as("SELECT access FROM files WHERE hash = ?").bind(hash.as_bytes()).fetch_optional(&self.db).await?;
+        let row: Option<(String, String)> = query_as("SELECT access, access_string FROM files WHERE hash = ?").bind(hash.as_bytes()).fetch_optional(&self.db).await?;
 
         match row {
             Some((access, access_string)) => Ok(Some((AccessControl::from_str(&access)?, access_string))),

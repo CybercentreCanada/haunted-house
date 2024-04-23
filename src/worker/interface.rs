@@ -195,7 +195,7 @@ async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
                     },
                     Ok(None) => {},
                     Err(err) => {
-                        error!("{err}");
+                        error!("List ingest files error: {err}");
                     }
                 }
             }
