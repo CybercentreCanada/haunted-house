@@ -23,13 +23,15 @@ use itertools::Itertools;
 use log::{error, info};
 use memmap2::MmapMut;
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::query::Query;
 use crate::timing::{TimingCapture, mark, NullCapture};
@@ -68,7 +70,7 @@ pub struct ExtensibleTrigramFile {
 }
 
 /// Label that can reference any segment, both manditory and extension
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum SegmentAddress {
     /// Describes a manditory segment, value inside is the trigram value
     Trigram(u32),
@@ -84,7 +86,7 @@ enum UpdateOperations<'a> {
         /// Which segment should be overwritten
         segment: SegmentAddress,
         /// The data to write (not copied, stored as a reference to the external buffer for efficency)
-        data: &'a[u8]
+        data: Cow<'a, [u8]>
     },
     /// Extend the chain of segments for this trigram into this new segment
     ExtendSegment{
@@ -530,7 +532,7 @@ impl ExtensibleTrigramFile {
                         encode_into(&new_content, &mut encode_data_buffer);
                         encode_data_buffer.resize(active_segment.payload_bytes() as usize, 0);
                         write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                        writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                        writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: Cow::Borrowed(&encode_data_buffer) }, &mut write_data_buffer)?)?;
                     }
 
                     // point to next segment
@@ -589,7 +591,7 @@ impl ExtensibleTrigramFile {
                         encode_data_buffer.push(0);
                     }
                     write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                    writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                    writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: Cow::Borrowed(&encode_data_buffer) }, &mut write_data_buffer)?)?;
                 }
             }
 
@@ -620,7 +622,7 @@ impl ExtensibleTrigramFile {
                 encode_data_buffer.clear();
                 encode_into(&content, &mut encode_data_buffer);
                 write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: &encode_data_buffer }, &mut write_data_buffer)?)?;
+                writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: Cow::Borrowed(&encode_data_buffer) }, &mut write_data_buffer)?)?;
                 address = new_address;
             }
         }
@@ -711,39 +713,85 @@ impl ExtensibleTrigramFile {
 
             // Read how much data to expect
             source.seek(SeekFrom::Start(0)).context("reseting the operation source")?;
-            let mut reader = std::io::BufReader::new(source);
+            let mut reader = std::io::BufReader::with_capacity(1 << 25, source);
             let offset = reader.read_u64::<LittleEndian>().context("reading change offset value")?;
 
             // Start the read count ahead by the length
-            let mut bytes_read = 8;
+            let mut log_timer = std::time::Instant::now();
+            let id = self.id;
 
-            let mut buffer = vec![];
-            // let mut mmap = self.data.blocking_write();
-            while bytes_read < offset {
-                buffer.clear();
-                bytes_read += reader.read_until(0, &mut buffer)? as u64;
-                if !buffer.is_empty() {
-                    let operation: UpdateOperations = postcard::from_bytes_cobs(&mut buffer).context("parsing operation")?;
-                    match operation {
-                        UpdateOperations::WriteSegment { segment, data } => {
-                            let segment_offset = self.get_segment_offset(segment) as usize;
-                            self.data[segment_offset..segment_offset + data.len()].copy_from_slice(data);
-                        },
-                        UpdateOperations::ExtendSegment { trigram, segment, new_segment } => {
-                            // Write the new segment value into the segment being extended for forward reading
-                            let segment_offset = self.get_segment_offset(segment);
-                            let segment_length = match segment {
-                                SegmentAddress::Trigram(_) => self.initial_segment_size as u64,
-                                SegmentAddress::Segment(_) => self.extended_segment_size as u64,
-                            };
-                            let write_location = segment_offset + segment_length - POINTER_SIZE;
-                            self.data[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
-
-                            // write the new segment value into the hint table for fast appends
-                            let hint_location = self.get_tail_hint_offset(trigram);
-                            self.data[hint_location as usize..hint_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
-                        },
+            // Spawn a thread that will read all the operations from the journal
+            let (send_op, recv_op) = std::sync::mpsc::sync_channel::<Result<(UpdateOperations, u64)>>(64000);
+            std::thread::spawn(move || {
+                let mut bytes_read = 8;
+                let mut buffer = vec![];
+                    while bytes_read < offset {
+                    buffer.clear();
+                    bytes_read += match reader.read_until(0, &mut buffer) {
+                        Ok(read) => read as u64,
+                        Err(err) => {send_op.send(Err(err.into())).unwrap(); break}
+                    };
+                    if !buffer.is_empty() {
+                        let operation: UpdateOperations = match postcard::from_bytes_cobs(&mut buffer).context("parsing operation") {
+                            Ok(value) => value,
+                            Err(err) => {send_op.send(Err(err)).unwrap(); break}
+                        };
+                        send_op.send(Ok((operation, bytes_read))).unwrap();
                     }
+                }
+            });
+
+            // pool writes and put them in order so we don't overwrite the same location repeatedly
+            // and can do the writes in order, hopefully getting all our writes for a 
+            let mut pending_writes: BTreeMap<SegmentAddress, Cow<[u8]>> = Default::default();
+            let mut skipped: usize = 0;
+
+            // loop to collect writes
+            // apply the extend operations as we go, there arn't as many of those
+            while let Ok(operation) = recv_op.recv() {
+                let (operation, bytes_read): (UpdateOperations, u64) = operation?;
+                match operation {
+                    UpdateOperations::WriteSegment { segment, data } => {
+                        if pending_writes.insert(segment, data).is_some() {
+                            skipped += 1;
+                        }
+                    },
+                    UpdateOperations::ExtendSegment { trigram, segment, new_segment } => {
+                        let segment_offset = self.get_segment_offset(segment);
+
+                        if let Some(data) = pending_writes.remove(&segment) {
+                            let segment_offset = segment_offset as usize;
+                            self.data[segment_offset..segment_offset + data.len()].copy_from_slice(data.as_ref());
+                        }
+
+                        // Write the new segment value into the segment being extended for forward reading
+                        let segment_length = match segment {
+                            SegmentAddress::Trigram(_) => self.initial_segment_size as u64,
+                            SegmentAddress::Segment(_) => self.extended_segment_size as u64,
+                        };
+                        let write_location = segment_offset + segment_length - POINTER_SIZE;
+                        self.data[write_location as usize..write_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
+
+                        // write the new segment value into the hint table for fast appends
+                        let hint_location = self.get_tail_hint_offset(trigram);
+                        self.data[hint_location as usize..hint_location as usize+4].copy_from_slice(&new_segment.to_le_bytes());
+                    },
+                }
+                if log_timer.elapsed() > Duration::from_secs(60) {
+                    info!("Filter {} applying edit buffer {counter} {bytes_read}/{offset}. Pending: {}; Dropped: {skipped}", id, pending_writes.len());
+                    log_timer = std::time::Instant::now();
+                }
+            }
+
+            // The operations have now been collected, apply them in order
+            info!("Filter {id} applying edit buffer {counter}. read finished. {} pending writes. {skipped} skipped writes.", pending_writes.len());
+            log_timer = std::time::Instant::now();
+            while let Some((segment, data)) = pending_writes.pop_first() {
+                let segment_offset = self.get_segment_offset(segment) as usize;
+                self.data[segment_offset..segment_offset + data.len()].copy_from_slice(data.as_ref());
+                if log_timer.elapsed() > Duration::from_secs(60) {
+                    info!("Filter {id} applying edit buffer {counter}. {} pending writes.", pending_writes.len());
+                    log_timer = std::time::Instant::now();
                 }
             }
         }
