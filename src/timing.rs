@@ -26,6 +26,20 @@ pub trait TimingCapture {
     fn add(&self, index: usize, value: f64);
     /// Build a scope guard object for the given span
     fn build(&self, index: usize) -> Self::Mark;
+
+    /// Allocate a new span id
+    fn child_id(&self, parent: usize, label: &str) -> usize {
+        let new_index = self.init_id(label);
+        let mut heritage = HERITAGE.lock().unwrap();
+        heritage.push((parent, new_index));
+        new_index
+    }
+
+    fn init_id(&self, label: &str) -> usize {
+        let mut labels = LABELS.lock().unwrap();
+        labels.push(label.to_owned());
+        labels.len() - 1
+    }
 }
 
 /// A capture of timing information for single invocation of timed code
@@ -51,13 +65,6 @@ impl Capture {
         })}
     }
 
-    /// Allocate a new span id
-    fn child_id(&self, parent: usize, label: &str) -> usize {
-        let new_index = self.new_id(label);
-        let mut heritage = HERITAGE.lock().unwrap();
-        heritage.push((parent, new_index));
-        new_index
-    }
 
     #[cfg(test)]
     pub fn print(&self) {
@@ -146,11 +153,7 @@ impl<'a> TimingCapture for &'a Capture {
 
     fn new_id(&self, label: &str) -> usize {
         // static mut SIZE: AtomicUsize = AtomicUsize::new(0);
-        let new_index = {
-            let mut labels = LABELS.lock().unwrap();
-            labels.push(label.to_owned());
-            labels.len() - 1
-        };
+        let new_index = self.init_id(label);
         let mut data = self.data.borrow_mut();
         let new_len = new_index + 1;
         data.times.resize(new_len, 0.0);
@@ -237,22 +240,34 @@ macro_rules! mark {
 pub(crate) use mark;
 use serde::{Deserialize, Serialize};
 
-/// A null capture object that doesn't actually do anything
-pub struct NullCapture {}
+/// A null capture object that doesn't actually do any metrics collection
+pub struct NullCapture {
+    index: Option<usize>
+}
 
 impl NullCapture {
     /// Create a non-capturing drop in
     pub fn new() -> Self {
-        Self{}
+        Self {index: None}
+    }
+
+    pub fn new_mark(index: usize) -> Self {
+        Self {index: Some(index)}
     }
 }
 
 impl TimingCapture for NullCapture {
     type Mark = NullCapture;
 
-    fn new_id(&self, _label: &str) -> usize { 0 }
+    fn new_id(&self, label: &str) -> usize {
+        if let Some(index) = self.index {
+            self.child_id(index, label)
+        } else {
+            self.init_id(label)
+        }
+    }
     fn add(&self, _index: usize, _value: f64) { }
-    fn build(&self, _index: usize) -> Self::Mark { Self::new() }
+    fn build(&self, index: usize) -> Self::Mark { Self::new_mark(index) }
 }
 
 /// Path where we expect to find cgroup cpu information within a container

@@ -28,7 +28,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{Write, Seek, SeekFrom, Read, BufRead};
-use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -38,10 +37,11 @@ use crate::timing::{TimingCapture, mark, NullCapture};
 use crate::types::FilterID;
 
 use super::encoding::{cost_to_add, encode_into, decode_into, encoded_number_size};
-use super::trigrams::{TrigramSet, TrigramIterator};
+use super::journal::IdCollector;
+use super::{intersection, into_trigrams, remove_file, union};
 
 /// A convinence constant defining how many possible trigrams exist
-const TRIGRAM_RANGE: u64 = 1 << 24;
+pub const TRIGRAM_RANGE: u64 = 1 << 24;
 /// Number of bytes used for each segment id
 const POINTER_SIZE: u64 = 4;
 /// Size of the fixed length header
@@ -134,15 +134,6 @@ impl<'a> RawSegmentInfo<'a> {
     }
 }
 
-/// Helper function to remove a file and succeed when missing
-fn remove_file(path: &Path) -> Result<()> {
-    if let Err(err) = std::fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            return Err(err.into());
-        }
-    };
-    return Ok(())
-}
 
 impl ExtensibleTrigramFile {
     /// Create a new trigram index file.
@@ -420,7 +411,7 @@ impl ExtensibleTrigramFile {
     }
 
     /// Prepare an operation to write a set of file trigrams to this file
-    pub fn write_batch(&self, files: &mut [(u64, TrigramSet)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
+    pub fn write_batch(&self, files: &mut [(u64, Vec<u8>)], timing: impl TimingCapture) -> Result<(File, u64, u32)> {
         let capture = mark!(timing, "write_batch");
         // prepare the buffer for operations
         let (write_buffer, _buffer_location, buffer_counter) = {
@@ -446,10 +437,7 @@ impl ExtensibleTrigramFile {
             let _mark = mark!(capture, "prepare_inputs");
             files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-            IdCollector {
-                acceptable: 0,
-                iterators: files.iter().map(|(id, row)|(*id, row.iter().peekable())).collect_vec(),
-            }
+            IdCollector::new_from_vec(&files)
         };
 
         // track how many segments are added in this batch
@@ -878,50 +866,50 @@ impl ExtensibleTrigramFile {
 /// yield the trigrams in sequence that they occur. If a trigram doesn't occur
 /// in one of the files it is skipped. When the trigram is returned the file
 /// ids of the files that contain it are returned by argument.
-struct IdCollector<'a> {
-    /// counter for which trigram we are on
-    acceptable: u32,
-    /// Set of files (ids and trigrams) to pass through
-    iterators: Vec<(u64, Peekable<TrigramIterator<'a>>)>
-}
+// struct IdCollector<'a> {
+//     /// counter for which trigram we are on
+//     acceptable: u32,
+//     /// Set of files (ids and trigrams) to pass through
+//     iterators: Vec<(u64, Peekable<TrigramIterator<'a>>)>
+// }
 
-impl IdCollector<'_> {
-    /// Function to drive the iteration described above
-    fn next(&mut self, hits: &mut Vec<u64>) -> Option<u32> {
-        // hits.clear();
+// impl IdCollector<'_> {
+//     /// Function to drive the iteration described above
+//     fn next(&mut self, hits: &mut Vec<u64>) -> Option<u32> {
+//         // hits.clear();
 
-        let mut selected_trigram = u32::MAX;
+//         let mut selected_trigram = u32::MAX;
 
-        for (id, input) in self.iterators.iter_mut() {
-            while let Some(&value) = input.peek() {
-                if value < self.acceptable {
-                    input.next();
-                    continue
-                }
+//         for (id, input) in self.iterators.iter_mut() {
+//             while let Some(&value) = input.peek() {
+//                 if value < self.acceptable {
+//                     input.next();
+//                     continue
+//                 }
 
-                match value.cmp(&selected_trigram) {
-                    std::cmp::Ordering::Less => {
-                        hits.clear();
-                        hits.push(*id);
-                        selected_trigram = value;
-                    },
-                    std::cmp::Ordering::Equal => {
-                        hits.push(*id);
-                    },
-                    std::cmp::Ordering::Greater => {},
-                }
-                break
-            }
-        }
+//                 match value.cmp(&selected_trigram) {
+//                     std::cmp::Ordering::Less => {
+//                         hits.clear();
+//                         hits.push(*id);
+//                         selected_trigram = value;
+//                     },
+//                     std::cmp::Ordering::Equal => {
+//                         hits.push(*id);
+//                     },
+//                     std::cmp::Ordering::Greater => {},
+//                 }
+//                 break
+//             }
+//         }
 
-        if selected_trigram == u32::MAX {
-            None
-        } else {
-            self.acceptable = selected_trigram + 1;
-            Some(selected_trigram)
-        }
-    }
-}
+//         if selected_trigram == u32::MAX {
+//             None
+//         } else {
+//             self.acceptable = selected_trigram + 1;
+//             Some(selected_trigram)
+//         }
+//     }
+// }
 
 /// An iterator over the file id list stored for a given trigram spread over several blocks
 struct TrigramCursor<'a> {
@@ -979,54 +967,6 @@ impl Iterator for TrigramCursor<'_> {
     }
 }
 
-fn into_trigrams(bytes: &[u8]) -> Vec<u32> {
-    if bytes.len() < 3 {
-        return vec![];
-    }
-    let mut trigrams = vec![];
-    let mut trigram: u32 = (bytes[0] as u32) << 8 | (bytes[1] as u32);
-
-    for byte in bytes.iter().skip(2) {
-        trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
-        trigrams.push(trigram);
-    }
-
-    return trigrams;
-}
-
-/// Calculate the union of two sets of numbers into the the first set
-///
-/// list need not be ordered
-fn union(base: &mut Vec<u64>, other: &Vec<u64>) {
-    base.extend(other);
-    base.sort_unstable();
-    base.dedup();
-}
-
-/// Calculate the intersection of two sets of numbers into the the first set
-///
-/// list must be ordered
-fn intersection(base: &mut Vec<u64>, other: &[u64]) {
-
-    let mut base_read_index = 0;
-    let mut base_write_index = 0;
-    let mut other_index = 0;
-
-    while base_read_index < base.len() && other_index < other.len() {
-        match base[base_read_index].cmp(&other[other_index]) {
-            std::cmp::Ordering::Less => { base_read_index += 1},
-            std::cmp::Ordering::Equal => {
-                base[base_write_index] = base[base_read_index];
-                base_write_index += 1;
-                base_read_index += 1;
-                other_index += 1;
-            },
-            std::cmp::Ordering::Greater => {other_index += 1},
-        }
-    }
-
-    base.truncate(base_write_index);
-}
 
 fn get_next_journal(directory: &Path, id: FilterID) -> (File, PathBuf, u64) {
     loop {
@@ -1103,33 +1043,30 @@ fn get_operation_journals(directory: &Path, id: FilterID) -> Result<Vec<(u64, Pa
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-
     use anyhow::{Result, Context};
     use itertools::Itertools;
-    use rand::{Rng, thread_rng};
 
     use crate::query::Query;
     use crate::timing::{NullCapture, Capture};
     use crate::types::FilterID;
-    use crate::worker::filter::{ExtensibleTrigramFile, into_trigrams, intersection};
-    use crate::worker::trigrams::{build_buffer, TrigramSet};
+    use crate::worker::encoding::encode_into;
+    use crate::worker::filter::ExtensibleTrigramFile;
+    use crate::worker::journal::IdCollector;
+    use crate::worker::trigrams::{build_buffer_to_offsets, random_trigrams, Bits};
 
-    use super::{TRIGRAM_RANGE, IdCollector, union};
+    use super::TRIGRAM_RANGE;
 
     #[test]
     fn simple_save_and_load() -> Result<()> {
         // build test data
         let mut trigrams = vec![];
         for ii in 1..102 {
-            let mut data = TrigramSet::new();
-            data.insert(500);
+            let mut data = vec![];
             if ii < 50 {
-                data.insert(0);
+                encode_into(&[0, 500], &mut data);
             } else {
-                data.insert(TRIGRAM_RANGE as u32 - 1);
+                encode_into(&[500, TRIGRAM_RANGE - 1], &mut data);
             }
-            data.compact();
             trigrams.push((ii, data));
         }
 
@@ -1166,16 +1103,15 @@ mod test {
     #[test]
     fn extended_save_and_load() -> Result<()> {
         // build test data
+        // build test data
         let mut trigrams = vec![];
         for ii in 1..102 {
-            let mut data = TrigramSet::new();
-            data.insert(500);
+            let mut data = vec![];
             if ii < 50 {
-                data.insert(0);
+                encode_into(&[0, 500], &mut data);
             } else {
-                data.insert(TRIGRAM_RANGE as u32 - 1);
+                encode_into(&[500, TRIGRAM_RANGE - 1], &mut data);
             }
-            data.compact();
             trigrams.push((ii, data));
         }
 
@@ -1215,14 +1151,15 @@ mod test {
 
         let timer = std::time::Instant::now();
         // build test data
+        let mut original = vec![];
         let mut trigrams = vec![];
 
-        for ii in (1..21).rev() {
-            trigrams.push((ii, TrigramSet::random(ii)));
+        for ii in 1..21 {
+            let (a, b) = random_trigrams(ii);
+            original.push(a);
+            trigrams.push((ii, b));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
-
-        trigrams.sort_by(|a, b|a.0.cmp(&b.0));
 
         // write it
         let tempdir = tempfile::tempdir()?;
@@ -1250,23 +1187,18 @@ mod test {
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let mut recreated: Vec<TrigramSet> = vec![];
-            for _ in 0..20 {
-                recreated.push(TrigramSet::new())
-            }
+            let mut recreated: Vec<Bits> = vec![Bits::repeat(false, TRIGRAM_RANGE as usize); original.len()];
 
             let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 for index in values {
-                    recreated[index as usize - 1].insert(trigram & 0xFFFFFF);
+                    unsafe {recreated[index as usize - 1].set_unchecked(trigram as usize, true); }
                 }
             }
 
-            let trigrams: HashMap<u64, TrigramSet> = trigrams.into_iter().collect();
-
             for (index, values) in recreated.into_iter().enumerate() {
-                assert!(*trigrams.get(&(index as u64+1)).unwrap() == values, "{index}")
+                assert!(original[index] == values, "{index}");
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
@@ -1275,7 +1207,7 @@ mod test {
 
     #[test]
     fn duplicate_batch() -> Result<()> {
-        let data = TrigramSet::random(thread_rng().gen());
+        let (original, data) = random_trigrams(99999);
 
         let tempdir = tempfile::tempdir()?;
         let id = FilterID::from(1);
@@ -1299,20 +1231,17 @@ mod test {
         }
 
         {
-            let mut recreated = TrigramSet::new();
+            let mut recreated = Bits::repeat(false, TRIGRAM_RANGE as usize);
 
             let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
                 let values = file.read_trigram(trigram)?;
                 if values.contains(&1) {
-                    recreated.insert(trigram);
-                }
-                if trigram % (1 << 16) == 0 {
-                    recreated.compact()
+                    unsafe { recreated.set_unchecked(trigram as usize, true); }
                 }
             }
 
-            assert!(data == recreated);
+            assert!(original == recreated);
         }
 
 
@@ -1321,8 +1250,8 @@ mod test {
 
     #[test]
     fn out_of_order_batch() -> Result<()> {
-        let mut bits = TrigramSet::new();
-        bits.insert(0);
+        let mut bits = vec![];
+        encode_into(&[0], &mut bits);
 
         let mut trigrams_a = vec![];
         let mut trigrams_b = vec![];
@@ -1361,8 +1290,8 @@ mod test {
 
     #[test]
     fn out_of_order_batch_reversed() -> Result<()> {
-        let mut bits = TrigramSet::new();
-        bits.insert(0);
+        let mut bits = vec![];
+        encode_into(&[0], &mut bits);
 
         let mut trigrams_a = vec![];
         let mut trigrams_b = vec![];
@@ -1399,68 +1328,69 @@ mod test {
         return Ok(())
     }
 
-    // #[test] temporary remove for performance reasons
-    // fn large_batch() -> Result<()> {
-    //     // build test data
-    //     let mut trigrams = vec![];
-    //     let timestamp = std::time::Instant::now();
-    //     for ii in 1..500 {
-    //         trigrams.push((ii, SparseBits::random(ii)));
-    //     }
-    //     println!("generate {:.2}", timestamp.elapsed().as_secs_f64());
+    #[test]
+    fn large_batch() -> Result<()> {
+        // build test data
+        let mut original = vec![];
+        let mut trigrams = vec![];
+        let timestamp = std::time::Instant::now();
+        for ii in 1..1001 {
+            let (bits, buffer) = random_trigrams(ii);
+            original.push(bits);
+            trigrams.push((ii, buffer))
+        }
+        println!("generate {:.2}", timestamp.elapsed().as_secs_f64());
 
-    //     // write it
-    //     let tempdir = tempfile::tempdir()?;
-    //     let location = tempdir.path().to_path_buf();
-    //     let id = FilterID::from(1);
-    //     let capture = Capture::new();
-    //     {
-    //         let mut file = ExtensibleTrigramFile::new(location, id, 256, 1024)?;
-    //         let x = file.write_batch(&mut trigrams, &capture)?;
-    //         file.apply_operations(x.0, x.1, x.2, &capture)?;
-    //     }
+        // write it
+        let tempdir = tempfile::tempdir()?;
+        let location = tempdir.path().to_path_buf();
+        let id = FilterID::from(1);
+        let capture = Capture::new();
+        {
+            let mut file = ExtensibleTrigramFile::new(location, id, 256, 1024)?;
+            let x = file.write_batch(&mut trigrams, &capture)?;
+            file.apply_operations(x.0, x.1, x.2, &capture)?;
+        }
 
-    //     capture.print();
-    //     // // Recreate the trigrams
-    //     // let timer = std::time::Instant::now();
-    //     // {
-    //     //     let mut recreated: Vec<BitVec> = vec![];
-    //     //     for _ in 0..20 {
-    //     //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
-    //     //     }
+        capture.print();
+        // // Recreate the trigrams
+        // let timer = std::time::Instant::now();
+        // {
+        //     let mut recreated: Vec<BitVec> = vec![];
+        //     for _ in 0..20 {
+        //         recreated.push(BitVec::repeat(false, TRIGRAM_RANGE as usize))
+        //     }
 
-    //     //     let mut file = ExtensibleTrigramFile::open(&location)?;
-    //     //     for trigram in 0..(1<<24) {
-    //     //         let values = file.read_trigram(trigram)?;
-    //     //         for index in values {
-    //     //             recreated[index as usize - 1].set(trigram as usize, true);
-    //     //         }
-    //     //     }
+        //     let mut file = ExtensibleTrigramFile::open(&location)?;
+        //     for trigram in 0..(1<<24) {
+        //         let values = file.read_trigram(trigram)?;
+        //         for index in values {
+        //             recreated[index as usize - 1].set(trigram as usize, true);
+        //         }
+        //     }
 
-    //     //     for (index, values) in recreated.into_iter().enumerate() {
-    //     //         assert_eq!(trigrams[index].1, values)
-    //     //     }
-    //     // }
-    //     // println!("read {}", timer.elapsed().as_secs_f64());
-    //     Ok(())
-    // }
+        //     for (index, values) in recreated.into_iter().enumerate() {
+        //         assert_eq!(trigrams[index].1, values)
+        //     }
+        // }
+        // println!("read {}", timer.elapsed().as_secs_f64());
+        Ok(())
+    }
 
     #[test]
     fn collector() {
         let mut objects = vec![];
         for ii in 0..256 {
-            let mut abc = TrigramSet::new();
+            let mut trigrams = vec![];
             for jj in 0..=0xFFFF {
-                abc.insert(ii << 16 | jj);
+                trigrams.push((ii << 16 | jj) as u64);
             }
-            abc.compact();
-            objects.push(((ii + 1) as u64, abc));
+            let mut buffer = vec![];
+            encode_into(&trigrams, &mut buffer);
+            objects.push(((ii + 1) as u64, buffer));
         }
 
-        let mut collector = IdCollector {
-            acceptable: 0,
-            iterators: objects.iter().map(|(id, row)|(*id, row.iter().peekable())).collect(),
-        };
+        let mut collector = IdCollector::new_from_vec(&objects);
 
         let mut rounds = 0;
         let mut ids = vec![];
@@ -1475,7 +1405,7 @@ mod test {
     fn simple_queries() -> Result<()> {
         // setup data
         let raw_data = std::include_bytes!("./filter.rs");
-        let trigrams = build_buffer(raw_data)?;
+        let trigrams = build_buffer_to_offsets(raw_data);
 
         // build table
         let tempdir = tempfile::tempdir()?;
@@ -1503,115 +1433,5 @@ mod test {
         return Ok(())
     }
 
-    #[test]
-    fn test_into_trigrams() {
-        assert_eq!(into_trigrams(&[]), Vec::<u32>::new());
-        assert_eq!(into_trigrams(&[0x10, 0xff]), Vec::<u32>::new());
-        assert_eq!(into_trigrams(&[0x10, 0xff, 0x44]), vec![0x10ff44]);
-        assert_eq!(into_trigrams(&[0x10, 0xff, 0x44, 0x22]), vec![0x10ff44, 0xff4422]);
-    }
-
-    #[test]
-    fn test_union() {
-        {
-            let mut base = vec![];
-            union(&mut base, &vec![]);
-            assert!(base.is_empty());
-        }
-        {
-            let mut base = vec![0x0];
-            union(&mut base, &vec![]);
-            assert_eq!(base, vec![0x0]);
-        }
-        {
-            let mut base = vec![];
-            union(&mut base, &vec![0x0]);
-            assert_eq!(base, vec![0x0]);
-        }
-        {
-            let mut base = vec![0x0, 0x1];
-            union(&mut base, &vec![]);
-            assert_eq!(base, vec![0x0, 0x1]);
-        }
-        {
-            let mut base = vec![];
-            union(&mut base, &vec![0x0, 0x1]);
-            assert_eq!(base, vec![0x0, 0x1]);
-        }
-        {
-            let mut base = vec![0xff];
-            union(&mut base, &vec![0x0, 0xff]);
-            assert_eq!(base, vec![0x0, 0xff]);
-        }
-        {
-            let mut base = vec![0xff];
-            union(&mut base, &vec![0xff, 0x0]);
-            assert_eq!(base, vec![0x0, 0xff]);
-        }
-        {
-            let mut base = vec![0x0, 0x1];
-            union(&mut base, &vec![0x0, 0x1, 0xff]);
-            assert_eq!(base, vec![0x0, 0x1, 0xff]);
-        }
-        {
-            let mut base = vec![0xff, 0x0, 0xff];
-            union(&mut base, &vec![0x1, 0x0]);
-            assert_eq!(base, vec![0x0, 0x1, 0xff]);
-        }
-    }
-
-    #[test]
-    fn test_intersection() {
-        {
-            let mut base = vec![];
-            intersection(&mut base, &[]);
-            assert!(base.is_empty());
-        }
-        {
-            let mut base = vec![0x0];
-            intersection(&mut base, &[]);
-            assert!(base.is_empty());
-        }
-        {
-            let mut base = vec![];
-            intersection(&mut base, &[0x0]);
-            assert!(base.is_empty());
-        }
-        {
-            let mut base = vec![0x0, 0x1];
-            intersection(&mut base, &[]);
-            assert!(base.is_empty());
-        }
-        {
-            let mut base = vec![];
-            intersection(&mut base, &[0x0, 0x1]);
-            assert!(base.is_empty());
-        }
-        {
-            let mut base = vec![0x0];
-            intersection(&mut base, &[0x0]);
-            assert_eq!(base, vec![0x0]);
-        }
-        {
-            let mut base = vec![0xff];
-            intersection(&mut base, &[0x0, 0xff]);
-            assert_eq!(base, vec![0xff]);
-        }
-        {
-            let mut base = vec![0xff];
-            intersection(&mut base, &[0xff, 0x0]);
-            assert_eq!(base, vec![0xff]);
-        }
-        {
-            let mut base = vec![0x0, 0x1];
-            intersection(&mut base, &[0x0, 0x1, 0xff]);
-            assert_eq!(base, vec![0x0, 0x1]);
-        }
-        {
-            let mut base = vec![0x1, 0xff];
-            intersection(&mut base, &[0x0, 0x1]);
-            assert_eq!(base, vec![0x1]);
-        }
-    }
 
 }

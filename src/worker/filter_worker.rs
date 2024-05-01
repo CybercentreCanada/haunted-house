@@ -10,8 +10,6 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::config::WorkerSettings;
 
-use super::trigrams::TrigramSet;
-
 #[derive(Debug)]
 enum ReaderCommand {
     Query(Query, oneshot::Sender<Result<Vec<u64>>>)
@@ -19,7 +17,7 @@ enum ReaderCommand {
 
 #[derive(Debug)]
 pub enum WriterCommand {
-    Ingest(Vec<(u64, TrigramSet)>, oneshot::Sender<()>),
+    Ingest(Vec<(u64, Vec<u8>)>, oneshot::Sender<()>),
     Flush
 }
 

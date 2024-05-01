@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::iter::Peekable;
 
 use anyhow::Result;
+use itertools::Itertools;
 use log::error;
 use tokio::sync::{Semaphore, RwLock};
 use tokio::task::JoinHandle;
@@ -18,6 +19,8 @@ use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
 use crate::storage::BlobStorage;
 use crate::types::{Sha256, FilterID, FileInfo};
+
+use super::encoding::encode_into;
 
 /// A manager for a directory holding the trigram sets yet to be written to filters.
 pub struct TrigramCache {
@@ -164,9 +167,9 @@ impl TrigramCache {
     }
 
     /// Load the content of a file
-    pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<TrigramSet> {
+    pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<Vec<u8>> {
         let data = tokio::fs::read(self._path(filter, hash)).await?;
-        Ok(postcard::from_bytes(&data)?)
+        Ok(TrigramFile::read_bytes(&data)?.into_packed_deltas())
     }
 
     /// Free a specific file from the cache
@@ -196,12 +199,12 @@ impl TrigramCache {
 }
 
 #[cfg(test)]
-pub (crate) fn build_buffer(data: &[u8]) -> Result<TrigramSet> {
+pub (crate) fn build_buffer(data: &[u8]) -> TrigramSet {
     // Prepare accumulators
     let mut output = TrigramSet::new();
 
     if data.len() < 3 {
-        return Ok(output)
+        return output
     }
 
     // Initialize trigram
@@ -216,20 +219,44 @@ pub (crate) fn build_buffer(data: &[u8]) -> Result<TrigramSet> {
     }
     output.compact();
 
-    return Ok(output)
+    return output
+}
+
+#[cfg(test)]
+pub (crate) type Bits = bitvec::vec::BitVec::<usize, bitvec::prelude::Lsb0>;
+
+#[cfg(test)]
+pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
+    // Prepare accumulators
+    let mut mask = Box::<BitArray::<[u64; 1 << 24]>>::default();
+
+    let mut index = 2;
+    let mut trigram: u32 = (input[0] as u32) << 8 | (input[1] as u32);
+
+    while index < input.len() {
+        trigram = ((trigram & 0x00FFFF) << 8) | (input[index] as u32);
+        unsafe { mask.set_unchecked(trigram as usize, true); }
+        index += 1;
+    }
+
+    let mut output = vec![];
+    let trigrams = mask.iter_ones().map(|v| v as u64).collect_vec();
+    encode_into(&trigrams, &mut output);
+
+    return output
 }
 
 /// Convert a stream of buffers into a trigram set
-async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>) -> Result<TrigramSet, ErrorKinds> {
+async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>) -> Result<TrigramFile, ErrorKinds> {
     // Prepare accumulators
-    let mut output = TrigramSet::new();
+    let mut mask = Box::<BitArray::<[u64; 1 << 24]>>::default();
 
     // Read the initial block
     let mut buffer = vec![];
     while buffer.len() <= 2 {
         let sub_buffer = match input.recv().await {
             Some(sub_buffer) => sub_buffer?,
-            None => return Ok(output),
+            None => return Ok(TrigramFile::Deltas(vec![])),
         };
 
         buffer.extend(sub_buffer);
@@ -239,29 +266,76 @@ async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error
     let mut trigram: u32 = (buffer[0] as u32) << 8 | (buffer[1] as u32);
     let mut index_start = 2;
 
-    'outer: loop {
-        for _ in 0..1<<16 {
-            for byte in &buffer[index_start..] {
-                trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
-                output.insert(trigram);
-            }
-
-            buffer = match input.recv().await {
-                Some(buffer) => buffer?,
-                None => break 'outer,
-            };
-            if buffer.is_empty() {
-                break 'outer;
-            }
-            index_start = 0;
+    loop {
+        for byte in &buffer[index_start..] {
+            trigram = (trigram & 0x00FFFF) << 8 | (*byte as u32);
+            unsafe {mask.set_unchecked(trigram as usize, true)};
         }
-        output.compact();
-    }
-    output.compact();
 
-    return Ok(output)
+        buffer = match input.recv().await {
+            Some(buffer) => buffer?,
+            None => break,
+        };
+        if buffer.is_empty() {
+            break;
+        }
+        index_start = 0;
+    }
+
+    // convert mask into offsets
+    let mut buffer = vec![];
+    let indices = mask.iter_ones().map(|v|v as u64).collect_vec();
+    encode_into(&indices, &mut buffer);
+    return Ok(TrigramFile::Deltas(buffer))
 }
 
+
+/// For underlying reasons _NO_ varients of this enum can be removed, changed, or reordered.
+/// If you want to change or add data do it by adding a new varient at the end.
+#[derive(Serialize, Deserialize)]
+#[repr(u32)]
+pub enum TrigramFile {
+    Chunked(TrigramSet) = 0,
+    Deltas(Vec<u8>) = 1,
+}
+
+impl TrigramFile {
+    #[cfg(test)]
+    pub fn into_trigramset(self) -> TrigramSet {
+        use super::encoding::StreamDecode;
+
+        match self {
+            TrigramFile::Chunked(set) => set,
+            TrigramFile::Deltas(data) => {
+                let mut set = TrigramSet::new();
+                for trigram in StreamDecode::new(&data) {
+                    set.insert(trigram as u32);
+                }
+                set.compact();
+                set
+            },
+        }
+    }
+
+    pub fn into_packed_deltas(self) -> Vec<u8> {
+        match self {
+            TrigramFile::Chunked(set) => {
+                let trigrams = set.iter().map(|v|v as u64).collect_vec();
+                let mut buffer = vec![];
+                encode_into(&trigrams, &mut buffer);
+                buffer
+            },
+            TrigramFile::Deltas(data) => data,
+        }
+    }
+
+    pub fn read_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() > 2 && data[0..2] == [0x80, 0x02] {
+            return Ok(TrigramFile::Chunked(postcard::from_bytes(data)?))
+        }
+        Ok(postcard::from_bytes(data)?)
+    }
+}
 
 /// A helper class for storing a set of trigrams efficently.
 ///
@@ -346,6 +420,14 @@ impl TrigramSet {
             chunks: Box::new([Chunk::EMPTY; 256])
         }
     }
+
+    // pub fn num_set(&self) -> usize {
+    //     let mut set = 0;
+    //     for chunk in self.chunks.iter() {
+    //         set += chunk.num_set()
+    //     }
+    //     set
+    // }
 
     /// Create an iterator over the indices of the set bits
     pub fn iter(&self) -> TrigramIterator {
@@ -459,6 +541,15 @@ impl Chunk {
     #[cfg(test)]
     pub fn empty() -> Self { Self::EMPTY }
 
+    // pub fn num_set(&self) -> usize {
+    //     match self  {
+    //         Chunk::Empty => 0,
+    //         Chunk::Added(items) => items.len(),
+    //         Chunk::Mask(count, _) => *count as usize,
+    //         Chunk::Removed(items) => u16::MAX as usize - items.len(),
+    //     }
+    // }
+
     /// Create an iterator over the indices of set bits
     pub fn iter(&self) -> ChunkIter {
         match self {
@@ -558,16 +649,37 @@ impl Chunk {
 }
 
 #[cfg(test)]
+pub (crate) fn random_trigrams(seed: u64) -> (Bits, Vec<u8>) {
+    use rand::{Rng, SeedableRng};
+    use crate::worker::filter::TRIGRAM_RANGE;
+
+    let mut prng = rand::rngs::SmallRng::seed_from_u64(seed);
+    let mut data = Bits::repeat(false, TRIGRAM_RANGE as usize);
+
+    let raw = data.as_raw_mut_slice();
+    for part in raw {
+        *part = prng.gen::<usize>() & prng.gen::<usize>() & prng.gen::<usize>();
+    }
+
+    let trigrams = data.iter_ones().map(|i| i as u64).collect_vec();
+    let mut buffer = vec![];
+    encode_into(&trigrams, &mut buffer);
+    (data, buffer)
+}
+
+#[cfg(test)]
 mod test {
     use std::collections::{BTreeSet, HashSet};
 
     use itertools::Itertools;
     use rand::{thread_rng, Rng};
 
-    use super::{Chunk, TrigramSet};
+    use crate::worker::{encoding::{encode_into, StreamDecode}, trigrams::{build_buffer, build_buffer_to_offsets}};
+
+    use super::{Chunk, TrigramFile, TrigramSet};
 
 
-    // #[test] temporary remove for performance reasons
+    #[test]
     fn build_random_chunk() {
         let mut values = (0..u16::MAX).collect_vec();
 
@@ -586,7 +698,6 @@ mod test {
         }
     }
 
-    // #[test] temporary remove for performance reasons
     #[test]
     fn single_values() {
         for ii in 0..=0xFFFFFF {
@@ -596,7 +707,7 @@ mod test {
         }
     }
 
-    // #[test] temporary remove for performance reasons
+    #[test]
     fn adding_values() {
         // Have the first chunk of this map get fully saturated plus a little more
         let mut bits = TrigramSet::new();
@@ -616,4 +727,90 @@ mod test {
     }
 
 
+
+    #[test]
+    fn build_compare() {
+
+        let data = std::fs::read("/bin/dockerd").unwrap();
+
+        {
+            let a = build_buffer(&data);
+            let b = build_buffer_to_offsets(&data);
+            let a = a.iter().collect_vec();
+            let b = StreamDecode::new(&b).map(|a| a as u32).collect_vec();
+            assert_eq!(a.first(), b.first());
+            assert_eq!(a.last(), b.last());
+            assert_eq!(a.len(), b.len());
+            assert_eq!(a, b);
+        }
+
+        const ITERATIONS: usize = 10;
+        let stamp = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            build_buffer(&data);
+        }
+        println!("{}", stamp.elapsed().as_secs_f64() / (ITERATIONS as f64) * 1000.0);
+
+        let stamp = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            build_buffer_to_offsets(&data);
+        }
+        println!("{}", stamp.elapsed().as_secs_f64() / (ITERATIONS as f64) * 1000.0);
+
+    }
+
+
+    #[test]
+    fn iteration() {
+        // build a random trigram set
+        // let trigrams = TrigramSet::random(88888);
+        let trigrams = build_buffer(&std::fs::read("/bin/dockerd").unwrap());
+
+        let values = trigrams.iter().map(|v|v as u64).collect_vec();
+
+        let mut buffer = vec![];
+        encode_into(&values, &mut buffer);
+
+        assert_eq!(StreamDecode::new(&buffer).collect_vec(), values);
+
+        println!("{}", postcard::to_allocvec(&trigrams).unwrap().len());
+        println!("{}", buffer.len());
+
+        let stamp = std::time::Instant::now();
+        let mut scratch = vec![];
+        for _ in 0..100 {
+            let mut value: u32 = 0;
+            for item in trigrams.iter() {
+                value = value.overflowing_add(item).0;
+            }
+            scratch.push(value);
+        }
+        println!("{}", stamp.elapsed().as_secs_f64() / 100.0 * 1000.0);
+
+        let stamp = std::time::Instant::now();
+        for _ in 0..100 {
+            let mut value: u32 = 0;
+            for item in StreamDecode::new(&buffer) {
+                value = value.overflowing_add(item as u32).0;
+            }
+            scratch.push(value);
+        }
+
+        println!("{}", stamp.elapsed().as_secs_f64() / 100.0 * 1000.0);
+
+        assert!(scratch.iter().all_equal());
+        assert_eq!(scratch.len(), 200);
+    }
+
+    #[test]
+    fn file_format_switch() {        
+        let data = TrigramSet::random(10);
+        let bytes = postcard::to_allocvec(&data).unwrap();
+
+        let file: TrigramFile = TrigramFile::read_bytes(&bytes).unwrap();
+        let recreated = file.into_trigramset();
+        assert_eq!(data, recreated);
+    }
+
 }
+

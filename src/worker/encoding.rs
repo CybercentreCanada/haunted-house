@@ -1,6 +1,11 @@
 
 /// pack a u64 value into a buffer
+#[inline(always)]
 pub fn encode_value_into(mut value: u64, buffer: &mut Vec<u8>){
+    if value == 0 {
+        buffer.push(0x00);
+        return
+    }
     while value > 0 {
         let mut fragment = value & 0b0111_1111;
         value >>= 7;
@@ -19,6 +24,7 @@ pub fn encode(indices: &[u64]) -> Vec<u8> {
 }
 
 /// pack a set of u64 into a buffer
+#[inline(always)]
 pub fn encode_into(indices: &[u64], buffer: &mut Vec<u8>) {
     if indices.is_empty() {
         return;
@@ -28,27 +34,10 @@ pub fn encode_into(indices: &[u64], buffer: &mut Vec<u8>) {
         return;
     }
     encode_value_into(indices[0], buffer);
-    // let mut last = indices[0];
-    // let mut run_length = 0;
     for pair in indices.windows(2) {
         let d = pair[1] - pair[0];
-        // if d == last {
-        //     run_length += 1;
-        // } else {
-        //     if run_length > 0 {
-        //         buffer.extend(encode_duplicates(run_length));
-        //         run_length = 0;
-        //     }
-
         encode_value_into(d, buffer);
-            // last = d;
-        // }
     }
-
-    // if run_length > 0 {
-    //     buffer.extend(encode_duplicates(run_length));
-    // }
-
 }
 
 /// Calculate how many bytes a value will need to be encoded
@@ -56,7 +45,7 @@ pub fn encoded_number_size(value: u64) -> u32 {
     value.ilog2()/7 + 1
 }
 
-/// How many additional bytes are needed to add the given value to the given sequence
+/// (upper bound on) How many additional bytes are needed to add the given value to the given sequence
 pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
     match values.last() {
         Some(last) => encoded_number_size(new_value - last),
@@ -103,6 +92,72 @@ pub fn decode_into(data: &[u8], values: &mut Vec<u64>) -> u32 {
 }
 
 
+pub struct StreamDecode<'a> {
+    bytes: &'a[u8],
+    next_value: Option<u64>,
+}
+
+impl<'a> StreamDecode<'a> {
+    pub fn new(data: &'a[u8]) -> Self {
+        let (bytes, next_value) = Self::decode_raw_next(data);
+        StreamDecode { bytes, next_value }
+    }
+
+    #[inline(always)]
+    fn decode_raw_next(mut data: &'a[u8]) -> (&'a[u8], Option<u64>) {
+        if data.is_empty() {
+            return (data, None)
+        }
+        let mut value = (data[0] & 0b0111_1111) as u64;
+        let mut continued = data[0] & 0b1000_0000 > 0;
+        data = &data[1..];        
+        let mut offset = 7;
+
+        while !data.is_empty() && continued {
+            value |= ((data[0] & 0b0111_1111) as u64) << offset;
+            continued = data[0] & 0b1000_0000 > 0;
+            data = &data[1..];        
+            offset += 7;
+        }
+
+        (data, Some(value))
+    }
+
+    #[inline(always)]
+    pub fn peek(&self) -> Option<u64> {
+        return self.next_value
+    }
+
+    #[inline(always)]
+    pub fn skip_one(&mut self) {
+        if let Some(current) = self.next_value {
+            let (remaining, delta) = Self::decode_raw_next(self.bytes);
+            self.bytes = remaining;
+            self.next_value = delta.map(|delta| current + delta);
+        }
+    }
+}
+
+impl Iterator for StreamDecode<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_value {
+            Some(current) => {
+                let (remaining, delta) = Self::decode_raw_next(self.bytes);
+                self.bytes = remaining;
+                match delta {
+                    Some(delta) => self.next_value = Some(current + delta),
+                    None => self.next_value = None
+                }
+                Some(current)
+            },
+            None => None,
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod test {
     use rand::{thread_rng, Rng};
@@ -122,22 +177,6 @@ mod test {
         let buffer = encode(&data);
         assert_eq!(decode(&buffer), (data, buffer.len() as u32));
     }
-
-    // #[test]
-    // fn run_compression() {
-    //     {
-    //         let data = vec![1, 2, 3, 4, 5, 6, 7];
-    //         let buffer = encode(&data);
-    //         assert_eq!(encoded_size(&data), 2);
-    //         assert_eq!(decode(&buffer), data);
-    //     }
-    //     {
-    //         let data = vec![1, 2, 3, 5, 7, 8, 9];
-    //         let buffer = encode(&data);
-    //         assert_eq!(encoded_size(&data), 5);
-    //         assert_eq!(decode(&buffer), data);
-    //     }
-    // }
 
     #[test]
     fn number_size() {
