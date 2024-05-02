@@ -437,7 +437,7 @@ impl ExtensibleTrigramFile {
             let _mark = mark!(capture, "prepare_inputs");
             files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-            IdCollector::new_from_vec(&files)
+            IdCollector::new_from_vec(files)
         };
 
         // track how many segments are added in this batch

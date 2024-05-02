@@ -108,6 +108,7 @@ impl<'a> StreamDecode<'a> {
         if data.is_empty() {
             return (data, None)
         }
+        
         let mut value = (data[0] & 0b0111_1111) as u64;
         let mut continued = data[0] & 0b1000_0000 > 0;
         data = &data[1..];        
@@ -116,7 +117,7 @@ impl<'a> StreamDecode<'a> {
         while !data.is_empty() && continued {
             value |= ((data[0] & 0b0111_1111) as u64) << offset;
             continued = data[0] & 0b1000_0000 > 0;
-            data = &data[1..];        
+            data = &data[1..];
             offset += 7;
         }
 

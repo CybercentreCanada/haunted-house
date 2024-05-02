@@ -7,6 +7,7 @@ use std::iter::Peekable;
 
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use tokio::sync::mpsc;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -231,25 +232,59 @@ impl JournalFilter {
     }
 
     /// Read the file list for a single trigram
-    fn read_all(&self) -> Result<Vec<Vec<u64>>> {
-        let mut guard = self.read_handle.lock();
-        let reader: &mut std::fs::File = &mut guard;
-        let mut reader = BufReader::new( reader);
-        let mut buffer = vec![];
+    // fn read_all(&self) -> Result<Vec<Vec<u64>>> {
+    //     let mut guard = self.read_handle.lock();
+    //     let reader: &mut std::fs::File = &mut guard;
+    //     let mut reader = BufReader::new( reader);
+    //     let mut buffer = vec![];
 
-        let mut collected = Vec::with_capacity(TRIGRAM_RANGE as usize);
-        let mut addresses = AddressReader::open(&self.directory, self.id)?;
-        while let Some((_, mut address, size)) = addresses.next()? {
-            let mut trigrams = Vec::with_capacity(size.0 as usize);
-            while let Some(current) = address {
-                buffer.clear();
-                let block = self.load_block_into(current, &mut reader, &mut buffer)?;
-                decode_into(block.file_ids, &mut trigrams);
-                address = block.previous;
+    //     let mut collected = Vec::with_capacity(TRIGRAM_RANGE as usize);
+    //     let mut addresses = AddressReader::open(&self.directory, self.id)?;
+    //     while let Some((_, mut address, size)) = addresses.next()? {
+    //         let mut trigrams = Vec::with_capacity(size.0 as usize);
+    //         while let Some(current) = address {
+    //             buffer.clear();
+    //             let block = self.load_block_into(current, &mut reader, &mut buffer)?;
+    //             decode_into(block.file_ids, &mut trigrams);
+    //             address = block.previous;
+    //         }
+    //         collected.push(trigrams);
+    //     }
+    //     Ok(collected)
+    // }
+
+    #[cfg(test)]
+    fn read_all(self: Arc<Self>) -> mpsc::Receiver<Result<(u32, Vec<u64>)>> {
+        let (send, recv) = mpsc::channel(32);
+
+        tokio::task::spawn_blocking(move ||{
+            let send_err = send.clone();
+            let result = move || -> Result<()> {
+                let mut guard = self.read_handle.lock();
+                let reader: &mut std::fs::File = &mut guard;
+                let mut reader = BufReader::new( reader);
+                let mut buffer = vec![];
+
+                let mut addresses = AddressReader::open(&self.directory, self.id)?;
+                while let Some((val, mut address, size)) = addresses.next()? {
+                    let mut trigrams = Vec::with_capacity(size.0 as usize);
+                    while let Some(current) = address {
+                        buffer.clear();
+                        let block = self.load_block_into(current, &mut reader, &mut buffer)?;
+                        decode_into(block.file_ids, &mut trigrams);
+                        address = block.previous;
+                    }
+                    send.blocking_send(Ok((val, trigrams)))?;
+                }
+                Ok(())
+            }();
+
+            if let Err(err) = result {
+                send_err.blocking_send(Err(err)).unwrap()
             }
-            collected.push(trigrams);
-        }
-        Ok(collected)
+        });
+
+        recv
     }
 
     /// Read the file list for a single trigram
@@ -658,6 +693,7 @@ mod test {
     use itertools::Itertools;
     use rand::{Rng, SeedableRng};
 
+    use crate::worker::encoding::StreamDecode;
     use crate::{query::Query, worker::encoding::encode_into};
     use crate::types::FilterID;
     use super::JournalFilter;
@@ -700,14 +736,15 @@ mod test {
             println!("Open time: {}", timestamp.elapsed().as_secs_f64());
 
             let timestamp = std::time::Instant::now();
-            let output = file.read_all()?;
+            let mut output = file.read_all();
 
-            for (trigram, values) in output.iter().enumerate() {
+            while let Some(row) = output.recv().await {
+                let (trigram, values) = row?;
                 if trigram == 0 {
                     assert_eq!(*values, (1..50).collect_vec());
                 } else if trigram == 500 {
                     assert_eq!(*values, (1..102).collect_vec());
-                } else if trigram == TRIGRAM_RANGE as usize - 1 {
+                } else if trigram == TRIGRAM_RANGE as u32 - 1 {
                     assert_eq!(*values, (50..102).collect_vec());
                 } else {
                     assert!(values.is_empty());
@@ -725,12 +762,12 @@ mod test {
 
         let timer = std::time::Instant::now();
         // build test data
-        let mut original = vec![];
+        // let mut original = vec![];
         let mut trigrams = vec![];
 
         for ii in 1..31 {
             let (a, b) = random_trigrams(ii);
-            original.push(a);
+            // original.push(a);
             trigrams.push((ii, b));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
@@ -756,22 +793,20 @@ mod test {
 
         // Recreate the trigrams
         {
-            let mut recreated: Vec<Bits> = vec![Bits::repeat(false, TRIGRAM_RANGE as usize); original.len()];
-
-            let timer = std::time::Instant::now();
             let file = JournalFilter::open(location, id).await?;
-            let output = file.read_all()?;
-            println!("read {:.2}; {}ms each", timer.elapsed().as_secs_f64(), 1000.0 * timer.elapsed().as_secs_f64()/TRIGRAM_RANGE as f64);
 
-            for (trigram, values) in output.into_iter().enumerate() {
-                // let values = file.read_trigram(trigram)?;
-                for index in values {
-                    unsafe {recreated[index as usize - 1].set_unchecked(trigram, true); }
+            let mut files = trigrams.iter().map(|row|StreamDecode::new(&row.1)).collect_vec();
+            let mut output = file.read_all();
+            
+            while let Some(row) = output.recv().await {
+                let (trigram, values) = row?;
+                for file_index in values {
+                    assert!(files[file_index as usize - 1].next().unwrap() == trigram as u64);
                 }
             }
 
-            for (index, values) in recreated.into_iter().enumerate() {
-                assert_eq!(original[index], values);
+            for mut file in files {
+                assert!(file.next().is_none())
             }
         }
         Ok(())
@@ -784,12 +819,12 @@ mod test {
 
         let timer = std::time::Instant::now();
         // build test data
-        let mut original = vec![];
+        // let mut original = vec![];
         let mut trigrams = vec![];
 
         for ii in 1..21 {
             let (a, b) = random_trigrams(ii);
-            original.push(a);
+            // original.push(a);
             trigrams.push((ii, b));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
@@ -818,28 +853,25 @@ mod test {
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let mut recreated: Vec<Bits> = vec![Bits::repeat(false, TRIGRAM_RANGE as usize); original.len()];
-
-            let timer = std::time::Instant::now();
             let file = JournalFilter::open(location, id).await?;
-            let output = file.read_all()?;
-            println!("read {:.2}; {}ms each", timer.elapsed().as_secs_f64(), 1000.0 * timer.elapsed().as_secs_f64()/TRIGRAM_RANGE as f64);
 
-            for (trigram, values) in output.into_iter().enumerate() {
-                // let values = file.read_trigram(trigram)?;
-                for index in values {
-                    unsafe { recreated[index as usize - 1].set_unchecked(trigram, true) };
+            let mut files = trigrams.iter().take(10).map(|row|StreamDecode::new(&row.1)).collect_vec();
+            let mut output = file.read_all();
+            
+            while let Some(row) = output.recv().await {
+                let (trigram, values) = row?;
+                for file_index in values {
+                    let file_index = file_index as usize - 1;
+                    if file_index < 10 {
+                        assert!(files[file_index].next().unwrap() == trigram as u64);
+                    } else {
+                        panic!("Unexpected id: {file_index}");
+                    }
                 }
             }
 
-            for (index, values) in recreated.into_iter().enumerate() {
-                if index < 10 {
-                    // the earlier write should be commited
-                    assert!(original[index] == values, "{index}");
-                } else {
-                    // the later write should be missing
-                    assert!(values.count_ones() == 0);
-                }
+            for mut file in files {
+                assert!(file.next().is_none())
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
@@ -849,12 +881,12 @@ mod test {
     #[tokio::test]
     async fn large_batch() -> Result<()> {
         // build test data
-        let mut original = vec![];
+        // let mut original = vec![];
         let mut trigrams = vec![];
         let timestamp = std::time::Instant::now();
         for ii in 1..1001 {
             let (bits, buffer) = random_trigrams(ii);
-            original.push(bits);
+            // original.push(bits);
             trigrams.push((ii, buffer))
         }
         println!("generate {:.2}", timestamp.elapsed().as_secs_f64());
@@ -874,21 +906,20 @@ mod test {
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let mut recreated: Vec<Bits> = vec![Bits::repeat(false, TRIGRAM_RANGE as usize); trigrams.len()];
-
-            let timer = std::time::Instant::now();
             let file = JournalFilter::open(location, id).await?;
-            let output = file.read_all()?;
-            println!("read {:.2}; {}ms each", timer.elapsed().as_secs_f64(), 1000.0 * timer.elapsed().as_secs_f64()/TRIGRAM_RANGE as f64);
 
-            for (trigram, values) in output.into_iter().enumerate() {
-                for index in values {
-                    unsafe { recreated[index as usize - 1].set_unchecked(trigram, true) };
+            let mut files = trigrams.iter().map(|row|StreamDecode::new(&row.1)).collect_vec();
+            let mut output = file.read_all();
+            
+            while let Some(row) = output.recv().await {
+                let (trigram, values) = row?;
+                for file_index in values {
+                    assert!(files[file_index as usize - 1].next().unwrap() == trigram as u64);
                 }
             }
 
-            for (index, values) in recreated.into_iter().enumerate() {
-                assert_eq!(original[index], values)
+            for mut file in files {
+                assert!(file.next().is_none())
             }
         }
         println!("read {}", timer.elapsed().as_secs_f64());
