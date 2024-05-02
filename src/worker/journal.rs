@@ -7,6 +7,7 @@ use std::iter::Peekable;
 
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use log::info;
 use tokio::sync::mpsc;
 use itertools::Itertools;
 use parking_lot::Mutex;
@@ -204,29 +205,22 @@ impl JournalFilter {
             let mut writer = writer.into_inner()?;
             writer.flush()?;
             writer.sync_data()?;
-        
-
-            // writer.flush()?;
-            // writer.sync_data()?;
             address_writer.install()?;
         }
-        println!("write_batch metrics \n{}", capture.format());
+        info!("write_batch metrics \n{}", capture.format());
         Ok(())
     }
 
-    fn load_block(&self, address: Address) -> Result<Block> {
-        todo!()
-        // let mut guard = self.read_handle.lock();
-        // let reader: &mut std::fs::File = &mut guard;
-        // let mut reader = BufReader::new( reader);
-        // reader.seek(SeekFrom::Start(address.0))?;
-        // let mut buffer = vec![];
-        // let _size = reader.read_until(0, &mut buffer)?;
-        // Ok(postcard::from_bytes_cobs(&mut buffer)?)
+    fn load_block<'a>(&self, address: Address, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
+        let mut guard = self.read_handle.lock();
+        let reader: &mut std::fs::File = &mut guard;
+        let mut reader = BufReader::new(reader);
+        self.load_block_into(address, &mut reader, buffer)
     }
 
     fn load_block_into<'a>(&self, address: Address, reader: &mut BufReader<&mut File>, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
         reader.seek(SeekFrom::Start(address.0))?;
+        buffer.clear();
         let _size = reader.read_until(0, buffer)?;
         Ok(postcard::from_bytes_cobs(buffer)?)
     }
@@ -294,8 +288,9 @@ impl JournalFilter {
         if size.0 == 0 {
             return Ok(vec![])
         }
+        let mut buffer = vec![];
         while let Some(current) = address {
-            let block = self.load_block(current)?;
+            let block = self.load_block(current, &mut buffer)?;
             decode_into(block.file_ids, &mut collected);
             address = block.previous;
         }
@@ -315,9 +310,12 @@ impl JournalFilter {
         // Load all the offset and sizes
         let trigrams = AddressReader::read_set(&self.directory, self.id, trigrams)?;
 
+        // TODO there is an optimization here were if any of the sets are quite small we could load them
+        // separately before moving onto the larger ones
+
         // build a collection if iterators that will navigate the linked list of segments
-        // yielding file ids in order. They will only read segments when the current one is
-        // exhausted, this potentially lets us avoid loading unused memory pages.
+        // yielding file ids in decending order. They will only read segments when the current one is
+        // exhausted, this potentially lets us avoid loading unused sections of the underlying file.
         let mut sources = vec![];
         for (_trigram, address, size) in trigrams {
             // TODO sort by size
@@ -332,8 +330,6 @@ impl JournalFilter {
             Some(item) => item,
             None => return Ok(vec![]),
         };
-
-        todo!("switch direction on files");
 
         // Loop over all the cursors until all files have been considered
         let mut output = vec![];
@@ -353,13 +349,13 @@ impl JournalFilter {
                         // if the current value on this cursor is behind the candidate keep
                         // moving forward until we catch up with the candidate, all the values we are skipping
                         // over must be missing in at least one other cursor for this to happen
-                        std::cmp::Ordering::Less => { cursor.next()?; continue },
+                        std::cmp::Ordering::Greater => { cursor.next()?; continue },
                         // If this cursor has the candidate in it, move to the next cursor, candidate is still valid
                         std::cmp::Ordering::Equal => { continue 'next_cursor },
                         // If this cursor has passed the candidate the candidate is invalid (it needs to be
                         // in all of the cursors) take the current value as the new candidate and restart
                         // the loop over the cursors
-                        std::cmp::Ordering::Greater => { candidate = next; continue 'next_candidate },
+                        std::cmp::Ordering::Less => { candidate = next; continue 'next_candidate },
                     }
                 }
             }
@@ -368,9 +364,9 @@ impl JournalFilter {
             // of the 'next_candidate loop then we have found this candidates in all the cursors
             output.push(candidate);
 
-            // advance to the next file ID as a candidate. It doesn't matter if the cursors don't
+            // advance to the 'next' file ID as a candidate. It doesn't matter if the cursors don't
             // actually have this value, since we are about to check them.
-            candidate += 1;
+            candidate -= 1;
         }
         return Ok(output)
     }
@@ -440,7 +436,8 @@ impl JournalFilter {
 struct TrigramCursor<'a> {
     host: &'a JournalFilter,
     current: Vec<u64>,
-    next_address: Option<Address>
+    next_address: Option<Address>,
+    data_buffer: Vec<u8>,
 }
 
 impl<'a> TrigramCursor<'a> {
@@ -448,6 +445,7 @@ impl<'a> TrigramCursor<'a> {
         Self {
             host,
             next_address,
+            data_buffer: vec![],
             current: vec![]
         }
     }
@@ -455,7 +453,7 @@ impl<'a> TrigramCursor<'a> {
     fn fill(&mut self) -> Result<bool> {
         if !self.current.is_empty() { return Ok(true) }
         if let Some(address) = self.next_address {
-            let block = self.host.load_block(address)?;
+            let block = self.host.load_block(address, &mut self.data_buffer)?;
             self.next_address = block.previous;
             decode_into(block.file_ids, &mut self.current);
             return Ok(!self.current.is_empty())
@@ -575,6 +573,7 @@ impl AddressReader {
             let forward_move = new_location - location;
             if forward_move > 0 {   
                 tail.seek_relative(forward_move as i64)?;
+                location += forward_move;
             }
 
             let address = tail.read_u64::<LittleEndian>()?;
@@ -700,9 +699,6 @@ mod test {
     use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams, Bits, TrigramSet};
 
     use super::{TRIGRAM_RANGE, IdCollector};
-
-
-
 
     #[tokio::test(flavor = "multi_thread")]
     async fn simple_save_and_load() -> Result<()> {
@@ -954,33 +950,49 @@ mod test {
     #[tokio::test]
     async fn simple_queries() -> Result<()> {
         // setup data
-        let raw_data = std::include_bytes!("./filter.rs");
-        let trigrams = build_buffer_to_offsets(raw_data);
+        let raw_data1 = std::include_bytes!("./journal.rs");
+        let raw_data2 = std::include_bytes!("./manager.rs");
+        let raw_data3 = std::include_bytes!("./trigrams.rs");
+        let trigrams1 = build_buffer_to_offsets(raw_data1);
+        let trigrams2 = build_buffer_to_offsets(raw_data2);
+        let trigrams3 = build_buffer_to_offsets(raw_data3);
 
         // build table
         let tempdir = tempfile::tempdir()?;
         let id = FilterID::from(1);
         let location = tempdir.path().to_path_buf();
         let file = JournalFilter::new(location, id).await?;
-        file.write_batch(vec![(1, trigrams)]).await?;
+        println!("write 1");
+        file.write_batch(vec![(1, trigrams1)]).await?;
+        println!("write 2");
+        file.write_batch(vec![(2, trigrams2)]).await?;
+        println!("write 3");
+        file.write_batch(vec![(3, trigrams3)]).await?;
         
-        // run literal query
+        // run literal query that should only be in this file
         println!("query 1");
-        let query = Query::Literal(b"query_literal".to_vec());
+        let query = Query::Literal(b"This shouldn't occur in any files and the odds of a false positive should be low.".to_vec());
         let hits = file.query(query.clone()).await?;
         assert_eq!(hits, vec![1]);
 
-        // run or query
+        // run literal query that should not exist anywhere. False positives should also be low given the length.
         println!("query 2");
-        let query = Query::Or(vec![Query::Literal(b"1".to_vec()), Query::Literal(b"query_literal".to_vec())]);
+        let bytes: Vec<u8> = (0..48).map(|_| rand::thread_rng().gen()).collect();
+        let query = Query::Literal(bytes.clone());
         let hits = file.query(query.clone()).await?;
-        assert_eq!(hits, vec![1]);
-
-        // run and query
-        println!("query 3");
-        let query = Query::And(vec![Query::Literal(b"1".to_vec()), Query::Literal(b"query_literal".to_vec())]);
-        let hits = file.query(query).await?;
         assert!(hits.is_empty());
+
+        // run a query that should hit on everything
+        println!("query 3");
+        let query = Query::Or(vec![Query::Literal(b"fn ".to_vec()), Query::Literal(bytes.clone())]);
+        let hits = file.query(query.clone()).await?;
+        assert_eq!(hits, vec![1, 2, 3]);
+
+        // run a query that should hit on two of the files
+        println!("query 4");
+        let query = Query::Or(vec![Query::Literal(b"JournalFilter".to_vec()), Query::Literal(bytes)]);
+        let hits = file.query(query.clone()).await?;
+        assert_eq!(hits, vec![1, 2]);
 
         return Ok(())
     }

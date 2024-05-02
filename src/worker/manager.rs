@@ -14,6 +14,7 @@ use crate::types::{ExpiryGroup, FilterID, FileInfo};
 
 use super::YaraTask;
 use super::database::{IngestStatus, Database, IngestStatusBundle};
+use super::journal::JournalFilter;
 use super::filter::ExtensibleTrigramFile;
 use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse, StorageStatus};
