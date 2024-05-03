@@ -46,10 +46,19 @@ struct Address(u64);
 
 
 pub struct JournalFilter {
-    write_handle: Mutex<Arc<File>>,
-    read_handle: Mutex<File>,
-    directory: PathBuf,
+    /// identifier for this journal, ties files on disk to database entries elsewhere
     id: FilterID,
+    /// directory where files related to this journal are stored, other things will be in this directory
+    directory: PathBuf,
+    /// A file handle used while writing 
+    write_handle: Mutex<Arc<File>>,
+    /// A file handle used while reading. This could be a pool if we are having search throughput issues.
+    read_handle: Mutex<File>,
+    /// A flag indicating if this journal is active, this lets different components that might
+    /// want to use this journal to coordinate starting, stoping, garbage collection, etc.
+    running: std::sync::atomic::AtomicBool,
+    /// A notice to let people know if the status of this journal has changed
+    running_notice: tokio::sync::Notify,
 }
 
 
@@ -74,7 +83,9 @@ impl JournalFilter {
                 write_handle: Mutex::new(Arc::new(data)),
                 read_handle: Mutex::new(reader), 
                 directory, 
-                id 
+                id,
+                running: std::sync::atomic::AtomicBool::new(true),
+                running_notice: tokio::sync::Notify::new(),
             }))
         }).await?
     }
@@ -118,21 +129,57 @@ impl JournalFilter {
                 write_handle: Mutex::new(Arc::new(data)),
                 read_handle: Mutex::new(reader), 
                 directory, 
-                id 
+                id,
+                running: std::sync::atomic::AtomicBool::new(true),
+                running_notice: tokio::sync::Notify::new(),
             }))
         }).await?
     }
 
-    pub async fn write_batch(self: &Arc<Self>, files: Vec<(u64, Vec<u8>)>) -> Result<()> {
+    pub fn delete(&self) -> Result<()> {
+        AddressBuilder::clear_all(&self.directory, self.id);
+        remove_file(&self.directory.join(format!("{}", self.id)))?;
+        return Ok(())
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn stop(&self) {
+        self.running.store(false, std::sync::atomic::Ordering::Release);
+        self.running_notice.notify_waiters();
+        self.write_handle.lock();
+        self.read_handle.lock();
+    }
+
+    pub fn notify(&self) {
+        self.running_notice.notify_waiters();
+    }
+
+    pub async fn notified(&self) {
+        if self.is_running() {
+            self.running_notice.notified().await
+        }
+    }
+
+    #[must_use]
+    pub async fn write_batch(self: &Arc<Self>, files: Vec<(u64, Vec<u8>)>) -> Result<bool> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             this._write_batch(files)
         }).await?
     }
 
-    fn  _write_batch(&self, mut files: Vec<(u64, Vec<u8>)>) -> Result<()> {
+    #[must_use]
+    fn _write_batch(&self, mut files: Vec<(u64, Vec<u8>)>) -> Result<bool> {
         let capture = &Capture::new();
         let guard = self.write_handle.lock();
+
+        if !self.is_running() {
+            return Ok(false)
+        }
+
         {
             let _capture_batch = mark!(capture, "write_batch");
 
@@ -208,7 +255,7 @@ impl JournalFilter {
             address_writer.install()?;
         }
         info!("write_batch metrics \n{}", capture.format());
-        Ok(())
+        Ok(true)
     }
 
     fn load_block<'a>(&self, address: Address, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
@@ -298,7 +345,7 @@ impl JournalFilter {
     }
 
     /// Calculate the intersection of the file lists for all the given trigrams
-    pub fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
+    fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
         // Handle corner cases
         if trigrams.is_empty() {
             return Ok(vec![])
@@ -382,7 +429,11 @@ impl JournalFilter {
     }
 
     /// Actual logic for the 'query' methods
-    fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {
+    fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {        
+        if !self.is_running() {
+            return Err(anyhow::anyhow!("Filter stopping."));
+        }
+
         match query {
             Query::And(items) => {
                 let mut base = self._query(&items[0], cache)?;
@@ -646,6 +697,12 @@ impl AddressBuilder {
         let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(tail_location).context("Creating tail file")?;
         tail.set_len(TAIL_FILE_SIZE).context("Initializing tail file")?;
         Ok(())
+    }
+
+    fn clear_all(directory: &Path, id: FilterID) -> Result<()> {
+        Self::clear_temp(directory, id);
+        let tail_location = directory.join(format!("{id}.tail"));
+        remove_file(&tail_location)
     }
 
     fn clear_temp(directory: &Path, id: FilterID) -> Result<()> {

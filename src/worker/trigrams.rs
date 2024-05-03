@@ -228,6 +228,8 @@ pub (crate) type Bits = bitvec::vec::BitVec::<usize, bitvec::prelude::Lsb0>;
 #[cfg(test)]
 pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
     // Prepare accumulators
+
+    use super::encoding::StreamEncode;
     let mut mask = Box::<BitArray::<[u64; 1 << 24]>>::default();
 
     let mut index = 2;
@@ -239,11 +241,14 @@ pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
         index += 1;
     }
 
-    let mut output = vec![];
-    let trigrams = mask.iter_ones().map(|v| v as u64).collect_vec();
-    encode_into(&trigrams, &mut output);
-
-    return output
+    // let mut output = vec![];
+    // let trigrams = mask.iter_ones().map(|v| v as u64).collect_vec();
+    // encode_into(&trigrams, &mut output);
+    let mut output = StreamEncode::new();
+    for trigram in mask.iter_ones() {
+        output.add(trigram as u64);
+    }
+    return output.finish()
 }
 
 /// Convert a stream of buffers into a trigram set

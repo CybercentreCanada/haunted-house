@@ -348,6 +348,7 @@ fn default_parallel_file_downloads() -> usize { 100 }
 
 /// Settings for the worker server
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct WorkerSettings {
     /// Where should files be stored temporarily while processing occurs
     pub file_cache: CacheConfig,
@@ -358,28 +359,23 @@ pub struct WorkerSettings {
     /// What TLS settings should the server use
     pub tls: Option<TLSConfig>,
     /// Which path should be used for local data storage
-    #[serde(default="default_data_path")]
     pub data_path: PathBuf,
     /// A soft cap on the number of bytes of data to be saved by the worker.
     /// The worker should stop accepting new items when the size gets near this.
-    #[serde(default="default_data_limit", deserialize_with="deserialize_size", serialize_with="serialize_size")]
+    #[serde(deserialize_with="deserialize_size", serialize_with="serialize_size")]
     pub data_limit: u64,
     /// How much space (bytes) should be reserved for transient storage
-    #[serde(default="default_data_reserve")]
     pub data_reserve: u64,
     /// Default size for initial data segments in the filter files
-    #[serde(default="default_initial_segment_size")]
     pub initial_segment_size: u32,
     /// Default size for extended segments in the filter files
-    #[serde(default="default_extended_segment_size")]
     pub extended_segment_size: u32,
     /// How many files should be ingested per batch
-    #[serde(default="default_ingest_batch_size")]
     pub ingest_batch_size: u32,
+    /// How long to wait for a full batch
+    pub ingest_batch_delay_seconds: u64,
     /// How many files should be downloaded concurrently
-    #[serde(default="default_parallel_file_downloads")]
     pub parallel_file_downloads: usize,
-
     #[serde(flatten)]
     pub classification: ClassificationConfig,
 }
@@ -397,6 +393,7 @@ impl Default for WorkerSettings {
             initial_segment_size: default_initial_segment_size(),
             extended_segment_size: default_extended_segment_size(),
             ingest_batch_size: default_ingest_batch_size(),
+            ingest_batch_delay_seconds: 60,
             parallel_file_downloads: default_parallel_file_downloads(),
             bind_address: Some("localhost:4444".to_owned()),
             tls: None,
