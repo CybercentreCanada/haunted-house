@@ -101,7 +101,7 @@ impl WorkerState {
         self.database.create_filter(id, &expiry).await?;
         let mut filters = self.filters.write().await;
         if filters.contains_key(&id) { return Ok(()); }
-        let worker = JournalFilter::open(self.config.get_filter_directory(), id).await?;
+        let worker = JournalFilter::new(self.config.get_filter_directory(), id).await?;
         tokio::spawn(self.clone().ingest_feeder(id, worker.clone()));
         filters.insert(id, worker);
         return Ok(())

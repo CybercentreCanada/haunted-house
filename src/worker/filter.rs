@@ -1187,7 +1187,7 @@ mod test {
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let mut recreated: Vec<Bits> = vec![Bits::repeat(false, TRIGRAM_RANGE as usize); original.len()];
+            let mut recreated: Vec<Bits> = vec![Bits::ZERO; original.len()];
 
             let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {
@@ -1197,8 +1197,8 @@ mod test {
                 }
             }
 
-            for (index, values) in recreated.into_iter().enumerate() {
-                assert!(original[index] == values, "{index}");
+            for (index, values) in recreated.iter().enumerate() {
+                assert!(original[index].as_ref() == values, "{index}");
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
@@ -1231,7 +1231,7 @@ mod test {
         }
 
         {
-            let mut recreated = Bits::repeat(false, TRIGRAM_RANGE as usize);
+            let mut recreated: Box<Bits> = Default::default();
 
             let file = ExtensibleTrigramFile::open(location, id)?;
             for trigram in 0..(1<<24) {

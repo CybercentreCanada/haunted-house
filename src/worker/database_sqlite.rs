@@ -588,7 +588,7 @@ impl FilterSQLWorker {
                 }
             }
         }
-        info!("File selection complete [Filter {}]: {} input, {} selected", self.id, view.len(), selected.len());
+        info!("File selection complete [Filter {}]: {} input, {} selected", self.id, indices.len(), selected.len());
         return Ok(selected)
     }
 

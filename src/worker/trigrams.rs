@@ -12,7 +12,6 @@ use log::error;
 use tokio::sync::{Semaphore, RwLock};
 use tokio::task::JoinHandle;
 use bitvec::{bitarr, BitArr};
-use bitvec::prelude::BitArray;
 use serde::{Serialize, Deserialize, de::Error};
 
 use crate::config::WorkerSettings;
@@ -20,7 +19,7 @@ use crate::error::ErrorKinds;
 use crate::storage::BlobStorage;
 use crate::types::{Sha256, FilterID, FileInfo};
 
-use super::encoding::encode_into;
+use super::encoding::{encode_into, StreamEncode};
 
 /// A manager for a directory holding the trigram sets yet to be written to filters.
 pub struct TrigramCache {
@@ -222,15 +221,12 @@ pub (crate) fn build_buffer(data: &[u8]) -> TrigramSet {
     return output
 }
 
-#[cfg(test)]
-pub (crate) type Bits = bitvec::vec::BitVec::<usize, bitvec::prelude::Lsb0>;
+pub (crate) type Bits = BitArr!(for 1 << 24, in usize, bitvec::order::Lsb0);
 
 #[cfg(test)]
 pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
     // Prepare accumulators
-
-    use super::encoding::StreamEncode;
-    let mut mask = Box::<BitArray::<[u64; 1 << 24]>>::default();
+    let mut mask = Box::<Bits>::default();
 
     let mut index = 2;
     let mut trigram: u32 = (input[0] as u32) << 8 | (input[1] as u32);
@@ -254,7 +250,7 @@ pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
 /// Convert a stream of buffers into a trigram set
 async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>) -> Result<TrigramFile, ErrorKinds> {
     // Prepare accumulators
-    let mut mask = Box::<BitArray::<[u64; 1 << 24]>>::default();
+    let mut mask = Box::<Bits>::default();
 
     // Read the initial block
     let mut buffer = vec![];
@@ -288,10 +284,11 @@ async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error
     }
 
     // convert mask into offsets
-    let mut buffer = vec![];
-    let indices = mask.iter_ones().map(|v|v as u64).collect_vec();
-    encode_into(&indices, &mut buffer);
-    return Ok(TrigramFile::Deltas(buffer))
+    let mut output = StreamEncode::new();
+    for trigram in mask.iter_ones() {
+        output.add(trigram as u64);
+    }
+    return Ok(TrigramFile::Deltas(output.finish()))
 }
 
 
@@ -467,6 +464,8 @@ impl TrigramSet {
     }
 }
 
+type ChunkBits = BitArr!(for 1 << 16, in u64, bitvec::order::Lsb0);
+
 /// A bitset over 2^16 values
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Chunk {
@@ -474,7 +473,7 @@ enum Chunk {
     /// Bitset encoded as indices of each set bit
     Added(Vec<u16>),
     /// Bitset incoded as a literal bit flag per value
-    Mask(u16, Box<BitArray<[u64; 1024]>>),
+    Mask(u16, Box<ChunkBits>),
     /// Bitset encoded as indices of each unset bit
     Removed(Vec<u16>)
 }
@@ -654,12 +653,11 @@ impl Chunk {
 }
 
 #[cfg(test)]
-pub (crate) fn random_trigrams(seed: u64) -> (Bits, Vec<u8>) {
+pub (crate) fn random_trigrams(seed: u64) -> (Box<Bits>, Vec<u8>) {
     use rand::{Rng, SeedableRng};
-    use crate::worker::filter::TRIGRAM_RANGE;
 
     let mut prng = rand::rngs::SmallRng::seed_from_u64(seed);
-    let mut data = Bits::repeat(false, TRIGRAM_RANGE as usize);
+    let mut data = Box::<Bits>::default();
 
     let raw = data.as_raw_mut_slice();
     for part in raw {

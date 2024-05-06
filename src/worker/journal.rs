@@ -64,45 +64,62 @@ pub struct JournalFilter {
 
 impl JournalFilter {
     pub async fn new(directory: PathBuf, id: FilterID) -> Result<Arc<Self>> {
-        tokio::task::spawn_blocking(move || {
-            // prepare file
-            let location = directory.join(format!("{id}"));
-            let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&location).context("Creating data file")?;
-            data.set_len(HEADER_SIZE).context("Adjusting file size")?;            
+        tokio::task::spawn_blocking(move || Self::blocking_new(directory, id)).await?
+    }
 
-            // write header
-            data.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
-            data.sync_all()?;
+    fn blocking_new(directory: PathBuf, id: FilterID) -> Result<Arc<Self>> {
+        // prepare file
+        let location = directory.join(format!("{id}"));
+        let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&location).context("Creating data file")?;
+        data.set_len(HEADER_SIZE).context("Adjusting file size")?;            
 
-            // setup tail
-            AddressBuilder::init_empty(&directory, id)?;
+        // write header
+        data.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
+        data.sync_all()?;
 
-            // return object
-            let reader = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?;
-            Ok(Arc::new(Self { 
-                write_handle: Mutex::new(Arc::new(data)),
-                read_handle: Mutex::new(reader), 
-                directory, 
-                id,
-                running: std::sync::atomic::AtomicBool::new(true),
-                running_notice: tokio::sync::Notify::new(),
-            }))
-        }).await?
+        // setup tail
+        AddressBuilder::init_empty(&directory, id)?;
+
+        // return object
+        let reader = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?;
+        Ok(Arc::new(Self { 
+            write_handle: Mutex::new(Arc::new(data)),
+            read_handle: Mutex::new(reader), 
+            directory, 
+            id,
+            running: std::sync::atomic::AtomicBool::new(true),
+            running_notice: tokio::sync::Notify::new(),
+        }))
     }
 
     pub async fn open(directory: PathBuf, id: FilterID) -> Result<Arc<Self>> {
         tokio::task::spawn_blocking(move || {
             // open file
             let location = directory.join(format!("{id}"));
-            let mut data = std::fs::OpenOptions::new().create_new(false).write(true).read(true).open(&location).context("Open file to write")?;
-            
+            if let Ok(metadata) = location.metadata() {
+                if metadata.len() <= 4 {
+                    AddressBuilder::clear_all(&directory, id);
+                    remove_file(&location)?;
+                }
+            }
+            if !location.exists() {
+                return Self::blocking_new(directory, id)
+            }
+            let mut data = std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(&location).context("Open file to write")?;
+
             // verify header
-            if data.read_u32::<LittleEndian>()? != HEADER_MAGIC {
-                return Err(anyhow::anyhow!("Corrupt data file: header magic wrong"));
+            let read_magic = data.read_u32::<LittleEndian>()?;
+            if read_magic != HEADER_MAGIC {
+                let mut size = 0;
+                if let Ok(metadata) = location.metadata() {
+                    size = metadata.len();
+                }
+    
+                return Err(anyhow::anyhow!("Corrupt data file: header magic wrong {read_magic:08x}; {location:?}; size: {size}"));
             }
     
             // clear temporary 
-            AddressBuilder::clear_temp(&directory, id)?;
+            AddressBuilder::init_ready(&directory, id)?;
 
             // Open current tail and read last location
             let mut reader = AddressReader::open(&directory, id)?;
@@ -696,6 +713,14 @@ impl AddressBuilder {
         let tail_location = directory.join(format!("{id}.tail"));
         let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(tail_location).context("Creating tail file")?;
         tail.set_len(TAIL_FILE_SIZE).context("Initializing tail file")?;
+        Ok(())
+    }
+
+    fn init_ready(directory: &Path, id: FilterID) -> Result<()> {
+        Self::clear_temp(directory, id)?;
+        if !directory.join(format!("{id}.tail")).exists() {
+            Self::init_empty(directory, id)?;
+        }
         Ok(())
     }
 
