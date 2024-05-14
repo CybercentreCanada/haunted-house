@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::{cmp::Reverse, collections::{hash_map::Entry, BTreeSet, HashMap}, fs::File, io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::Arc};
+use std::{cmp::Reverse, collections::{hash_map::Entry, BTreeSet, HashMap}, fs::File, io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::{mpsc::{Receiver, Sender}, Arc}};
 use std::iter::Peekable;
 
 // todo ensure ordered file ids
@@ -222,16 +222,10 @@ impl JournalFilter {
             let mut address_reader = AddressReader::open(&self.directory, self.id)?;
             drop(_mark);
 
-            // start reading the file sequences in a background thread
-            let (address_sink, address_stream) = std::sync::mpsc::sync_channel::<(u32, Vec<u64>)>(4);
-            std::thread::spawn(|| {
-
-            });
-
             // write each new block into the journal and address block
             let mut file_ids = vec![];
             let _main_loop = mark!(_capture_batch, "main_loop");
-            while let Some(trigram) = collector.next(&mut file_ids) {
+            while let Some(trigram) = { let _x = mark!(_main_loop, "collect_ids"); collector.next(&mut file_ids) } {
                 let _write_loop = mark!(_main_loop, "loop_body");
                 let (old_address, old_size) = loop {
                     let (tg, address, size) = address_reader.next()?.unwrap();
@@ -814,6 +808,13 @@ mod test {
 
     use super::{TRIGRAM_RANGE, IdCollector};
 
+    fn init() {
+        if std::env::var("RUST_LOG").is_err() {
+            std::env::set_var("RUST_LOG", "haunted_house=debug")
+        }    
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn simple_save_and_load() -> Result<()> {
         // build test data
@@ -988,6 +989,8 @@ mod test {
 
     #[tokio::test]
     async fn large_batch() -> Result<()> {
+        init();
+
         // build test data
         // let mut original = vec![];
         let mut trigrams = vec![];
