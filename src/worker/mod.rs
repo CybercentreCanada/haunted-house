@@ -15,7 +15,7 @@ mod database;
 mod database_sqlite;
 mod trigrams;
 mod encoding;
-mod journal;
+pub mod journal;
 mod manager;
 mod filter;
 mod filter_worker;

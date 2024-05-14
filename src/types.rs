@@ -2,6 +2,8 @@
 //! Module containing simple types used throughout the crate.
 //!
 
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc, Datelike};
 use serde::Serializer;
 use serde::{Serialize, Deserialize, de::Error};
@@ -183,6 +185,20 @@ impl std::fmt::Display for FilterID {
 impl From<i64> for FilterID {
     fn from(value: i64) -> Self {
         FilterID(value)
+    }
+}
+
+impl FromStr for FilterID {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = hex::decode(s)?;
+        let array: [u8; 8] = match bytes.try_into() {
+            Ok(array) => array,
+            Err(_) => return Err(anyhow::anyhow!("wrong id string length")),
+        };
+        let value = i64::from_le_bytes(array);
+        Ok(FilterID(value))
     }
 }
 

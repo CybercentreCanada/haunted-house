@@ -27,12 +27,11 @@ nix = { version = "0.28", features = ["fs"] }
 
 # Data proccessing and manipulating
 memmap2 = "0.7"
+cobs = "0.2"
 byteorder = "1.4"
 bitvec = { version = "1", features = ["serde"]}
 yara = { version = "0.16", features= ["vendored"] }
 # yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
-# bytes = "1.4"
-# sha2 = "0.10"
 
 # Parsing and serialization
 regex = "1.8"

@@ -1,23 +1,24 @@
 #![allow(unused)]
 
-use std::{collections::{hash_map::Entry, BTreeSet, HashMap}, fs::File, io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::Arc};
+use std::{cmp::Reverse, collections::{hash_map::Entry, BTreeSet, HashMap}, fs::File, io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::Arc};
 use std::iter::Peekable;
 
 // todo ensure ordered file ids
 
 use anyhow::{Context, Result};
+use bitvec::order::{BitOrder, Lsb0};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::info;
+use log::{error, info};
 use tokio::sync::mpsc;
 use itertools::Itertools;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+// use serde::{Deserialize, Serialize};
 
-use crate::{query::Query, timing::{mark, Capture, TimingCapture}, types::FilterID};
+use crate::{query::Query, timing::{mark, Capture, TimingCapture}, types::FilterID, worker::encoding::{encode_value_into, DecreasingEncoder}};
 use crate::worker::trigrams::TrigramIterator;
-use crate::worker::encoding::encode_into;
+use crate::worker::encoding::encode_into_increasing;
 
-use super::{encoding::{decode_into, StreamDecode}, intersection, into_trigrams, remove_file, trigrams::TrigramSet, union};
+use super::{encoding::{decode_decreasing_into, decode_into, decode_value, StreamDecode}, intersection, into_trigrams, remove_file, trigrams::TrigramSet, union};
 
 /// A convinence constant defining how many possible trigrams exist
 const TRIGRAM_RANGE: u64 = 1 << 24;
@@ -41,7 +42,7 @@ impl std::ops::Add<usize> for Size {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Address(u64);
 
 
@@ -133,9 +134,12 @@ impl JournalFilter {
             // read last record and truncate after
             if address > 0 {
                 let mut reader = BufReader::new(&mut data);
-                reader.seek(SeekFrom::Start(address))?;
+                if reader.seek(SeekFrom::Start(address))? != address {
+                    error!("{} data missing", id);
+                };
                 let mut buffer = vec![];
                 let size = reader.read_until(0, &mut buffer)?;
+                Self::load_block_data(Address(address), &mut buffer)?;
                 data.set_len(address + size as u64)?;
             }
             data.seek(SeekFrom::End(0))?;
@@ -180,7 +184,6 @@ impl JournalFilter {
         }
     }
 
-    #[must_use]
     pub async fn write_batch(self: &Arc<Self>, files: Vec<(u64, Vec<u8>)>) -> Result<bool> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -188,7 +191,6 @@ impl JournalFilter {
         }).await?
     }
 
-    #[must_use]
     fn _write_batch(&self, mut files: Vec<(u64, Vec<u8>)>) -> Result<bool> {
         let capture = &Capture::new();
         let guard = self.write_handle.lock();
@@ -204,21 +206,27 @@ impl JournalFilter {
             let _mark = mark!(_capture_batch, "setup_writer");
             let writer: Arc<std::fs::File> = guard.clone();
             let mut writer = BufWriter::with_capacity(BUFFER_SIZE, writer);
-            let mut encode_data_buffer = vec![];
-            let mut write_data_buffer = vec![];
+            let mut encode_data_buffer: Vec<u8> = vec![];
+            let mut write_data_buffer: Vec<u8> = vec![];
             let mut position = writer.stream_position()?;
             drop(_mark);
 
             // Prepare the trigram reader, make sure the files are sorted so the output later will
-            // always be sorted
+            // always be sorted (high to low)
             let _mark = mark!(_capture_batch, "prepare_input");
-            files.sort_unstable_by_key(|row|row.0);
+            files.sort_unstable_by_key(|row|Reverse(row.0));
             let mut collector = IdCollector::new_from_vec(&files);
 
             // start old and new address block
             let mut address_writer = AddressBuilder::new(self.directory.clone(), self.id)?;
             let mut address_reader = AddressReader::open(&self.directory, self.id)?;
             drop(_mark);
+
+            // start reading the file sequences in a background thread
+            let (address_sink, address_stream) = std::sync::mpsc::sync_channel::<(u32, Vec<u64>)>(4);
+            std::thread::spawn(|| {
+
+            });
 
             // write each new block into the journal and address block
             let mut file_ids = vec![];
@@ -238,17 +246,31 @@ impl JournalFilter {
                 let new_address = position;
                 {
                     let _mark = mark!(_write_loop, "process_batch");
-                    // file_ids.sort_unstable(); // we need them to be sorted, but they should be already
+                    // file_ids.sort_unstable(reverse); // we need them to be sorted, but they should be already
+
+                    // Write the header info
                     encode_data_buffer.clear();
-                    encode_into(&file_ids, &mut encode_data_buffer);
-                    let block = Block {
-                        previous: old_address,
-                        file_ids: &encode_data_buffer,
+                    let address_offset = match old_address {
+                        Some(address) => new_address - address.0,
+                        None => 0,
                     };
-                    write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
-                    let encoded_block = postcard::to_slice_cobs(&block, &mut write_data_buffer)?;
-                    position += encoded_block.len() as u64;
-                    writer.write_all(encoded_block)?;
+                    encode_value_into(address_offset, &mut encode_data_buffer);
+                    encode_value_into(file_ids[0], &mut encode_data_buffer);
+
+                    // write the bulk of the data
+                    DecreasingEncoder::new(file_ids[0], &mut encode_data_buffer).write(&file_ids[1..]);
+
+                    // prepare the buffer for cobs tranform with some extra space for header
+                    write_data_buffer.resize(cobs::max_encoding_length(encode_data_buffer.len()) + 128, 0);
+
+                    // do the cobs encoding
+                    let write_length = cobs::encode(&encode_data_buffer, &mut write_data_buffer);
+                    write_data_buffer.truncate(write_length);
+                    write_data_buffer.push(0);
+
+                    // write the data to the journal
+                    position += write_data_buffer.len() as u64;
+                    writer.write_all(&write_data_buffer)?;
                 }
 
                 // fill in the new address data
@@ -275,6 +297,19 @@ impl JournalFilter {
         Ok(true)
     }
 
+    fn load_block_data(address: Address, data: &mut [u8]) -> Result<Block<'_>> {
+        let bytes = cobs::decode_in_place(data).map_err(|_| anyhow::anyhow!("cobs"))?;
+        let data = &data[..bytes];
+        let (offset, data) = decode_value(data);
+        let (first_id, data) = decode_value(data);
+        Ok(Block { 
+            address, 
+            previous_offset: if offset > 0 { Some(offset) } else { None }, 
+            first_id, 
+            deltas: data 
+        })
+    }
+
     fn load_block<'a>(&self, address: Address, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
         let mut guard = self.read_handle.lock();
         let reader: &mut std::fs::File = &mut guard;
@@ -286,30 +321,8 @@ impl JournalFilter {
         reader.seek(SeekFrom::Start(address.0))?;
         buffer.clear();
         let _size = reader.read_until(0, buffer)?;
-        Ok(postcard::from_bytes_cobs(buffer)?)
+        Self::load_block_data(address, buffer)
     }
-
-    /// Read the file list for a single trigram
-    // fn read_all(&self) -> Result<Vec<Vec<u64>>> {
-    //     let mut guard = self.read_handle.lock();
-    //     let reader: &mut std::fs::File = &mut guard;
-    //     let mut reader = BufReader::new( reader);
-    //     let mut buffer = vec![];
-
-    //     let mut collected = Vec::with_capacity(TRIGRAM_RANGE as usize);
-    //     let mut addresses = AddressReader::open(&self.directory, self.id)?;
-    //     while let Some((_, mut address, size)) = addresses.next()? {
-    //         let mut trigrams = Vec::with_capacity(size.0 as usize);
-    //         while let Some(current) = address {
-    //             buffer.clear();
-    //             let block = self.load_block_into(current, &mut reader, &mut buffer)?;
-    //             decode_into(block.file_ids, &mut trigrams);
-    //             address = block.previous;
-    //         }
-    //         collected.push(trigrams);
-    //     }
-    //     Ok(collected)
-    // }
 
     #[cfg(test)]
     fn read_all(self: Arc<Self>) -> mpsc::Receiver<Result<(u32, Vec<u64>)>> {
@@ -325,14 +338,14 @@ impl JournalFilter {
 
                 let mut addresses = AddressReader::open(&self.directory, self.id)?;
                 while let Some((val, mut address, size)) = addresses.next()? {
-                    let mut trigrams = Vec::with_capacity(size.0 as usize);
+                    let mut file_ids = Vec::with_capacity(size.0 as usize);
                     while let Some(current) = address {
                         buffer.clear();
-                        let block = self.load_block_into(current, &mut reader, &mut buffer)?;
-                        decode_into(block.file_ids, &mut trigrams);
-                        address = block.previous;
+                        let block = self.load_block_into( current, &mut reader, &mut buffer)?;
+                        block.decode_into(&mut file_ids);
+                        address = block.previous();
                     }
-                    send.blocking_send(Ok((val, trigrams)))?;
+                    send.blocking_send(Ok((val, file_ids)))?;
                 }
                 Ok(())
             }();
@@ -346,6 +359,7 @@ impl JournalFilter {
     }
 
     /// Read the file list for a single trigram
+    /// set is sorted low to high
     fn read_trigram(&self, trigram: u32) -> Result<Vec<u64>> {
         let mut collected = vec![];
         let (mut address, size) = AddressReader::read_single(&self.directory, self.id, trigram)?;
@@ -355,13 +369,15 @@ impl JournalFilter {
         let mut buffer = vec![];
         while let Some(current) = address {
             let block = self.load_block(current, &mut buffer)?;
-            decode_into(block.file_ids, &mut collected);
-            address = block.previous;
+            block.decode_into(&mut collected);
+            address = block.previous();
         }
+        collected.reverse();
         Ok(collected)
     }
 
     /// Calculate the intersection of the file lists for all the given trigrams
+    /// set is sorted low to high
     fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
         // Handle corner cases
         if trigrams.is_empty() {
@@ -504,6 +520,7 @@ impl JournalFilter {
 struct TrigramCursor<'a> {
     host: &'a JournalFilter,
     current: Vec<u64>,
+    index: usize,
     next_address: Option<Address>,
     data_buffer: Vec<u8>,
 }
@@ -513,17 +530,20 @@ impl<'a> TrigramCursor<'a> {
         Self {
             host,
             next_address,
+            index: 0,
             data_buffer: vec![],
             current: vec![]
         }
     }
 
     fn fill(&mut self) -> Result<bool> {
-        if !self.current.is_empty() { return Ok(true) }
+        if self.index < self.current.len() { return Ok(true) }
         if let Some(address) = self.next_address {
             let block = self.host.load_block(address, &mut self.data_buffer)?;
-            self.next_address = block.previous;
-            decode_into(block.file_ids, &mut self.current);
+            self.next_address = block.previous();
+            self.index = 0;
+            self.current.clear();
+            block.decode_into(&mut self.current);
             return Ok(!self.current.is_empty())
         }
         Ok(false)
@@ -531,12 +551,13 @@ impl<'a> TrigramCursor<'a> {
 
     fn next(&mut self) -> Result<Option<u64>> {
         self.fill()?;
-        Ok(self.current.pop())
+        self.index += 1;
+        Ok(self.current.get(self.index - 1).cloned())
     }
 
     fn peek(&mut self) -> Result<Option<u64>> {
         self.fill()?;
-        Ok(self.current.last().cloned())
+        Ok(self.current.get(self.index).cloned())
     }
 }
 
@@ -759,10 +780,21 @@ impl AddressBuilder {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct Block<'a> {
-    previous: Option<Address>,
-    file_ids: &'a[u8],
+    address: Address,
+    previous_offset: Option<u64>,
+    first_id: u64,
+    deltas: &'a [u8],
+}
+
+impl Block<'_> {
+    fn previous(&self) -> Option<Address> {
+        self.previous_offset.map(|offset| Address(self.address.0 - offset))
+    }
+
+    fn decode_into(&self, output: &mut Vec<u64>) {
+        decode_decreasing_into(self.deltas, self.first_id, output)
+    }
 }
 
 #[cfg(test)]
@@ -775,7 +807,7 @@ mod test {
     use rand::{Rng, SeedableRng};
 
     use crate::worker::encoding::StreamDecode;
-    use crate::{query::Query, worker::encoding::encode_into};
+    use crate::{query::Query, worker::encoding::encode_into_increasing};
     use crate::types::FilterID;
     use super::JournalFilter;
     use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams, Bits, TrigramSet};
@@ -789,9 +821,9 @@ mod test {
         for ii in 1..102 {
             let mut data = vec![];
             if ii < 50 {
-                encode_into(&[0, 500], &mut data);
+                encode_into_increasing(&[0, 500], &mut data);
             } else {
-                encode_into(&[500, TRIGRAM_RANGE - 1], &mut data);
+                encode_into_increasing(&[500, TRIGRAM_RANGE - 1], &mut data);
             }
             trigrams.push((ii, data));
         }
@@ -817,7 +849,8 @@ mod test {
             let mut output = file.read_all();
 
             while let Some(row) = output.recv().await {
-                let (trigram, values) = row?;
+                let (trigram, mut values) = row?;
+                values.reverse();
                 if trigram == 0 {
                     assert_eq!(*values, (1..50).collect_vec());
                 } else if trigram == 500 {
@@ -878,7 +911,7 @@ mod test {
             
             while let Some(row) = output.recv().await {
                 let (trigram, values) = row?;
-                for file_index in values {
+                for &file_index in values.iter().rev() {
                     assert!(files[file_index as usize - 1].next().unwrap() == trigram as u64);
                 }
             }
@@ -893,16 +926,12 @@ mod test {
     /// rollback the tail file to simulate a failure mid write
     #[tokio::test]
     async fn failed_write() -> Result<()> {
-        // let x = setup_global_subscriber();
-
         let timer = std::time::Instant::now();
         // build test data
-        // let mut original = vec![];
         let mut trigrams = vec![];
 
         for ii in 1..21 {
-            let (a, b) = random_trigrams(ii);
-            // original.push(a);
+            let (_, b) = random_trigrams(ii);
             trigrams.push((ii, b));
         }
         println!("generate {:.2}", timer.elapsed().as_secs_f64());
@@ -937,7 +966,8 @@ mod test {
             let mut output = file.read_all();
             
             while let Some(row) = output.recv().await {
-                let (trigram, values) = row?;
+                let (trigram, mut values) = row?;
+                values.reverse();
                 for file_index in values {
                     let file_index = file_index as usize - 1;
                     if file_index < 10 {
@@ -990,7 +1020,8 @@ mod test {
             let mut output = file.read_all();
             
             while let Some(row) = output.recv().await {
-                let (trigram, values) = row?;
+                let (trigram, mut values) = row?;
+                values.reverse();
                 for file_index in values {
                     assert!(files[file_index as usize - 1].next().unwrap() == trigram as u64);
                 }
@@ -1014,7 +1045,7 @@ mod test {
             }
             indices.sort_unstable();
             let mut buffer = vec![];
-            encode_into(&indices, &mut buffer);
+            encode_into_increasing(&indices, &mut buffer);
             objects.push((ii + 1, buffer));
         }
 

@@ -36,7 +36,7 @@ use crate::query::Query;
 use crate::timing::{TimingCapture, mark, NullCapture};
 use crate::types::FilterID;
 
-use super::encoding::{cost_to_add, encode_into, decode_into, encoded_number_size};
+use super::encoding::{cost_to_add, encode_into_increasing, decode_into, encoded_number_size};
 use super::journal::IdCollector;
 use super::{intersection, into_trigrams, remove_file, union};
 
@@ -517,7 +517,7 @@ impl ExtensibleTrigramFile {
                     if content != new_content {
                         let _span = mark!(operations_span, "write_operation");
                         encode_data_buffer.clear();
-                        encode_into(&new_content, &mut encode_data_buffer);
+                        encode_into_increasing(&new_content, &mut encode_data_buffer);
                         encode_data_buffer.resize(active_segment.payload_bytes() as usize, 0);
                         write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
                         writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: address, data: Cow::Borrowed(&encode_data_buffer) }, &mut write_data_buffer)?)?;
@@ -570,7 +570,7 @@ impl ExtensibleTrigramFile {
                 if changed {
                     let _span = mark!(operations_span, "write_operation");
                     encode_data_buffer.clear();
-                    encode_into(&content, &mut encode_data_buffer);
+                    encode_into_increasing(&content, &mut encode_data_buffer);
                     // in case we are overwriting existing data that could have been longer due to
                     // delta encoding or similar we will add an extra zero if there is room to
                     // mark the end of the encoded data. If there is no extra space we don't need
@@ -608,7 +608,7 @@ impl ExtensibleTrigramFile {
                 let _span = mark!(operations_span, "write_operation");
                 writer.write_all(postcard::to_slice_cobs(&UpdateOperations::ExtendSegment { trigram, segment: address, new_segment }, &mut extend_data_buffer)?)?;
                 encode_data_buffer.clear();
-                encode_into(&content, &mut encode_data_buffer);
+                encode_into_increasing(&content, &mut encode_data_buffer);
                 write_data_buffer.resize(encode_data_buffer.len() + 128, 0);
                 writer.write_all(postcard::to_slice_cobs(&UpdateOperations::WriteSegment { segment: new_address, data: Cow::Borrowed(&encode_data_buffer) }, &mut write_data_buffer)?)?;
                 address = new_address;
@@ -1049,7 +1049,7 @@ mod test {
     use crate::query::Query;
     use crate::timing::{NullCapture, Capture};
     use crate::types::FilterID;
-    use crate::worker::encoding::encode_into;
+    use crate::worker::encoding::encode_into_increasing;
     use crate::worker::filter::ExtensibleTrigramFile;
     use crate::worker::journal::IdCollector;
     use crate::worker::trigrams::{build_buffer_to_offsets, random_trigrams, Bits};
@@ -1063,9 +1063,9 @@ mod test {
         for ii in 1..102 {
             let mut data = vec![];
             if ii < 50 {
-                encode_into(&[0, 500], &mut data);
+                encode_into_increasing(&[0, 500], &mut data);
             } else {
-                encode_into(&[500, TRIGRAM_RANGE - 1], &mut data);
+                encode_into_increasing(&[500, TRIGRAM_RANGE - 1], &mut data);
             }
             trigrams.push((ii, data));
         }
@@ -1108,9 +1108,9 @@ mod test {
         for ii in 1..102 {
             let mut data = vec![];
             if ii < 50 {
-                encode_into(&[0, 500], &mut data);
+                encode_into_increasing(&[0, 500], &mut data);
             } else {
-                encode_into(&[500, TRIGRAM_RANGE - 1], &mut data);
+                encode_into_increasing(&[500, TRIGRAM_RANGE - 1], &mut data);
             }
             trigrams.push((ii, data));
         }
@@ -1251,7 +1251,7 @@ mod test {
     #[test]
     fn out_of_order_batch() -> Result<()> {
         let mut bits = vec![];
-        encode_into(&[0], &mut bits);
+        encode_into_increasing(&[0], &mut bits);
 
         let mut trigrams_a = vec![];
         let mut trigrams_b = vec![];
@@ -1291,7 +1291,7 @@ mod test {
     #[test]
     fn out_of_order_batch_reversed() -> Result<()> {
         let mut bits = vec![];
-        encode_into(&[0], &mut bits);
+        encode_into_increasing(&[0], &mut bits);
 
         let mut trigrams_a = vec![];
         let mut trigrams_b = vec![];
@@ -1386,7 +1386,7 @@ mod test {
                 trigrams.push((ii << 16 | jj) as u64);
             }
             let mut buffer = vec![];
-            encode_into(&trigrams, &mut buffer);
+            encode_into_increasing(&trigrams, &mut buffer);
             objects.push(((ii + 1) as u64, buffer));
         }
 

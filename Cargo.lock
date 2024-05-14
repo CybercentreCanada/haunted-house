@@ -1667,6 +1667,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "clap",
+ "cobs",
  "deadpool",
  "env_logger",
  "futures",

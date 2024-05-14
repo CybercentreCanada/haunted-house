@@ -19,13 +19,13 @@ pub fn encode_value_into(mut value: u64, buffer: &mut Vec<u8>){
 #[cfg(test)]
 pub fn encode(indices: &[u64]) -> Vec<u8> {
     let mut buffer = vec![];
-    encode_into(indices, &mut buffer);
+    encode_into_increasing(indices, &mut buffer);
     return buffer
 }
 
 /// pack a set of u64 into a buffer
 #[inline(always)]
-pub fn encode_into(indices: &[u64], buffer: &mut Vec<u8>) {
+pub fn encode_into_increasing(indices: &[u64], buffer: &mut Vec<u8>) {
     if indices.is_empty() {
         return;
     }
@@ -45,6 +45,29 @@ pub fn encoded_number_size(value: u64) -> u32 {
     value.ilog2()/7 + 1
 }
 
+pub struct DecreasingEncoder<'a> {
+    last_value: u64,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'a> DecreasingEncoder<'a> {
+    pub fn new(first: u64, buffer: &'a mut Vec<u8>) -> Self {
+        Self {last_value: first, buffer }
+    }
+
+    pub fn write(&mut self, values: &[u64]) {
+        for &value in values {
+            self.push(value)
+        }
+    }
+
+    pub fn push(&mut self, value: u64) {
+        let delta = self.last_value - value - 1;
+        encode_value_into(delta, self.buffer);
+        self.last_value = value
+    }
+}
+
 /// (upper bound on) How many additional bytes are needed to add the given value to the given sequence
 pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
     match values.last() {
@@ -58,6 +81,32 @@ pub fn decode(data: &[u8]) -> (Vec<u64>, u32) {
     let mut values = vec![];
     let size = decode_into(data, &mut values);
     return (values, size)
+}
+
+pub fn decode_value(mut data: &[u8]) -> (u64, &[u8]) {
+    let mut value = (data[0] & 0b0111_1111) as u64;
+    let mut offset = 7;
+
+    while data[0] & 0b1000_0000 > 0 {
+        data = &data[1..];
+        if data.is_empty() || data[0] == 0 {
+            return (value, data)
+        }
+        value |= ((data[0] & 0b0111_1111) as u64) << offset;
+        offset += 7;
+    }
+
+    (value, &data[1..])
+}
+
+pub fn decode_decreasing_into(mut data: &[u8], mut value: u64, values: &mut Vec<u64>) {
+    values.push(value);
+    let mut delta;
+    while !data.is_empty() {
+        (delta, data) = decode_value(data);
+        value -= delta + 1;
+        values.push(value)
+    }
 }
 
 /// Unpack a sequence of u64 from a buffer
@@ -190,7 +239,7 @@ mod test {
 
     use crate::worker::encoding::{StreamDecode, StreamEncode};
 
-    use super::{decode, encode, encoded_number_size};
+    use super::{decode, decode_value, encode, encode_into_increasing, encode_value_into, encoded_number_size};
 
     #[test]
     fn round_trip() {
@@ -246,5 +295,42 @@ mod test {
 
         assert!(decode(&buffer1).0 == data);
         assert!(StreamDecode::new(&buffer1).collect_vec() == data);
+    }
+
+    // Testa
+    #[test]
+    fn decode_single_values() {
+        let empty: &[u8] = &[];
+
+        let mut buffer = vec![];
+        encode_value_into(1 << 13, &mut buffer);
+        assert_eq!(decode_value(&buffer), (1 << 13, empty));
+
+        let mut buffer = vec![];
+        encode_value_into(1 << 20, &mut buffer);        
+        assert_eq!(decode_value(&buffer), (1 << 20, empty));
+
+        let mut buffer = vec![];
+        encode_value_into(0xfff, &mut buffer);        
+        assert_eq!(decode_value(&buffer), (0xfff, empty));
+
+        let mut buffer = vec![];
+        encode_value_into(1 << 20, &mut buffer);        
+        buffer.push(0);
+        assert_eq!(decode_value(&buffer), (1 << 20, &[0u8][..]));
+
+        let mut buffer = vec![];
+        encode_value_into(1 << 20, &mut buffer);        
+        encode_value_into(1, &mut buffer);        
+        encode_value_into(0xfff, &mut buffer);        
+        buffer.push(0xff);
+
+        let (value, buffer) = decode_value(&buffer);
+        assert_eq!(value, 1 << 20);
+        let (value, buffer) = decode_value(buffer);
+        assert_eq!(value, 1);
+        let (value, buffer) = decode_value(buffer);
+        assert_eq!(value, 0xfff);
+        assert_eq!(buffer, &[0xff])
     }
 }

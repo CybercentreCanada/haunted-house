@@ -19,7 +19,7 @@ use crate::error::ErrorKinds;
 use crate::storage::BlobStorage;
 use crate::types::{Sha256, FilterID, FileInfo};
 
-use super::encoding::{encode_into, StreamEncode};
+use super::encoding::{encode_into_increasing, StreamEncode};
 
 /// A manager for a directory holding the trigram sets yet to be written to filters.
 pub struct TrigramCache {
@@ -324,7 +324,7 @@ impl TrigramFile {
             TrigramFile::Chunked(set) => {
                 let trigrams = set.iter().map(|v|v as u64).collect_vec();
                 let mut buffer = vec![];
-                encode_into(&trigrams, &mut buffer);
+                encode_into_increasing(&trigrams, &mut buffer);
                 buffer
             },
             TrigramFile::Deltas(data) => data,
@@ -666,7 +666,7 @@ pub (crate) fn random_trigrams(seed: u64) -> (Box<Bits>, Vec<u8>) {
 
     let trigrams = data.iter_ones().map(|i| i as u64).collect_vec();
     let mut buffer = vec![];
-    encode_into(&trigrams, &mut buffer);
+    encode_into_increasing(&trigrams, &mut buffer);
     (data, buffer)
 }
 
@@ -677,7 +677,7 @@ mod test {
     use itertools::Itertools;
     use rand::{thread_rng, Rng};
 
-    use crate::worker::{encoding::{encode_into, StreamDecode}, trigrams::{build_buffer, build_buffer_to_offsets}};
+    use crate::worker::{encoding::{encode_into_increasing, StreamDecode}, trigrams::{build_buffer, build_buffer_to_offsets}};
 
     use super::{Chunk, TrigramFile, TrigramSet};
 
@@ -772,7 +772,7 @@ mod test {
         let values = trigrams.iter().map(|v|v as u64).collect_vec();
 
         let mut buffer = vec![];
-        encode_into(&values, &mut buffer);
+        encode_into_increasing(&values, &mut buffer);
 
         assert_eq!(StreamDecode::new(&buffer).collect_vec(), values);
 

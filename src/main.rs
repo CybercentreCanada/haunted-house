@@ -2,7 +2,7 @@
     unused_crate_dependencies, noop_method_call, single_use_lifetimes, trivial_casts,
     unused_lifetimes, nonstandard_style, variant_size_differences)]
 #![deny(keyword_idents)]
-#![warn(clippy::missing_docs_in_private_items)]
+// #![warn(clippy::missing_docs_in_private_items)]
 #![allow(clippy::needless_return, clippy::while_let_on_iterator)]
 
 //!
@@ -76,7 +76,7 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(short, long)]
         default: bool,
-    }
+    },
 }
 
 
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
             let config = load_worker_config(config)?;
             config.init_directories()?;
             crate::worker::main(config).await?;
-        }
+        },
     }
 
     return Ok(())
