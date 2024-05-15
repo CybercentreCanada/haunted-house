@@ -30,6 +30,8 @@ use std::str::FromStr;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
+use types::FilterID;
+use worker::journal::JournalFilter;
 
 
 #[derive(Parser, Debug)]
@@ -77,6 +79,9 @@ enum Commands {
         #[arg(short, long)]
         default: bool,
     },
+    Defrag {
+        path: PathBuf
+    }
 }
 
 
@@ -139,6 +144,13 @@ async fn main() -> Result<()> {
             config.init_directories()?;
             crate::worker::main(config).await?;
         },
+        Commands::Defrag { path } => {
+            let file = path.file_name().unwrap().to_string_lossy();
+            let path = path.parent().unwrap();
+            let id: FilterID = file.parse()?;
+            let journal = JournalFilter::open(path.to_owned(), id).await?;
+            journal.defrag().await?;
+        }
     }
 
     return Ok(())

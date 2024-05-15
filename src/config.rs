@@ -301,6 +301,7 @@ impl BrokerSettings {
 const TRIGRAM_DIRECTORY: &str = "trigram-cache";
 /// The sub directory where filter data is stored
 const FILTER_DIRETORY: &str = "filters";
+pub const FILTER_TEMP_SUBDIRECTORY: &str = "tmp";
 /// The sub directory where sql database are stored
 const DATABASE_DIRETORY: &str = "sql-data";
 
@@ -309,6 +310,8 @@ impl WorkerSettings {
     pub fn init_directories(&self) -> Result<()> {
         std::fs::create_dir_all(self.get_trigram_cache_directory())?;
         std::fs::create_dir_all(self.get_filter_directory())?;
+        std::fs::remove_dir_all(self.get_filter_temp_directory())?;
+        std::fs::create_dir_all(self.get_filter_temp_directory())?;
         std::fs::create_dir_all(self.get_database_directory())?;
         return Ok(())
     }
@@ -321,6 +324,10 @@ impl WorkerSettings {
     /// Get a path object for the filter directory
     pub fn get_filter_directory(&self) -> PathBuf {
         self.data_path.join(FILTER_DIRETORY)
+    }
+
+    pub fn get_filter_temp_directory(&self) -> PathBuf {
+        self.get_filter_directory().join(FILTER_TEMP_SUBDIRECTORY)
     }
 
     /// Geth a path for the database directory
@@ -336,7 +343,7 @@ fn default_data_path() -> PathBuf { PathBuf::from("/data/") }
 /// Default soft cap data limit
 fn default_data_limit() -> u64 { 1 << 40 }
 /// Number of bytes that will be reserved from the soft cap for transient purposes.
-fn default_data_reserve() -> u64 { 5 << 30 }
+fn default_data_reserve() -> u64 { 100 << 30 }
 /// The default size for the initial segments of the filter files
 fn default_initial_segment_size() -> u32 { 128 }
 /// The default size for extended segments for the filter files

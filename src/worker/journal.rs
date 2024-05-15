@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use bitvec::order::{BitOrder, Lsb0};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use log::{error, info};
+use rand::{thread_rng, Rng};
 use tokio::sync::mpsc;
 use itertools::Itertools;
 use parking_lot::Mutex;
 // use serde::{Deserialize, Serialize};
 
-use crate::{query::Query, timing::{mark, Capture, TimingCapture}, types::FilterID, worker::encoding::{encode_value_into, DecreasingEncoder}};
+use crate::{config::FILTER_TEMP_SUBDIRECTORY, query::Query, timing::{mark, Capture, TimingCapture}, types::FilterID, worker::encoding::{encode_value_into, DecreasingEncoder}};
 use crate::worker::trigrams::TrigramIterator;
 use crate::worker::encoding::encode_into_increasing;
 
@@ -28,7 +29,7 @@ const HEADER_MAGIC: u32 = 0xd42e1880;
 const HEADER_SIZE: u64 = 4;
 
 const TAIL_ROW_SIZE: u64 = 8 + 8;
-const TAIL_FILE_SIZE: u64 = TAIL_ROW_SIZE * TRIGRAM_RANGE;
+const TAIL_FILE_SIZE: u64 = TAIL_ROW_SIZE * TRIGRAM_RANGE + 8;
 
 const BUFFER_SIZE: usize = 1 << 14;
 
@@ -51,7 +52,7 @@ pub struct JournalFilter {
     id: FilterID,
     /// directory where files related to this journal are stored, other things will be in this directory
     directory: PathBuf,
-    /// A file handle used while writing 
+    /// A file handle used while writing
     write_handle: Mutex<Arc<File>>,
     /// A file handle used while reading. This could be a pool if we are having search throughput issues.
     read_handle: Mutex<File>,
@@ -72,7 +73,6 @@ impl JournalFilter {
         // prepare file
         let location = directory.join(format!("{id}"));
         let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&location).context("Creating data file")?;
-        data.set_len(HEADER_SIZE).context("Adjusting file size")?;            
 
         // write header
         data.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
@@ -83,10 +83,10 @@ impl JournalFilter {
 
         // return object
         let reader = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?;
-        Ok(Arc::new(Self { 
+        Ok(Arc::new(Self {
             write_handle: Mutex::new(Arc::new(data)),
-            read_handle: Mutex::new(reader), 
-            directory, 
+            read_handle: Mutex::new(reader),
+            directory,
             id,
             running: std::sync::atomic::AtomicBool::new(true),
             running_notice: tokio::sync::Notify::new(),
@@ -97,6 +97,8 @@ impl JournalFilter {
         tokio::task::spawn_blocking(move || {
             // open file
             let location = directory.join(format!("{id}"));
+            
+            // check for files that haven't been fully initialized
             if let Ok(metadata) = location.metadata() {
                 if metadata.len() <= 4 {
                     AddressBuilder::clear_all(&directory, id);
@@ -106,6 +108,10 @@ impl JournalFilter {
             if !location.exists() {
                 return Self::blocking_new(directory, id)
             }
+
+            // if a defrag just finished but the files are still being installed finish that now
+            Self::_install_defrag(&directory, id);
+
             let mut data = std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(&location).context("Open file to write")?;
 
             // verify header
@@ -115,11 +121,11 @@ impl JournalFilter {
                 if let Ok(metadata) = location.metadata() {
                     size = metadata.len();
                 }
-    
+
                 return Err(anyhow::anyhow!("Corrupt data file: header magic wrong {read_magic:08x}; {location:?}; size: {size}"));
             }
-    
-            // clear temporary 
+
+            // clear temporary
             AddressBuilder::init_ready(&directory, id)?;
 
             // Open current tail and read last location
@@ -143,18 +149,36 @@ impl JournalFilter {
                 data.set_len(address + size as u64)?;
             }
             data.seek(SeekFrom::End(0))?;
-            
+
             // return object
-            let reader = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?;
-            Ok(Arc::new(Self { 
+            let reader = Self::open_reader(&directory, id)?;
+            Ok(Arc::new(Self {
                 write_handle: Mutex::new(Arc::new(data)),
-                read_handle: Mutex::new(reader), 
-                directory, 
+                read_handle: Mutex::new(reader),
+                directory,
                 id,
                 running: std::sync::atomic::AtomicBool::new(true),
                 running_notice: tokio::sync::Notify::new(),
             }))
         }).await?
+    }
+
+    fn open_reader(directory: &Path, id: FilterID) -> Result<File> {
+        let location = directory.join(format!("{}", id));
+        Ok(std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?)
+    }
+
+    fn _open_reader(&self) -> Result<File> {
+        Self::open_reader(&self.directory, self.id)
+    }
+
+    fn open_writer(directory: &Path, id: FilterID) -> Result<File> {
+        let location = directory.join(format!("{}", id));
+        Ok(std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(&location).context("Open file to write")?)
+    }
+
+    fn _open_writer(&self) -> Result<File> {
+        Self::open_writer(&self.directory, self.id)
     }
 
     pub fn delete(&self) -> Result<()> {
@@ -182,6 +206,94 @@ impl JournalFilter {
         if self.is_running() {
             self.running_notice.notified().await
         }
+    }
+
+    pub async fn defrag(self: &Arc<Self>) -> Result<bool> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            this._defrag()
+        }).await?
+    }
+
+    fn _defrag(&self) -> Result<bool> {
+        let capture = &Capture::new();
+        let mut guard = self.write_handle.lock();
+
+        if !self.is_running() {
+            return Ok(false)
+        }
+
+        // create temp files to write into
+        let temp_journal_path = self.directory.join(FILTER_TEMP_SUBDIRECTORY).join(thread_rng().gen::<u128>().to_string());
+        let mut temp_journal = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&temp_journal_path).context("Creating data file")?;
+        let mut address_writer = AddressBuilder::new(self.directory.clone(), self.id)?;
+       
+        // write header
+        temp_journal.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
+        let mut position = 4u64;
+
+        // spawn thread to read defragmented data
+        let mut trigram_stream = self.read_all();
+
+        // write the data as it comes in
+        let mut encode_data_buffer = vec![];
+        let mut write_data_buffer = vec![];
+        while let Some(trigram) = trigram_stream.blocking_recv() {
+            let (trigram, file_ids) = trigram?;
+
+            // handle trigrams that never occured
+            if file_ids.is_empty() {
+                address_writer.write(trigram, None, Size(0))?;
+                continue
+            }
+
+            // write out the tail file for a defragmented section
+            address_writer.write(trigram, Some(Address(position)), Size(file_ids.len() as u64))?;
+
+            // Encode the file ids
+            Self::encode_block_data(&mut encode_data_buffer, None, position, &file_ids, &mut write_data_buffer).context("defrag::encode_block_data")?;
+
+            // write the data to the journal
+            position += write_data_buffer.len() as u64;
+            temp_journal.write_all(&write_data_buffer)?;
+        }
+        
+        // write trailing data
+        let tail_location = address_writer.finish(0)?;
+        temp_journal.flush()?;
+        temp_journal.sync_all()?;
+
+        // Install the files
+        let mut reader = self.read_handle.lock();
+        self._prepare_install_defrag(&temp_journal_path, &tail_location)?;
+        Self::_install_defrag(&self.directory, self.id)?;
+
+        // replace the file handles in the locks
+        *reader = self._open_reader()?;
+        *guard = Arc::new(self._open_writer()?);
+        guard.seek(SeekFrom::End(0))?;
+
+        Ok(true)
+    }
+
+    fn _prepare_install_defrag(&self, temp_data: &Path, temp_tails: &Path) -> Result<()> {
+        std::fs::rename(temp_data, self.directory.join(format!(".{}", self.id)))?;
+        std::fs::rename(temp_tails, self.directory.join(format!(".{}.tail", self.id)))?;
+        Ok(())
+    }
+
+    fn _install_defrag(directory: &Path, id: FilterID) -> Result<()> {
+        let temp_data = directory.join(format!(".{}", id));
+        let temp_tails = directory.join(format!(".{}.tail", id));
+        if temp_tails.exists() {
+            if temp_data.exists() {        
+                std::fs::rename(temp_data, directory.join(format!("{}", id)))?;
+            }
+            std::fs::rename(temp_tails, directory.join(format!("{}.tail", id)))?;
+        } else {
+            remove_file(&temp_data)?;
+        }
+        Ok(())
     }
 
     pub async fn write_batch(self: &Arc<Self>, files: Vec<(u64, Vec<u8>)>) -> Result<bool> {
@@ -242,25 +354,7 @@ impl JournalFilter {
                     let _mark = mark!(_write_loop, "process_batch");
                     // file_ids.sort_unstable(reverse); // we need them to be sorted, but they should be already
 
-                    // Write the header info
-                    encode_data_buffer.clear();
-                    let address_offset = match old_address {
-                        Some(address) => new_address - address.0,
-                        None => 0,
-                    };
-                    encode_value_into(address_offset, &mut encode_data_buffer);
-                    encode_value_into(file_ids[0], &mut encode_data_buffer);
-
-                    // write the bulk of the data
-                    DecreasingEncoder::new(file_ids[0], &mut encode_data_buffer).write(&file_ids[1..]);
-
-                    // prepare the buffer for cobs tranform with some extra space for header
-                    write_data_buffer.resize(cobs::max_encoding_length(encode_data_buffer.len()) + 128, 0);
-
-                    // do the cobs encoding
-                    let write_length = cobs::encode(&encode_data_buffer, &mut write_data_buffer);
-                    write_data_buffer.truncate(write_length);
-                    write_data_buffer.push(0);
+                    Self::encode_block_data(&mut encode_data_buffer, old_address, new_address, &file_ids, &mut write_data_buffer)?;
 
                     // write the data to the journal
                     position += write_data_buffer.len() as u64;
@@ -271,7 +365,7 @@ impl JournalFilter {
                 address_writer.write(trigram, Some(Address(new_address)), old_size + file_ids.len())?;
             }
             drop(_main_loop);
-            
+
             // finish writing incomplete sections
             {
                 let _mark = mark!(_capture_batch, "finish_addresses");
@@ -284,11 +378,34 @@ impl JournalFilter {
             let _mark = mark!(_capture_batch, "finish");
             let mut writer = writer.into_inner()?;
             writer.flush()?;
-            writer.sync_data()?;
-            address_writer.install()?;
+            writer.sync_all()?;
+            address_writer.install(1 + address_reader.read_generation().context("read_generation")?)?;
         }
         info!("write_batch metrics \n{}", capture.format());
         Ok(true)
+    }
+
+    fn encode_block_data(encode_data_buffer: &mut Vec<u8>, old_address: Option<Address>, new_address: u64, file_ids: &[u64], write_data_buffer: &mut Vec<u8>) -> Result<()> {
+        // Write the header info
+        encode_data_buffer.clear();
+        let address_offset = match old_address {
+            Some(address) => new_address - address.0,
+            None => 0,
+        };
+        encode_value_into(address_offset, encode_data_buffer);
+        encode_value_into(file_ids[0], encode_data_buffer);
+
+        // write the bulk of the data
+        DecreasingEncoder::new(file_ids[0], encode_data_buffer).write(&file_ids[1..]);
+
+        // prepare the buffer for cobs tranform with some extra space for header
+        write_data_buffer.resize(cobs::max_encoding_length(encode_data_buffer.len()) + 128, 0);
+
+        // do the cobs encoding
+        let write_length = cobs::encode(&encode_data_buffer, write_data_buffer);
+        write_data_buffer.truncate(write_length);
+        write_data_buffer.push(0);
+        Ok(())
     }
 
     fn load_block_data(address: Address, data: &mut [u8]) -> Result<Block<'_>> {
@@ -296,11 +413,11 @@ impl JournalFilter {
         let data = &data[..bytes];
         let (offset, data) = decode_value(data);
         let (first_id, data) = decode_value(data);
-        Ok(Block { 
-            address, 
-            previous_offset: if offset > 0 { Some(offset) } else { None }, 
-            first_id, 
-            deltas: data 
+        Ok(Block {
+            address,
+            previous_offset: if offset > 0 { Some(offset) } else { None },
+            first_id,
+            deltas: data
         })
     }
 
@@ -308,34 +425,41 @@ impl JournalFilter {
         let mut guard = self.read_handle.lock();
         let reader: &mut std::fs::File = &mut guard;
         let mut reader = BufReader::new(reader);
-        self.load_block_into(address, &mut reader, buffer)
+        Self::load_block_into(address, &mut reader, buffer)
     }
 
-    fn load_block_into<'a>(&self, address: Address, reader: &mut BufReader<&mut File>, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
+    fn load_block_into<'a>(address: Address, reader: &mut BufReader<&mut File>, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
         reader.seek(SeekFrom::Start(address.0))?;
         buffer.clear();
         let _size = reader.read_until(0, buffer)?;
         Self::load_block_data(address, buffer)
     }
 
-    #[cfg(test)]
-    fn read_all(self: Arc<Self>) -> mpsc::Receiver<Result<(u32, Vec<u64>)>> {
+    fn read_all(&self) -> mpsc::Receiver<Result<(u32, Vec<u64>)>> {
         let (send, recv) = mpsc::channel(32);
+
+        let directory = self.directory.clone();
+        let id = self.id;
+        let mut reader = match self._open_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                _ = send.send(Err(err.into()));
+                return recv
+            },
+        };
 
         tokio::task::spawn_blocking(move ||{
             let send_err = send.clone();
             let result = move || -> Result<()> {
-                let mut guard = self.read_handle.lock();
-                let reader: &mut std::fs::File = &mut guard;
-                let mut reader = BufReader::new( reader);
+                let mut reader = BufReader::new(&mut reader);
                 let mut buffer = vec![];
 
-                let mut addresses = AddressReader::open(&self.directory, self.id)?;
+                let mut addresses = AddressReader::open(&directory, id)?;
                 while let Some((val, mut address, size)) = addresses.next()? {
                     let mut file_ids = Vec::with_capacity(size.0 as usize);
                     while let Some(current) = address {
                         buffer.clear();
-                        let block = self.load_block_into( current, &mut reader, &mut buffer)?;
+                        let block = Self::load_block_into( current, &mut reader, &mut buffer)?;
                         block.decode_into(&mut file_ids);
                         address = block.previous();
                     }
@@ -456,7 +580,7 @@ impl JournalFilter {
     }
 
     /// Actual logic for the 'query' methods
-    fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {        
+    fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {
         if !self.is_running() {
             return Err(anyhow::anyhow!("Filter stopping."));
         }
@@ -654,7 +778,7 @@ impl AddressReader {
             // move forward as needed
             let new_location = trigram as u64 * TAIL_ROW_SIZE;
             let forward_move = new_location - location;
-            if forward_move > 0 {   
+            if forward_move > 0 {
                 tail.seek_relative(forward_move as i64)?;
                 location += forward_move;
             }
@@ -687,6 +811,12 @@ impl AddressReader {
         Ok((address, size))
     }
 
+    fn read_generation(mut self) -> Result<u64> {
+        self.handle.seek(SeekFrom::Start(TRIGRAM_RANGE * TAIL_ROW_SIZE))?;
+        let generation = self.handle.read_u64::<LittleEndian>()?;
+        Ok(generation)
+    }
+
     fn next(&mut self) -> Result<Option<(u32, Option<Address>, Size)>> {
         if self.next_trigram as u64 >= TRIGRAM_RANGE {
             Ok(None)
@@ -701,11 +831,12 @@ impl AddressReader {
             };
             let size = Size(self.handle.read_u64::<LittleEndian>()?);
             Ok(Some((trigram, address, size)))
-        }   
+        }
     }
 }
 
 struct AddressBuilder {
+    location: PathBuf,
     directory: PathBuf,
     id: FilterID,
     expected_trigram: u32,
@@ -714,9 +845,11 @@ struct AddressBuilder {
 
 impl AddressBuilder {
     fn new(directory: PathBuf, id: FilterID) -> Result<Self> {
-        let tail_location = directory.join(format!(".{id}.tail"));
-        let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(tail_location).context("Creating tail file")?;
+        let temp_id: u128 = thread_rng().gen();
+        let tail_location = directory.join(FILTER_TEMP_SUBDIRECTORY).join(format!("{temp_id}"));
+        let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&tail_location).context("Creating tail file")?;
         Ok(Self {
+            location: tail_location,
             directory,
             id,
             expected_trigram: 0,
@@ -732,7 +865,6 @@ impl AddressBuilder {
     }
 
     fn init_ready(directory: &Path, id: FilterID) -> Result<()> {
-        Self::clear_temp(directory, id)?;
         if !directory.join(format!("{id}.tail")).exists() {
             Self::init_empty(directory, id)?;
         }
@@ -740,13 +872,7 @@ impl AddressBuilder {
     }
 
     fn clear_all(directory: &Path, id: FilterID) -> Result<()> {
-        Self::clear_temp(directory, id);
         let tail_location = directory.join(format!("{id}.tail"));
-        remove_file(&tail_location)
-    }
-
-    fn clear_temp(directory: &Path, id: FilterID) -> Result<()> {
-        let tail_location = directory.join(format!(".{id}.tail"));
         remove_file(&tail_location)
     }
 
@@ -763,13 +889,21 @@ impl AddressBuilder {
         Ok(())
     }
 
-    fn install(self) -> Result<()> {
+    fn finish(mut self, generation: u64) -> Result<PathBuf> {
+        self.handle.write_u64::<LittleEndian>(generation);
         let mut handle = self.handle.into_inner()?;
         handle.flush()?;
-        handle.sync_data()?;
-        let temp = self.directory.join(format!(".{}.tail", self.id));
+        handle.sync_all()?;
+        Ok(self.location)
+    }
+
+    fn install(mut self, generation: u64) -> Result<()> {
+        self.handle.write_u64::<LittleEndian>(generation);
+        let mut handle = self.handle.into_inner()?;
+        handle.flush()?;
+        handle.sync_all()?;
         let active = self.directory.join(format!("{}.tail", self.id));
-        std::fs::rename(temp, active)?;
+        std::fs::rename(self.location, active)?;
         Ok(())
     }
 }
@@ -801,6 +935,7 @@ mod test {
     use rand::{Rng, SeedableRng};
 
     use crate::worker::encoding::StreamDecode;
+    use crate::worker::journal::AddressReader;
     use crate::{query::Query, worker::encoding::encode_into_increasing};
     use crate::types::FilterID;
     use super::JournalFilter;
@@ -811,7 +946,7 @@ mod test {
     fn init() {
         if std::env::var("RUST_LOG").is_err() {
             std::env::set_var("RUST_LOG", "haunted_house=debug")
-        }    
+        }
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
@@ -843,7 +978,7 @@ mod test {
         // Read it again
         {
             let timestamp = std::time::Instant::now();
-            let file = JournalFilter::open(location, id).await?;
+            let file = JournalFilter::open(location.clone(), id).await?;
             println!("Open time: {}", timestamp.elapsed().as_secs_f64());
 
             let timestamp = std::time::Instant::now();
@@ -865,6 +1000,9 @@ mod test {
 
             println!("Read time: {}; {} each", timestamp.elapsed().as_secs_f64(), timestamp.elapsed().as_secs_f64()/TRIGRAM_RANGE as f64);
         }
+
+        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 1);
+
         Ok(())
     }
 
@@ -905,11 +1043,11 @@ mod test {
 
         // Recreate the trigrams
         {
-            let file = JournalFilter::open(location, id).await?;
+            let file = JournalFilter::open(location.clone(), id).await?;
 
             let mut files = trigrams.iter().map(|row|StreamDecode::new(&row.1)).collect_vec();
             let mut output = file.read_all();
-            
+
             while let Some(row) = output.recv().await {
                 let (trigram, values) = row?;
                 for &file_index in values.iter().rev() {
@@ -921,6 +1059,8 @@ mod test {
                 assert!(file.next().is_none())
             }
         }
+
+        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 3);
         Ok(())
     }
 
@@ -961,11 +1101,11 @@ mod test {
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let file = JournalFilter::open(location, id).await?;
+            let file = JournalFilter::open(location.clone(), id).await?;
 
             let mut files = trigrams.iter().take(10).map(|row|StreamDecode::new(&row.1)).collect_vec();
             let mut output = file.read_all();
-            
+
             while let Some(row) = output.recv().await {
                 let (trigram, mut values) = row?;
                 values.reverse();
@@ -984,6 +1124,7 @@ mod test {
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
+        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 1);
         Ok(())
     }
 
@@ -1013,15 +1154,15 @@ mod test {
             file.write_batch(trigrams.clone()).await?;
             println!("write data: {:.2}", time.elapsed().as_secs_f64());
         }
-        
+
         // Recreate the trigrams
         let timer = std::time::Instant::now();
         {
-            let file = JournalFilter::open(location, id).await?;
+            let file = JournalFilter::open(location.clone(), id).await?;
 
             let mut files = trigrams.iter().map(|row|StreamDecode::new(&row.1)).collect_vec();
             let mut output = file.read_all();
-            
+
             while let Some(row) = output.recv().await {
                 let (trigram, mut values) = row?;
                 values.reverse();
@@ -1035,6 +1176,7 @@ mod test {
             }
         }
         println!("read {}", timer.elapsed().as_secs_f64());
+        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 1);
         Ok(())
     }
 
@@ -1084,7 +1226,7 @@ mod test {
         file.write_batch(vec![(2, trigrams2)]).await?;
         println!("write 3");
         file.write_batch(vec![(3, trigrams3)]).await?;
-        
+
         // run literal query that should only be in this file
         println!("query 1");
         let query = Query::Literal(b"This shouldn't occur in any files and the odds of a false positive should be low.".to_vec());
