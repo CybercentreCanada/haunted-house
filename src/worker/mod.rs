@@ -98,16 +98,7 @@ pub async fn main(config: crate::config::WorkerSettings) -> Result<()> {
 
     info!("Waiting for data flush...");
     data.stop().await;
-    // let result = tokio::select! {
-    //     res = api => res,
-    //     res = manager => res,
-    // };
-
-    // match result {
-    //     Ok(Err(err)) => error!("Server crashed: {err} {}", err.root_cause()),
-    //     Err(err) => error!("Server crashed: {err}"),
-    //     _ => {}
-    // };
+    
     return Ok(())
 }
 

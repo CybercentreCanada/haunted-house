@@ -29,6 +29,7 @@ pub struct WorkerState {
     pub trigrams: Arc<TrigramCache>,
     pub config: WorkerSettings,
     pub resource_tracker: ResourceTracker,
+    pub defrag_token: tokio::sync::Semaphore,
 }
 
 // type FilterInfo = (FilterWorker, Arc<Notify>, watch::Sender<bool>);
@@ -48,6 +49,7 @@ impl WorkerState {
             config,
             trigrams,
             resource_tracker: ResourceTracker::start(),
+            defrag_token: tokio::sync::Semaphore::new(1),
         });
 
         // Start workers for every filter
@@ -277,6 +279,20 @@ impl WorkerState {
             }
         }
     }
+    
+    /// Get the number of fragments we are willing to accept as a function of 
+    /// how long its been since this index was written to.
+    /// This curve has 100 at 2 hours.
+    /// as the time decreases the number of generations climbs to infinity, we don't want to defrag an active index
+    /// as the time increases the number of generations drops so that at a day of inactivity it will defrag 
+    /// any with 4 or more generations, at around 4 days of inactivity defraging will be run for
+    /// ANY fragmentation at all
+    fn defrag_limit(since_last_write: std::time::Duration) -> u64 {
+        let seconds = since_last_write.as_secs_f64();
+        let hours = seconds/(60.0 * 60.0);
+        let limit = 100.0/(hours - 1.0);
+        limit.floor() as u64
+    }
 
     pub async fn ingest_feeder(self: Arc<Self>, id: FilterID, worker: Arc<JournalFilter>) {
         while let Err(err) = self._ingest_feeder(id, worker.clone()).await {
@@ -300,6 +316,15 @@ impl WorkerState {
 
             // figure out if we have enough files to process
             if batch.is_empty() {
+                let last_write = worker.last_write().await?;
+                let generation = worker.generation_counter().await?;
+                if generation > Self::defrag_limit(last_write) {
+                    if let Ok(_token) = self.defrag_token.try_acquire() {
+                        worker.defrag().await?;
+                        continue
+                    }
+                }
+
                 _ = tokio::time::timeout(tokio::time::Duration::from_secs(600), worker.notified()).await;
                 continue
             } else if batch.len() < batch_size as usize {

@@ -310,7 +310,11 @@ impl WorkerSettings {
     pub fn init_directories(&self) -> Result<()> {
         std::fs::create_dir_all(self.get_trigram_cache_directory())?;
         std::fs::create_dir_all(self.get_filter_directory())?;
-        std::fs::remove_dir_all(self.get_filter_temp_directory())?;
+        if let Err(err) = std::fs::remove_dir_all(self.get_filter_temp_directory()) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        };
         std::fs::create_dir_all(self.get_filter_temp_directory())?;
         std::fs::create_dir_all(self.get_database_directory())?;
         return Ok(())

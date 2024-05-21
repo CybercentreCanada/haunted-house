@@ -79,7 +79,7 @@ impl JournalFilter {
         data.sync_all()?;
 
         // setup tail
-        AddressBuilder::init_empty(&directory, id)?;
+        AddressBuilder::init_empty(&directory, id).context("init empty address table")?;
 
         // return object
         let reader = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?;
@@ -165,7 +165,7 @@ impl JournalFilter {
 
     fn open_reader(directory: &Path, id: FilterID) -> Result<File> {
         let location = directory.join(format!("{}", id));
-        Ok(std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?)
+        std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(location).context("Open file to read")
     }
 
     fn _open_reader(&self) -> Result<File> {
@@ -174,7 +174,7 @@ impl JournalFilter {
 
     fn open_writer(directory: &Path, id: FilterID) -> Result<File> {
         let location = directory.join(format!("{}", id));
-        Ok(std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(&location).context("Open file to write")?)
+        std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(location).context("Open file to write")
     }
 
     fn _open_writer(&self) -> Result<File> {
@@ -402,7 +402,7 @@ impl JournalFilter {
         write_data_buffer.resize(cobs::max_encoding_length(encode_data_buffer.len()) + 128, 0);
 
         // do the cobs encoding
-        let write_length = cobs::encode(&encode_data_buffer, write_data_buffer);
+        let write_length = cobs::encode(encode_data_buffer, write_data_buffer);
         write_data_buffer.truncate(write_length);
         write_data_buffer.push(0);
         Ok(())
@@ -443,7 +443,7 @@ impl JournalFilter {
         let mut reader = match self._open_reader() {
             Ok(reader) => reader,
             Err(err) => {
-                _ = send.send(Err(err.into()));
+                _ = send.blocking_send(Err(err));
                 return recv
             },
         };
@@ -633,6 +633,21 @@ impl JournalFilter {
             },
         }
     }
+
+    pub async fn generation_counter(self: &Arc<Self>) -> Result<u64> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            AddressReader::open(&this.directory, this.id)?.read_generation()
+        }).await?
+    }
+
+    pub async fn last_write(self: &Arc<Self>) -> Result<std::time::Duration> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let metadata = this.write_handle.lock().metadata()?;
+            Ok(metadata.modified()?.elapsed()?)
+        }).await?
+    }    
 }
 
 struct TrigramCursor<'a> {
@@ -846,7 +861,9 @@ struct AddressBuilder {
 impl AddressBuilder {
     fn new(directory: PathBuf, id: FilterID) -> Result<Self> {
         let temp_id: u128 = thread_rng().gen();
-        let tail_location = directory.join(FILTER_TEMP_SUBDIRECTORY).join(format!("{temp_id}"));
+        let temp_dir = directory.join(FILTER_TEMP_SUBDIRECTORY);
+        std::fs::create_dir_all(&temp_dir)?;
+        let tail_location = temp_dir.join(format!("{temp_id}"));
         let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&tail_location).context("Creating tail file")?;
         Ok(Self {
             location: tail_location,
@@ -859,7 +876,7 @@ impl AddressBuilder {
 
     fn init_empty(directory: &Path, id: FilterID) -> Result<()> {
         let tail_location = directory.join(format!("{id}.tail"));
-        let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(tail_location).context("Creating tail file")?;
+        let tail = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(tail_location).context("Creating empty tail file")?;
         tail.set_len(TAIL_FILE_SIZE).context("Initializing tail file")?;
         Ok(())
     }
@@ -1061,6 +1078,29 @@ mod test {
         }
 
         assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 3);
+
+        {
+            let file = JournalFilter::open(location.clone(), id).await?;
+            file.defrag().await.unwrap();
+            assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 0);
+
+            let mut files = trigrams.iter().map(|row|StreamDecode::new(&row.1)).collect_vec();
+            let mut output = file.read_all();
+
+            while let Some(row) = output.recv().await {
+                let (trigram, values) = row?;
+                for &file_index in values.iter().rev() {
+                    assert!(files[file_index as usize - 1].next().unwrap() == trigram as u64);
+                }
+            }
+
+            for mut file in files {
+                assert!(file.next().is_none())
+            }
+        }
+
+        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 0);
+
         Ok(())
     }
 
