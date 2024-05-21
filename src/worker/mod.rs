@@ -17,8 +17,6 @@ mod trigrams;
 mod encoding;
 pub mod journal;
 mod manager;
-mod filter;
-mod filter_worker;
 
 
 #[derive(Serialize, Deserialize)]
