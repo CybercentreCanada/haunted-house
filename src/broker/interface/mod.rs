@@ -67,7 +67,7 @@ struct TokenMiddlewareImpl<E> {
     core: Arc<HouseCore>,
 }
 
-#[poem::async_trait]
+// #[async_trait]
 impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
     type Output = E::Output;
 
@@ -97,6 +97,7 @@ impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
 
 /// An internal interface that allows access to system level status information.
 /// This interface is available as long as any role is authenticated.
+#[derive(Clone)]
 struct StatusInterface {
     /// Pointer to server data
     core: Arc<HouseCore>
@@ -116,6 +117,7 @@ impl StatusInterface {
 
 /// An internal interface that allows access to search operations.
 /// This interface is tied to the 'Search' role.
+#[derive(Clone)]
 struct SearcherInterface {
     /// Pointer to server data
     core: Arc<HouseCore>

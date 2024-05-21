@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, Context};
-use aws_sdk_s3::types::ByteStream;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::primitives::ByteStream;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use futures::StreamExt;
 use log::error;
+// use rustls::client::WebPkiServerVerifier;
 // use reqwest_middleware::ClientWithMiddleware;
 // use reqwest_retry::RetryTransientMiddleware;
 // use reqwest_retry::policies::ExponentialBackoff;
@@ -48,7 +50,7 @@ impl Default for BlobStorageConfig {
     }
 }
 
-fn url_to_other_config(urls: &Vec<String>) -> Result<BlobStorageConfig> {
+fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
     if urls.len() != 1 {
         return Err(ErrorKinds::FilestoreError("Only one filestore url expected.".to_string()).into())
     }
@@ -557,10 +559,9 @@ impl AzureBlobStore {
                 },
                 None => false,
             };
-            if &azure_core::error::ErrorKind::DataConversion == err.kind() {
-                if err.to_string() == "header not found x-ms-delete-type-permanent" {
-                    ignore = true;
-                }
+            const NOT_FOUND: &str = "header not found x-ms-delete-type-permanent";
+            if &azure_core::error::ErrorKind::DataConversion == err.kind() && err.to_string() == NOT_FOUND {
+                ignore = true;
             }
             // println!("{}", err);
             // println!("{:?}", err);
@@ -595,6 +596,7 @@ pub struct S3Config {
 }
 
 /// A dummy certificate verifier that just accepts anything
+#[derive(Debug)]
 pub struct NoCertificateVerification {}
 
 impl rustls::client::ServerCertVerifier for NoCertificateVerification {
@@ -604,18 +606,70 @@ impl rustls::client::ServerCertVerifier for NoCertificateVerification {
         _intermediates: &[rustls::Certificate],
         _server_name: &rustls::ServerName,
         _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp: &[u8],
+        _ocsp_response: &[u8],
         _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+    ) -> std::prelude::v1::Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())    
     }
 }
+
+// this is for a later version of rustls if the aws library actually updates
+// /// A dummy certificate verifier that just accepts anything
+// #[derive(Debug)]
+// pub struct NoCertificateVerification {
+//     verifier: Arc<WebPkiServerVerifier>
+// }
+
+// impl NoCertificateVerification {
+//     fn new(roots: Arc<rustls::RootCertStore>) -> Result<Self> {
+//         Ok(Self {
+//             verifier: WebPkiServerVerifier::builder(roots).build()?
+//         })
+//     }
+// }
+
+// impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+//     fn verify_server_cert(
+//         &self,
+//         _end_entity: &rustls::pki_types::CertificateDer<'_>,
+//         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+//         _server_name: &rustls::pki_types::ServerName<'_>,
+//         _ocsp_response: &[u8],
+//         _now: rustls::pki_types::UnixTime,
+//     ) -> std::prelude::v1::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+//         Ok(rustls::client::danger::ServerCertVerified::assertion())
+//     }
+
+//     fn verify_tls12_signature(
+//         &self,
+//         message: &[u8],
+//         cert: &rustls::pki_types::CertificateDer<'_>,
+//         dss: &rustls::DigitallySignedStruct,
+//     ) -> std::prelude::v1::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+//         self.verifier.verify_tls12_signature(message, cert, dss)
+//     }
+
+//     fn verify_tls13_signature(
+//         &self,
+//         message: &[u8],
+//         cert: &rustls::pki_types::CertificateDer<'_>,
+//         dss: &rustls::DigitallySignedStruct,
+//     ) -> std::prelude::v1::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+//         self.verifier.verify_tls13_signature(message, cert, dss)
+//     }
+
+//     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+//         self.verifier.supported_verify_schemes()
+//     }
+// }
+
+
 
 impl S3BlobStore {
     /// Connect to the s3 store and ensure resources exist
     async fn new(config: S3Config) -> Result<Self> {
         // Ok(S3BlobStore { client: bucket })
-        let mut loader = aws_config::from_env();
+        let mut loader = aws_config::defaults(BehaviorVersion::v2024_03_28());
 
         // Override the region
         loader = loader.region(aws_types::region::Region::new(config.region_name));
@@ -634,17 +688,18 @@ impl S3BlobStore {
         }
 
         // Configure the use of ssl
-        loader = loader.http_connector({
+        loader = loader.http_client({
 
             let https_connector = if config.no_tls_verify {
                 let root_store = rustls::RootCertStore::empty();
                 let mut tls_config = rustls::ClientConfig::builder()
                     .with_safe_defaults()
-                    .with_root_certificates(root_store)
+                    .with_root_certificates(root_store.clone())
                     .with_no_client_auth();
+                                    
                 tls_config
                     .dangerous()
-                    .set_certificate_verifier(Arc::new(NoCertificateVerification {}));
+                    .set_certificate_verifier(Arc::new(NoCertificateVerification{}));
 
                 hyper_rustls::HttpsConnectorBuilder::new()
                     .with_tls_config(tls_config)
@@ -661,7 +716,33 @@ impl S3BlobStore {
                     .build()
             };
 
-            aws_smithy_client::hyper_ext::Adapter::builder()
+            // this is for a later version of rustls if the aws library actually updates
+            // let https_connector = if config.no_tls_verify {
+            //     let root_store = rustls::RootCertStore::empty();
+            //     let mut tls_config = rustls::ClientConfig::builder()    
+            //         .with_root_certificates(root_store.clone())
+            //         .with_no_client_auth();
+            //     tls_config
+            //         .dangerous()
+            //         .set_certificate_verifier(Arc::new(NoCertificateVerification::new(Arc::new(root_store))?));
+
+            //     hyper_rustls::HttpsConnectorBuilder::new()
+            //         .with_tls_config(tls_config)
+            //         .https_or_http()
+            //         .enable_http1()
+            //         .enable_http2()
+            //         .build()
+            // } else {
+            //     hyper_rustls::HttpsConnectorBuilder::new()
+            //         .with_native_roots()?
+            //         .https_or_http()
+            //         .enable_http1()
+            //         .enable_http2()
+            //         .build()
+            // };
+
+            // aws_smithy_runtime_api::client::http::SharedHttpClient::new
+            aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder::new()
                 .build(https_connector)
         });
 
@@ -704,6 +785,14 @@ impl S3BlobStore {
         let res = match request {
             Ok(res) => res,
             Err(err) => {
+                if let Some(resp) = err.raw_response() {
+                    if resp.status().is_success() {
+                        if let Some(value) = resp.headers().get("Content-Length") {
+                            return Ok(Some(value.parse()?))
+                        }
+                    }
+                }
+
                 let err = err.into_service_error();
                 if err.is_not_found() {
                     return Ok(None)
@@ -712,7 +801,7 @@ impl S3BlobStore {
             },
         };
 
-        return Ok(Some(res.content_length() as u64))
+        return Ok(res.content_length().map(|val| val as u64))
     }
 
     /// read blob into stream
@@ -756,6 +845,7 @@ impl S3BlobStore {
     }
 
     /// Upload a file, let the library handle streaming read
+    #[cfg(test)]
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         self.client
             .put_object()
@@ -792,6 +882,7 @@ impl S3BlobStore {
     }
 
     /// Delete the block by api call
+    #[cfg(test)]
     pub async fn delete(&self, label: &str) -> Result<()> {
         self.client
             .delete_object()
@@ -991,7 +1082,7 @@ mod test {
 
     #[test]
     fn parse_azure_url() {
-        let config = url_to_other_config(&vec!["azure://assemblylinefilestore.blob.core.windows.net/devfiles?access_key=PassW0rd".to_owned()]).unwrap();
+        let config = url_to_other_config(&["azure://assemblylinefilestore.blob.core.windows.net/devfiles?access_key=PassW0rd".to_owned()]).unwrap();
         assert_eq!(config, BlobStorageConfig::Azure(AzureBlobConfig { 
             account: "assemblylinefilestore".to_owned(), 
             access_key: "PassW0rd".to_owned(), 
@@ -1002,7 +1093,7 @@ mod test {
 
     #[test]
     fn parse_s3_url() {
-        let config = url_to_other_config(&vec!["s3://UNAMe:Passwrd@filestore:9000?s3_bucket=al-cache&use_ssl=False".to_owned()]).unwrap();
+        let config = url_to_other_config(&["s3://UNAMe:Passwrd@filestore:9000?s3_bucket=al-cache&use_ssl=False".to_owned()]).unwrap();
         assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
             access_key_id: Some("UNAMe".to_owned()), 
             secret_access_key: Some("Passwrd".to_owned()), 
@@ -1012,7 +1103,7 @@ mod test {
             no_tls_verify: true 
         }));
 
-        let config = url_to_other_config(&vec!["s3://UNAMe:Passwrd@filestore.com:9000/carebear?s3_bucket=al-cache&use_ssl=False&aws_region=hats".to_owned()]).unwrap();
+        let config = url_to_other_config(&["s3://UNAMe:Passwrd@filestore.com:9000/carebear?s3_bucket=al-cache&use_ssl=False&aws_region=hats".to_owned()]).unwrap();
         assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
             access_key_id: Some("UNAMe".to_owned()), 
             secret_access_key: Some("Passwrd".to_owned()), 

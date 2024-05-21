@@ -27,7 +27,6 @@ pub struct LoggerMiddlewareImpl<E> {
 }
 
 
-#[poem::async_trait]
 impl<E: Endpoint> Endpoint for LoggerMiddlewareImpl<E> {
     type Output = E::Output;
 

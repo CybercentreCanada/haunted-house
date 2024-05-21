@@ -64,8 +64,8 @@ impl From<sqlx::Error> for ErrorKinds {
     }
 }
 
-impl From<aws_smithy_client::SdkError<aws_sdk_s3::error::GetObjectError>> for ErrorKinds {
-    fn from(value: aws_smithy_client::SdkError<aws_sdk_s3::error::GetObjectError>) -> Self {
+impl From<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>> for ErrorKinds {
+    fn from(value: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>) -> Self {
         let error = value.into_service_error();
         if error.is_no_such_key() {
             ErrorKinds::BlobNotFound

@@ -1437,8 +1437,8 @@ pub enum ElasticError {
     FailedToCreateIndex(String, String),
     HTTPError{path: Option<String>, code: StatusCode, message: String},
     OtherHttpClient(reqwest::Error),
-    URL(url::ParseError),
-    JSON(serde_json::Error),
+    Url(url::ParseError),
+    Json(serde_json::Error),
     MalformedResponse,
     BadKey(String),
     SerializeError(ModelError),
@@ -1455,8 +1455,8 @@ impl std::fmt::Display for ElasticError {
             ElasticError::FailedToCreateIndex(src, target) => f.write_fmt(format_args!("Failed to create index {target} from {src}.")),
             ElasticError::HTTPError{path, code, message} => f.write_fmt(format_args!("http error [{path:?}]: {code} {message}")),
             ElasticError::OtherHttpClient(err) => f.write_fmt(format_args!("Error from http client: {err}")),
-            ElasticError::URL(error) => f.write_fmt(format_args!("URL parse error: {}", error)),
-            ElasticError::JSON(error) => f.write_fmt(format_args!("Issue with serialize or deserialize: {}", error)),
+            ElasticError::Url(error) => f.write_fmt(format_args!("URL parse error: {}", error)),
+            ElasticError::Json(error) => f.write_fmt(format_args!("Issue with serialize or deserialize: {}", error)),
             ElasticError::MalformedResponse => f.write_str("A server response was not formatted as expected"),
             ElasticError::BadKey(key) => f.write_fmt(format_args!("tried to save document with invalid key: {key}")),
             // ElasticError::BadDocumentVersion => f.write_str("An invalid document version string was encountered"),
@@ -1479,28 +1479,28 @@ impl From<reqwest::Error> for ElasticError {
                 ElasticError::HTTPError { path, code, message }
             },
             None => ElasticError::OtherHttpClient(value),
-        }.into()
+        }
     }
 }
 
 impl From<url::ParseError> for ElasticError {
-    fn from(value: url::ParseError) -> Self { ElasticError::URL(value).into() }
+    fn from(value: url::ParseError) -> Self { ElasticError::Url(value) }
 }
 
 impl From<serde_json::Error> for ElasticError {
-    fn from(value: serde_json::Error) -> Self { ElasticError::JSON(value).into() }
+    fn from(value: serde_json::Error) -> Self { ElasticError::Json(value) }
 }
 
 impl From<assemblyline_models::ModelError> for ElasticError {
-    fn from(value: assemblyline_models::ModelError) -> Self { ElasticError::SerializeError(value).into() }
+    fn from(value: assemblyline_models::ModelError) -> Self { ElasticError::SerializeError(value) }
 }
 
 impl From<assemblyline_models::meta::MappingError> for ElasticError {
-    fn from(value: assemblyline_models::meta::MappingError) -> Self { ElasticError::MappingError(value).into() }
+    fn from(value: assemblyline_models::meta::MappingError) -> Self { ElasticError::MappingError(value) }
 }
 
 impl From<assemblyline_markings::errors::Errors> for ElasticError {
-    fn from(value: assemblyline_markings::errors::Errors) -> Self { ElasticError::ClassificationError(value).into() }
+    fn from(value: assemblyline_markings::errors::Errors) -> Self { ElasticError::ClassificationError(value) }
 }
 
 /// Define result as defaulting to elastic error within this module

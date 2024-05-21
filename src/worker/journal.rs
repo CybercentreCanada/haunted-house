@@ -16,10 +16,9 @@ use parking_lot::Mutex;
 // use serde::{Deserialize, Serialize};
 
 use crate::{config::FILTER_TEMP_SUBDIRECTORY, query::Query, timing::{mark, Capture, TimingCapture}, types::FilterID, worker::encoding::{encode_value_into, DecreasingEncoder}};
-use crate::worker::trigrams::TrigramIterator;
 use crate::worker::encoding::encode_into_increasing;
 
-use super::{encoding::{decode_decreasing_into, decode_into, decode_value, StreamDecode}, intersection, into_trigrams, remove_file, trigrams::TrigramSet, union};
+use super::{encoding::{decode_decreasing_into, decode_into, decode_value, StreamDecode}, intersection, into_trigrams, remove_file, union};
 
 /// A convinence constant defining how many possible trigrams exist
 const TRIGRAM_RANGE: u64 = 1 << 24;
@@ -956,7 +955,7 @@ mod test {
     use crate::{query::Query, worker::encoding::encode_into_increasing};
     use crate::types::FilterID;
     use super::JournalFilter;
-    use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams, Bits, TrigramSet};
+    use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams, Bits};
 
     use super::{TRIGRAM_RANGE, IdCollector};
 

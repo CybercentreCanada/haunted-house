@@ -26,25 +26,23 @@ clap = { version = "4", features = ["derive"] }
 nix = { version = "0.28", features = ["fs"] }
 
 # Data proccessing and manipulating
-memmap2 = "0.7"
 cobs = "0.2"
 byteorder = "1.4"
 bitvec = { version = "1", features = ["serde"]}
-yara = { version = "0.16", features= ["vendored"] }
+yara = { version = "0.27", features= ["vendored"] }
 # yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
 
 # Parsing and serialization
 regex = "1.8"
 serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0"
-serde_with = "2.2"
+serde_with = "3.8"
 postcard = { version = "1.0.2", features = ["alloc"] }
 nom = "7"
 hex = "0.4"
 parse-size = { version = "1", features = ["std"] }
 schemars = { version = "0.8.6", optional = true }
-# serde_yaml = { version = "0.9" }
-boreal-parser = "0.3"
+boreal-parser = "0.5"
 base64 = "0.21"
 strum = { version = "0.25", features = ["derive"] }
 struct-metadata = { version = "0.1", features = ["serde_json"] }
@@ -55,8 +53,6 @@ sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
-# tokio-stream = "0.1"
-# tokio-util = { version = "0.7", features = ["time"] }
 futures = "0.3"
 
 #pyo3 = { version = "0.17", features = ["anyhow", "chrono"], optional = true }
@@ -64,20 +60,20 @@ futures = "0.3"
 #pyo3-log = { version = "0.7", optional = true }
 
 # Networking libraries
-poem = { version = "1.3", features = ["anyhow", "websocket", "openssl-tls"] }
+poem = { version = "3.0", features = ["anyhow", "websocket", "openssl-tls"] }
 openssl = { version = "0.10" }
-reqwest = { version = "0.11", features = ["json", "native-tls"] }
-reqwest-middleware = "0.2"
-reqwest-retry = "0.2"
-http = "0.2"
-tokio-tungstenite = { version = "0.19", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json", "native-tls", "stream"] }
+reqwest-middleware = { version = "0.3", features = ["json"] }
+reqwest-retry = "0.5"
+http = "1.1"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 native-tls = "0.2"
-hyper-rustls = { version = "0.23", features = [] }
-rustls = "0.20"
 url = "2.4"
+# version tied to aws libraries
+hyper-rustls = { version = "0.24", features = ["http2", "rustls-native-certs"] }
+rustls = { version = "0.21.8", features = ["dangerous_configuration"] }
 
 # Assemblyline libraries
-# assemblyline-client = "0.1"
 assemblyline-markings = "0.1"
 assemblyline-models = { version = "0.1" }
 
@@ -86,10 +82,11 @@ azure_core = "0.8"
 # azure_identity = "0.9"
 azure_storage = "0.9"
 azure_storage_blobs = "0.9"
-aws-config = "0.54"
-aws-sdk-s3 = "0.24"
-aws-types = "0.54"
-aws-smithy-client = "0.54"
+aws-config = "1.4"
+aws-sdk-s3 = "1.29"
+aws-types = "1.2"
+aws-smithy-runtime = { version = "1.5", features = [ "tls-rustls" ] }
+aws-smithy-runtime-api = "1.6"
 
 
 kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
@@ -97,11 +94,3 @@ k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
 
 [dev-dependencies]
 assertor = "*"
-
-[features]
-#python = ["pyo3", "dep:pyo3-asyncio", "dep:pyo3-log"]
-#extension-module = ["python", "pyo3/extension-module"]
-#serde_yaml = ["dep:serde_yaml"]
-#operator = ["dep:kube", "dep:schemars", "dep:k8s-openapi", "dep:serde_yaml"]
-#default = ["extension-module"]
-default = []
