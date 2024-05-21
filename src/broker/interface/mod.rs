@@ -67,7 +67,6 @@ struct TokenMiddlewareImpl<E> {
     core: Arc<HouseCore>,
 }
 
-// #[async_trait]
 impl<E: Endpoint> Endpoint for TokenMiddlewareImpl<E> {
     type Output = E::Output;
 

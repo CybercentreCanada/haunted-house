@@ -126,15 +126,15 @@ impl BufferedSQLite {
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;
 
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
-        sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
+        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *con).await?;
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *con).await?;
         sqlx::query("PRAGMA busy_timeout=600000").execute(&mut *con).await?;
 
         sqlx::query("create table if not exists filters (
             id INTEGER PRIMARY KEY,
             expiry INTEGER NOT NULL
-        )").execute(&mut con).await?;
-        sqlx::query("create index if not exists expiry ON filters(expiry)").execute(&mut con).await?;
+        )").execute(&mut *con).await?;
+        sqlx::query("create index if not exists expiry ON filters(expiry)").execute(&mut *con).await?;
 
         return Ok(())
     }
@@ -258,7 +258,7 @@ impl BufferedSQLite {
         sqlx::query("INSERT INTO filters(id, expiry) VALUES(?, ?) ON CONFLICT DO NOTHING")
             .bind(name.to_i64())
             .bind(expiry.as_u32())
-            .execute(&mut con).await?;
+            .execute(&mut *con).await?;
 
         self.workers.insert(name, FilterSQLWorker::start(&self.database_directory, self.ce.clone(), name, expiry, self.filter_sizes.clone(), self.filter_pending.clone()).await?);
 
@@ -288,7 +288,7 @@ impl BufferedSQLite {
 
         sqlx::query("DELETE FROM filters WHERE id = ?")
             .bind(id.to_i64())
-            .execute(&mut con).await?;
+            .execute(&mut *con).await?;
 
         if let Some(channel) = self.workers.remove(&id) {
             let (send, recv) = oneshot::channel();
@@ -396,8 +396,8 @@ impl FilterSQLWorker {
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;
 
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
-        sqlx::query("PRAGMA foreign_keys=ON").execute(&mut con).await?;
+        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *con).await?;
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *con).await?;
         sqlx::query("PRAGMA busy_timeout=600000").execute(&mut *con).await?;
 
         sqlx::query("create table if not exists files (
@@ -406,9 +406,9 @@ impl FilterSQLWorker {
             access BLOB NOT NULL,
             access_string BLOB NOT NULL,
             ingested BOOLEAN DEFAULT FALSE
-        )").execute(&mut con).await?;
-        sqlx::query("create index if not exists ingested ON files(ingested)").execute(&mut con).await?;
-        sqlx::query("create index if not exists hash ON files(hash)").execute(&mut con).await?;
+        )").execute(&mut *con).await?;
+        sqlx::query("create index if not exists ingested ON files(ingested)").execute(&mut *con).await?;
+        sqlx::query("create index if not exists hash ON files(hash)").execute(&mut *con).await?;
 
         return Ok(())
     }
@@ -465,7 +465,7 @@ impl FilterSQLWorker {
         let mut conn = self.db.acquire().await?;
         let mut output = vec![];
         for file in files {
-            let (ingested, ): (bool, ) = match query_as("SELECT ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut conn).await? {
+            let (ingested, ): (bool, ) = match query_as("SELECT ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
                 Some(row) => row,
                 None => {
                     output.push((self.id, file, IngestStatus::Missing));
@@ -488,7 +488,7 @@ impl FilterSQLWorker {
         for file in files {
             // Check if the file is already ingested
             let row: Option<(bool, )> = sqlx::query_as("SELECT ingested FROM files WHERE hash = ?")
-                .bind(file.hash.as_bytes()).fetch_optional(&mut conn).await?;
+                .bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await?;
             if let Some((ingested, )) = row {
                 if ingested {
                     completed.push((self.id, file));
@@ -501,7 +501,7 @@ impl FilterSQLWorker {
                 .bind(file.hash.as_bytes())
                 .bind(file.access.to_string())
                 .bind(file.access_string.to_string())
-                .execute(&mut conn).await?;
+                .execute(&mut *conn).await?;
 
             if let Some(size) = self.filter_sizes.write().await.get_mut(&self.id) {
                 *size += 1;
@@ -537,7 +537,8 @@ impl FilterSQLWorker {
     }
 
     pub async fn _update_file_access(&self, conn: &mut PoolConnection<sqlx::Sqlite>, file: &FileInfo) -> Result<IngestStatus> {
-        let (raw_access, old_access_string, ingested): (String, String, bool) = match query_as("SELECT access, access_string, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut *conn).await? {
+        let result = query_as("SELECT access, access_string, ingested FROM files WHERE hash = ?").bind(file.hash.as_bytes()).fetch_optional(&mut **conn).await?;
+        let (raw_access, old_access_string, ingested): (String, String, bool) = match result {
             Some(row) => row,
             None => return Ok(IngestStatus::Missing)
         };
@@ -558,7 +559,7 @@ impl FilterSQLWorker {
             .bind(new_access_string)
             .bind(raw_access)
             .bind(file.hash.as_bytes())
-            .execute(&mut *conn).await?;
+            .execute(&mut **conn).await?;
         if result.rows_affected() > 0 {
             if ingested {
                 return Ok(IngestStatus::Ready)
@@ -575,7 +576,7 @@ impl FilterSQLWorker {
         let mut conn = self.db.acquire().await?;
         for file_id in indices {
             let row: Option<(String, String, Vec<u8>)> = sqlx::query_as("SELECT access, access_string, hash FROM files WHERE number = ?")
-                .bind(*file_id as i64).fetch_optional(&mut conn).await?;
+                .bind(*file_id as i64).fetch_optional(&mut *conn).await?;
             if let Some((access, access_string, hash)) = row {
                 let access = AccessControl::from_str(&access)?;
                 if access.can_access(view) {
@@ -607,7 +608,7 @@ impl FilterSQLWorker {
         let stamp = std::time::Instant::now();
         let mut transaction = self.db.begin().await?;
         for (number, _) in &files {
-            sqlx::query("UPDATE files SET ingested = TRUE WHERE number = ?").bind(*number as i64).execute(&mut transaction).await?;
+            sqlx::query("UPDATE files SET ingested = TRUE WHERE number = ?").bind(*number as i64).execute(&mut *transaction).await?;
         }
         let mut pending = self.filter_pending.write().await;
         if let Some(pending) = pending.get_mut(&self.id) {
@@ -621,7 +622,7 @@ impl FilterSQLWorker {
 
     pub async fn abandon_file(&self, file: Sha256) -> Result<()> {
         let mut transaction = self.db.begin().await?;
-        sqlx::query("DELETE FROM files WHERE hash = ?").bind(file.as_bytes()).execute(&mut transaction).await?;
+        sqlx::query("DELETE FROM files WHERE hash = ?").bind(file.as_bytes()).execute(&mut *transaction).await?;
         let mut pending = self.filter_pending.write().await;
         if let Some(pending) = pending.get_mut(&self.id) {
             pending.remove(&file);

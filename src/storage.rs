@@ -425,9 +425,9 @@ impl AzureBlobStore {
             ClientBuilder::emulator()
         } else {
             let storage_credentials = if config.access_key.is_empty() {
-                StorageCredentials::Anonymous
+                StorageCredentials::anonymous()
             } else {
-                StorageCredentials::Key(config.account.clone(), config.access_key.clone())
+                StorageCredentials::access_key(config.account.clone(), config.access_key.clone())
             };
             ClientBuilder::new(config.account.clone(), storage_credentials)
         };
@@ -512,7 +512,7 @@ impl AzureBlobStore {
             execute: false,
             ownership: false,
             permissions: false
-        }, time::OffsetDateTime::now_utc() + time::Duration::HOUR)?;
+        }, time::OffsetDateTime::now_utc() + time::Duration::HOUR).await?;
 
         let url = client.generate_signed_blob_url(&sas)?;
 

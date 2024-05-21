@@ -14,13 +14,13 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde", "std"] }
 time = { version = "0.3" }
 rand = { version = "0.8", features = ["small_rng"] }
-itertools = "0.10"
+itertools = "0.13"
 parking_lot = "0.12"
 
 # Environment interfaces
 tempfile = "3"
 log = "0.4"
-env_logger = "0.9"
+env_logger = "0.11"
 # gethostname = "0.4"
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.28", features = ["fs"] }
@@ -43,13 +43,13 @@ hex = "0.4"
 parse-size = { version = "1", features = ["std"] }
 schemars = { version = "0.8.6", optional = true }
 boreal-parser = "0.5"
-base64 = "0.21"
-strum = { version = "0.25", features = ["derive"] }
+base64 = "0.22"
+strum = { version = "0.26", features = ["derive"] }
 struct-metadata = { version = "0.1", features = ["serde_json"] }
 
 # Database tools
-deadpool = "0.9"
-sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite" ] }
+deadpool = "0.12"
+sqlx = { version = "0.7", features = [ "runtime-tokio-rustls", "sqlite" ] }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -69,7 +69,7 @@ http = "1.1"
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 native-tls = "0.2"
 url = "2.4"
-# version tied to aws libraries
+# held back by aws libraries
 hyper-rustls = { version = "0.24", features = ["http2", "rustls-native-certs"] }
 rustls = { version = "0.21.8", features = ["dangerous_configuration"] }
 
@@ -78,19 +78,19 @@ assemblyline-markings = "0.1"
 assemblyline-models = { version = "0.1" }
 
 # Cloud service libraries
-azure_core = "0.8"
+azure_core = "0.20"
 # azure_identity = "0.9"
-azure_storage = "0.9"
-azure_storage_blobs = "0.9"
+azure_storage = "0.20"
+azure_storage_blobs = "0.20"
 aws-config = "1.4"
 aws-sdk-s3 = "1.29"
 aws-types = "1.2"
 aws-smithy-runtime = { version = "1.5", features = [ "tls-rustls" ] }
-aws-smithy-runtime-api = "1.6"
+# aws-smithy-runtime-api = "1.6"
 
 
-kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
-k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
+# kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
+# k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
 
 [dev-dependencies]
 assertor = "*"

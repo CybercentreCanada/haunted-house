@@ -70,11 +70,11 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
     async fn initialize(pool: &SqlitePool) -> Result<()> {
         let mut con = pool.acquire().await?;
 
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut con).await?;
+        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *con).await?;
 
         sqlx::query("create table if not exists dataset (
             data BLOB NOT NULL PRIMARY KEY
-        )").execute(&mut con).await.context("error creating table for set")?;
+        )").execute(&mut *con).await.context("error creating table for set")?;
 
         return Ok(())
     }
@@ -87,7 +87,7 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
             // Insert file entry
             let result = sqlx::query("INSERT INTO dataset(data) VALUES(?)")
             .bind(postcard::to_allocvec(&item)?)
-            .execute(&mut trans).await;
+            .execute(&mut *trans).await;
             match result {
                 Ok(_) => continue,
                 Err(err) => {
