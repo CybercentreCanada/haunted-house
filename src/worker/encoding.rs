@@ -41,9 +41,9 @@ pub fn encode_into_increasing(indices: &[u64], buffer: &mut Vec<u8>) {
 }
 
 /// Calculate how many bytes a value will need to be encoded
-pub fn encoded_number_size(value: u64) -> u32 {
-    value.ilog2()/7 + 1
-}
+// pub fn encoded_number_size(value: u64) -> u32 {
+//     value.ilog2()/7 + 1
+// }
 
 pub struct DecreasingEncoder<'a> {
     last_value: u64,
@@ -69,12 +69,12 @@ impl<'a> DecreasingEncoder<'a> {
 }
 
 /// (upper bound on) How many additional bytes are needed to add the given value to the given sequence
-pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
-    match values.last() {
-        Some(last) => encoded_number_size(new_value - last),
-        None => encoded_number_size(new_value)
-    }
-}
+// pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
+//     match values.last() {
+//         Some(last) => encoded_number_size(new_value - last),
+//         None => encoded_number_size(new_value)
+//     }
+// }
 
 #[cfg(test)]
 pub fn decode(data: &[u8]) -> (Vec<u64>, u32) {
@@ -98,6 +98,27 @@ pub fn decode_value(mut data: &[u8]) -> (u64, &[u8]) {
 
     (value, &data[1..])
 }
+
+pub fn try_decode_value(input: &[u8]) -> Option<(u64, usize)> {
+    if input.is_empty() { return None }
+    let mut data = input;
+    let mut value = (data[0] & 0b0111_1111) as u64;
+    let mut offset = 7;
+    let mut bytes_used = 1;
+
+    while data[0] & 0b1000_0000 > 0 {
+        data = &data[1..];
+        bytes_used += 1;
+        if data.is_empty() || data[0] == 0 {
+            return None
+        }
+        value |= ((data[0] & 0b0111_1111) as u64) << offset;
+        offset += 7;
+    }
+
+    Some((value, bytes_used))
+}
+
 
 pub fn decode_decreasing_into(mut data: &[u8], mut value: u64, values: &mut Vec<u64>) {
     values.push(value);
@@ -237,9 +258,9 @@ mod test {
     use itertools::Itertools;
     use rand::{thread_rng, Rng};
 
-    use crate::worker::encoding::{StreamDecode, StreamEncode};
+    use crate::worker::encoding::{try_decode_value, StreamDecode, StreamEncode};
 
-    use super::{decode, decode_value, encode, encode_into_increasing, encode_value_into, encoded_number_size};
+    use super::{decode, decode_value, encode, encode_value_into};
 
     #[test]
     fn round_trip() {
@@ -255,15 +276,15 @@ mod test {
         assert_eq!(decode(&buffer), (data, buffer.len() as u32));
     }
 
-    #[test]
-    fn number_size() {
-        let mut prng = thread_rng();
-        for ii in 1..100_000 {
-            let num: u64 = prng.gen();
-            assert_eq!(encode(&[ii]).len() as u32, encoded_number_size(ii));
-            assert_eq!(encode(&[num]).len() as u32, encoded_number_size(num));
-        }
-    }
+    // #[test]
+    // fn number_size() {
+    //     let mut prng = thread_rng();
+    //     for ii in 1..100_000 {
+    //         let num: u64 = prng.gen();
+    //         assert_eq!(encode(&[ii]).len() as u32, encoded_number_size(ii));
+    //         assert_eq!(encode(&[num]).len() as u32, encoded_number_size(num));
+    //     }
+    // }
 
     #[test]
     fn incomplete_write() {
@@ -332,5 +353,53 @@ mod test {
         let (value, buffer) = decode_value(buffer);
         assert_eq!(value, 0xfff);
         assert_eq!(buffer, &[0xff])
+    }
+
+    #[test]
+    fn decode_parts() {
+        let mut buffer = vec![];
+        encode_value_into(0xfffffffffff, &mut buffer);
+
+        assert_eq!(buffer.len(), 7);
+
+        assert_eq!(try_decode_value(&buffer[0..7]), Some((0xfffffffffff, 7)));
+        assert_eq!(try_decode_value(&buffer[0..6]), None);
+        assert_eq!(try_decode_value(&buffer[0..5]), None);
+        assert_eq!(try_decode_value(&buffer[0..4]), None);
+        assert_eq!(try_decode_value(&buffer[0..3]), None);
+        assert_eq!(try_decode_value(&buffer[0..2]), None);
+        assert_eq!(try_decode_value(&buffer[0..1]), None);
+        assert_eq!(try_decode_value(&buffer[0..0]), None);
+
+        let mut data: Vec<u64> = vec![];
+        for _ in 0..10 {
+            data.push(thread_rng().gen())            
+        }
+        data.push(0);
+        for _ in 0..10 {
+            data.push(thread_rng().gen())            
+        }
+        data.push(0);
+        
+        let mut buffer = vec![];
+        for value in &data {
+            encode_value_into(*value, &mut buffer);
+        }
+        buffer.push(0xff);
+
+        let mut output = vec![];
+        let mut cursor = 0;
+        while let Some((value, bytes_read)) = try_decode_value(&buffer[cursor..]) {
+            output.push(value);
+            cursor += bytes_read;
+        }
+        assert_eq!(data, output);
+
+        if cursor < buffer.len() {
+            let remaining = buffer.len() - cursor;
+            buffer.copy_within(cursor.., 0);
+            buffer.truncate(remaining)
+        }
+        assert_eq!(vec![0xff], buffer)
     }
 }

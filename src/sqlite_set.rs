@@ -147,7 +147,6 @@ mod test {
         let mut bb = collection.pop_batch(10).await?;
         aa.sort();
         bb.sort();
-        println!("{aa:?} {bb:?}");
 
         assert_eq!(aa, vec![10, 11]);
         assert!(bb.is_empty());

@@ -1,24 +1,29 @@
 #![allow(unused)]
 
-use std::{cmp::Reverse, collections::{hash_map::Entry, BTreeSet, HashMap}, fs::File, io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::{mpsc::{Receiver, Sender}, Arc}};
+use std::{cmp::Reverse, collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque}};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc::{Receiver, Sender}, Arc};
+use std::fs::File; 
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::iter::Peekable;
 
 // todo ensure ordered file ids
 
 use anyhow::{Context, Result};
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use bitvec::order::{BitOrder, Lsb0};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::{error, info};
+use log::{debug, error, info};
 use rand::{thread_rng, Rng};
-use tokio::sync::mpsc;
+use tokio::{runtime::Handle, sync::mpsc};
 use itertools::Itertools;
 use parking_lot::Mutex;
 // use serde::{Deserialize, Serialize};
 
-use crate::{config::FILTER_TEMP_SUBDIRECTORY, query::Query, timing::{mark, Capture, TimingCapture}, types::FilterID, worker::encoding::{encode_value_into, DecreasingEncoder}};
+use crate::{config::FILTER_TEMP_SUBDIRECTORY, pool::Pool, query::{broadcast, Reference, TrigramQuery, TrigramQueryExpression}, timing::{mark, Capture, TimingCapture}, types::FilterID, worker::encoding::{encode_value_into, DecreasingEncoder}};
 use crate::worker::encoding::encode_into_increasing;
 
-use super::{encoding::{decode_decreasing_into, decode_into, decode_value, StreamDecode}, intersection, into_trigrams, remove_file, union};
+use super::{encoding::{decode_decreasing_into, decode_into, decode_value, try_decode_value, StreamDecode}, intersection, into_trigrams, remove_file, union};
 
 /// A convinence constant defining how many possible trigrams exist
 const TRIGRAM_RANGE: u64 = 1 << 24;
@@ -31,7 +36,12 @@ const TAIL_ROW_SIZE: u64 = 8 + 8;
 const TAIL_FILE_SIZE: u64 = TAIL_ROW_SIZE * TRIGRAM_RANGE + 8;
 
 const BUFFER_SIZE: usize = 1 << 14;
+const READ_SIZE: usize = 1 << 13;
 
+type ReadPool = Pool<File>;
+
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 struct Size(u64);
 
 impl std::ops::Add<usize> for Size {
@@ -53,8 +63,8 @@ pub struct JournalFilter {
     directory: PathBuf,
     /// A file handle used while writing
     write_handle: Mutex<Arc<File>>,
-    /// A file handle used while reading. This could be a pool if we are having search throughput issues.
-    read_handle: Mutex<File>,
+    /// Lock to be held when moving or opening files
+    move_lock: Mutex<()>,
     /// A flag indicating if this journal is active, this lets different components that might
     /// want to use this journal to coordinate starting, stoping, garbage collection, etc.
     running: std::sync::atomic::AtomicBool,
@@ -71,7 +81,7 @@ impl JournalFilter {
     fn blocking_new(directory: PathBuf, id: FilterID) -> Result<Arc<Self>> {
         // prepare file
         let location = directory.join(format!("{id}"));
-        let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&location).context("Creating data file")?;
+        let mut data = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(location).context("Creating data file")?;
 
         // write header
         data.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
@@ -81,10 +91,9 @@ impl JournalFilter {
         AddressBuilder::init_empty(&directory, id).context("init empty address table")?;
 
         // return object
-        let reader = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(&location).context("Open file to read")?;
         Ok(Arc::new(Self {
             write_handle: Mutex::new(Arc::new(data)),
-            read_handle: Mutex::new(reader),
+            move_lock: Mutex::new(()),
             directory,
             id,
             running: std::sync::atomic::AtomicBool::new(true),
@@ -94,9 +103,11 @@ impl JournalFilter {
 
     pub async fn open(directory: PathBuf, id: FilterID) -> Result<Arc<Self>> {
         tokio::task::spawn_blocking(move || {
+            let move_lock = Mutex::new(());
+
             // open file
             let location = directory.join(format!("{id}"));
-            
+
             // check for files that haven't been fully initialized
             if let Ok(metadata) = location.metadata() {
                 if metadata.len() <= 4 {
@@ -109,7 +120,7 @@ impl JournalFilter {
             }
 
             // if a defrag just finished but the files are still being installed finish that now
-            Self::_install_defrag(&directory, id);
+            Self::_install_defrag(&directory, id, move_lock.lock());
 
             let mut data = std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(&location).context("Open file to write")?;
 
@@ -128,7 +139,7 @@ impl JournalFilter {
             AddressBuilder::init_ready(&directory, id)?;
 
             // Open current tail and read last location
-            let mut reader = AddressReader::open(&directory, id)?;
+            let mut reader = AddressReader::open(&directory, id, &move_lock.lock())?;
             let mut address: u64 = 0;
             while let Some((_, aa, _)) = reader.next()? {
                 if let Some(aa) = aa {
@@ -150,10 +161,9 @@ impl JournalFilter {
             data.seek(SeekFrom::End(0))?;
 
             // return object
-            let reader = Self::open_reader(&directory, id)?;
             Ok(Arc::new(Self {
                 write_handle: Mutex::new(Arc::new(data)),
-                read_handle: Mutex::new(reader),
+                move_lock,
                 directory,
                 id,
                 running: std::sync::atomic::AtomicBool::new(true),
@@ -167,7 +177,7 @@ impl JournalFilter {
         std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(location).context("Open file to read")
     }
 
-    fn _open_reader(&self) -> Result<File> {
+    fn _open_reader(&self, _: &parking_lot::MutexGuard<()>) -> Result<File> {
         Self::open_reader(&self.directory, self.id)
     }
 
@@ -194,7 +204,7 @@ impl JournalFilter {
         self.running.store(false, std::sync::atomic::Ordering::Release);
         self.running_notice.notify_waiters();
         self.write_handle.lock();
-        self.read_handle.lock();
+        self.move_lock.lock();
     }
 
     pub fn notify(&self) {
@@ -214,7 +224,7 @@ impl JournalFilter {
         }).await?
     }
 
-    fn _defrag(&self) -> Result<bool> {
+    fn _defrag(self: &Arc<Self>) -> Result<bool> {
         let capture = &Capture::new();
         let mut guard = self.write_handle.lock();
 
@@ -226,7 +236,7 @@ impl JournalFilter {
         let temp_journal_path = self.directory.join(FILTER_TEMP_SUBDIRECTORY).join(thread_rng().gen::<u128>().to_string());
         let mut temp_journal = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(&temp_journal_path).context("Creating data file")?;
         let mut address_writer = AddressBuilder::new(self.directory.clone(), self.id)?;
-       
+
         // write header
         temp_journal.write_u32::<LittleEndian>(HEADER_MAGIC).context("Writing header")?;
         let mut position = 4u64;
@@ -256,19 +266,17 @@ impl JournalFilter {
             position += write_data_buffer.len() as u64;
             temp_journal.write_all(&write_data_buffer)?;
         }
-        
+
         // write trailing data
         let tail_location = address_writer.finish(0)?;
         temp_journal.flush()?;
         temp_journal.sync_all()?;
 
         // Install the files
-        let mut reader = self.read_handle.lock();
         self._prepare_install_defrag(&temp_journal_path, &tail_location)?;
-        Self::_install_defrag(&self.directory, self.id)?;
+        Self::_install_defrag(&self.directory, self.id, self.move_lock.lock())?;
 
         // replace the file handles in the locks
-        *reader = self._open_reader()?;
         *guard = Arc::new(self._open_writer()?);
         guard.seek(SeekFrom::End(0))?;
 
@@ -281,11 +289,11 @@ impl JournalFilter {
         Ok(())
     }
 
-    fn _install_defrag(directory: &Path, id: FilterID) -> Result<()> {
+    fn _install_defrag(directory: &Path, id: FilterID, _: parking_lot::MutexGuard<()>) -> Result<()> {
         let temp_data = directory.join(format!(".{}", id));
         let temp_tails = directory.join(format!(".{}.tail", id));
         if temp_tails.exists() {
-            if temp_data.exists() {        
+            if temp_data.exists() {
                 std::fs::rename(temp_data, directory.join(format!("{}", id)))?;
             }
             std::fs::rename(temp_tails, directory.join(format!("{}.tail", id)))?;
@@ -330,7 +338,7 @@ impl JournalFilter {
 
             // start old and new address block
             let mut address_writer = AddressBuilder::new(self.directory.clone(), self.id)?;
-            let mut address_reader = AddressReader::open(&self.directory, self.id)?;
+            let mut address_reader = AddressReader::open(&self.directory, self.id, &self.move_lock.lock())?;
             drop(_mark);
 
             // write each new block into the journal and address block
@@ -378,7 +386,7 @@ impl JournalFilter {
             let mut writer = writer.into_inner()?;
             writer.flush()?;
             writer.sync_all()?;
-            address_writer.install(1 + address_reader.read_generation().context("read_generation")?)?;
+            address_writer.install(1 + address_reader.read_generation().context("read_generation")?, self.move_lock.lock())?;
         }
         info!("write_batch metrics \n{}", capture.format());
         Ok(true)
@@ -420,12 +428,12 @@ impl JournalFilter {
         })
     }
 
-    fn load_block<'a>(&self, address: Address, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
-        let mut guard = self.read_handle.lock();
-        let reader: &mut std::fs::File = &mut guard;
-        let mut reader = BufReader::new(reader);
-        Self::load_block_into(address, &mut reader, buffer)
-    }
+    // fn load_block<'a>(&self, address: Address, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
+    //     let mut guard = self.read_handle.lock();
+    //     let reader: &mut std::fs::File = &mut guard;
+    //     let mut reader = BufReader::new(reader);
+    //     Self::load_block_into(address, &mut reader, buffer)
+    // }
 
     fn load_block_into<'a>(address: Address, reader: &mut BufReader<&mut File>, buffer: &'a mut Vec<u8>) -> Result<Block<'a>> {
         reader.seek(SeekFrom::Start(address.0))?;
@@ -434,26 +442,29 @@ impl JournalFilter {
         Self::load_block_data(address, buffer)
     }
 
-    fn read_all(&self) -> mpsc::Receiver<Result<(u32, Vec<u64>)>> {
+    fn read_all(self: &Arc<Self>) -> mpsc::Receiver<Result<(u32, Vec<u64>)>> {
         let (send, recv) = mpsc::channel(32);
 
         let directory = self.directory.clone();
         let id = self.id;
-        let mut reader = match self._open_reader() {
-            Ok(reader) => reader,
-            Err(err) => {
-                _ = send.blocking_send(Err(err));
-                return recv
-            },
-        };
+        let this = self.clone();
 
         tokio::task::spawn_blocking(move ||{
             let send_err = send.clone();
             let result = move || -> Result<()> {
-                let mut reader = BufReader::new(&mut reader);
                 let mut buffer = vec![];
 
-                let mut addresses = AddressReader::open(&directory, id)?;
+                let mut addresses;
+                let mut reader;
+
+                {
+                    let guard = this.move_lock.lock();
+                    addresses = AddressReader::open(&directory, id, &guard)?;
+                    reader = this._open_reader(&guard)?;
+                }
+
+                let mut reader = BufReader::new(&mut reader);
+
                 while let Some((val, mut address, size)) = addresses.next()? {
                     let mut file_ids = Vec::with_capacity(size.0 as usize);
                     while let Some(current) = address {
@@ -475,168 +486,217 @@ impl JournalFilter {
         recv
     }
 
-    /// Read the file list for a single trigram
-    /// set is sorted low to high
-    fn read_trigram(&self, trigram: u32) -> Result<Vec<u64>> {
-        let mut collected = vec![];
-        let (mut address, size) = AddressReader::read_single(&self.directory, self.id, trigram)?;
-        if size.0 == 0 {
-            return Ok(vec![])
-        }
-        let mut buffer = vec![];
-        while let Some(current) = address {
-            let block = self.load_block(current, &mut buffer)?;
-            block.decode_into(&mut collected);
-            address = block.previous();
-        }
-        collected.reverse();
-        Ok(collected)
-    }
+    // /// Read the file list for a single trigram
+    // /// set is sorted low to high
+    // fn read_trigram(&self, trigram: u32) -> Result<Vec<u64>> {
+    //     let mut collected = vec![];
+    //     let (mut address, size) = AddressReader::read_single(&self.directory, self.id, trigram)?;
+    //     if size.0 == 0 {
+    //         return Ok(vec![])
+    //     }
+    //     let mut buffer = vec![];
+    //     while let Some(current) = address {
+    //         let block = self.load_block(current, &mut buffer)?;
+    //         block.decode_into(&mut collected);
+    //         address = block.previous();
+    //     }
+    //     collected.reverse();
+    //     Ok(collected)
+    // }
 
-    /// Calculate the intersection of the file lists for all the given trigrams
-    /// set is sorted low to high
-    fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
-        // Handle corner cases
-        if trigrams.is_empty() {
-            return Ok(vec![])
-        }
-        if trigrams.len() == 1 {
-            return self.read_trigram(trigrams[0])
-        }
+    // /// Calculate the intersection of the file lists for all the given trigrams
+    // /// set is sorted low to high
+    // fn read_trigrams(&self, trigrams: Vec<u32>) -> Result<Vec<u64>> {
+    //     // Handle corner cases
+    //     if trigrams.is_empty() {
+    //         return Ok(vec![])
+    //     }
+    //     if trigrams.len() == 1 {
+    //         return self.read_trigram(trigrams[0])
+    //     }
 
-        // Load all the offset and sizes
-        let trigrams = AddressReader::read_set(&self.directory, self.id, trigrams)?;
+    //     // Load all the offset and sizes
+    //     let trigrams = AddressReader::read_set(&self.directory, self.id, trigrams)?;
 
-        // TODO there is an optimization here were if any of the sets are quite small we could load them
-        // separately before moving onto the larger ones
+    //     // TODO there is an optimization here were if any of the sets are quite small we could load them
+    //     // separately before moving onto the larger ones
 
-        // build a collection if iterators that will navigate the linked list of segments
-        // yielding file ids in decending order. They will only read segments when the current one is
-        // exhausted, this potentially lets us avoid loading unused sections of the underlying file.
-        let mut sources = vec![];
-        for (_trigram, address, size) in trigrams {
-            // TODO sort by size
-            if size.0 == 0 {
-                return Ok(vec![])
-            }
-            sources.push(TrigramCursor::new(self, address));
-        }
+    //     // build a collection if iterators that will navigate the linked list of segments
+    //     // yielding file ids in decending order. They will only read segments when the current one is
+    //     // exhausted, this potentially lets us avoid loading unused sections of the underlying file.
+    //     let mut sources = vec![];
+    //     for (_trigram, address, size) in trigrams {
+    //         // TODO sort by size
+    //         if size.0 == 0 {
+    //             return Ok(vec![])
+    //         }
+    //         sources.push(TrigramCursor::new(self, address));
+    //     }
 
-        // Get the first file that might be in all the file lists
-        let mut candidate = match sources[0].peek()? {
-            Some(item) => item,
-            None => return Ok(vec![]),
-        };
+    //     // Get the first file that might be in all the file lists
+    //     let mut candidate = match sources[0].peek()? {
+    //         Some(item) => item,
+    //         None => return Ok(vec![]),
+    //     };
 
-        // Loop over all the cursors until all files have been considered
-        let mut output = vec![];
-        'next_candidate: loop {
-            // For the current candidate value check all the file lists to see if they all have it
-            'next_cursor: for cursor in &mut sources {
-                // This loop iterates through values in the current cursor until we catch up with the candidate value
-                loop {
-                    let next = match cursor.peek()? {
-                        Some(next) => next,
-                        // if we have reached the end of any of the cursors we can terminate this
-                        // search and return whatever we have found up until now
-                        None => break 'next_candidate,
-                    };
+    //     // Loop over all the cursors until all files have been considered
+    //     let mut output = vec![];
+    //     'next_candidate: loop {
+    //         // For the current candidate value check all the file lists to see if they all have it
+    //         'next_cursor: for cursor in &mut sources {
+    //             // This loop iterates through values in the current cursor until we catch up with the candidate value
+    //             loop {
+    //                 let next = match cursor.peek()? {
+    //                     Some(next) => next,
+    //                     // if we have reached the end of any of the cursors we can terminate this
+    //                     // search and return whatever we have found up until now
+    //                     None => break 'next_candidate,
+    //                 };
 
-                    match next.cmp(&candidate) {
-                        // if the current value on this cursor is behind the candidate keep
-                        // moving forward until we catch up with the candidate, all the values we are skipping
-                        // over must be missing in at least one other cursor for this to happen
-                        std::cmp::Ordering::Greater => { cursor.next()?; continue },
-                        // If this cursor has the candidate in it, move to the next cursor, candidate is still valid
-                        std::cmp::Ordering::Equal => { continue 'next_cursor },
-                        // If this cursor has passed the candidate the candidate is invalid (it needs to be
-                        // in all of the cursors) take the current value as the new candidate and restart
-                        // the loop over the cursors
-                        std::cmp::Ordering::Less => { candidate = next; continue 'next_candidate },
-                    }
-                }
-            }
+    //                 match next.cmp(&candidate) {
+    //                     // if the current value on this cursor is behind the candidate keep
+    //                     // moving forward until we catch up with the candidate, all the values we are skipping
+    //                     // over must be missing in at least one other cursor for this to happen
+    //                     std::cmp::Ordering::Greater => { cursor.next()?; continue },
+    //                     // If this cursor has the candidate in it, move to the next cursor, candidate is still valid
+    //                     std::cmp::Ordering::Equal => { continue 'next_cursor },
+    //                     // If this cursor has passed the candidate the candidate is invalid (it needs to be
+    //                     // in all of the cursors) take the current value as the new candidate and restart
+    //                     // the loop over the cursors
+    //                     std::cmp::Ordering::Less => { candidate = next; continue 'next_candidate },
+    //                 }
+    //             }
+    //         }
 
-            // If we have checked all the cursors and haven't skipped to the next iteration
-            // of the 'next_candidate loop then we have found this candidates in all the cursors
-            output.push(candidate);
+    //         // If we have checked all the cursors and haven't skipped to the next iteration
+    //         // of the 'next_candidate loop then we have found this candidates in all the cursors
+    //         output.push(candidate);
 
-            // advance to the 'next' file ID as a candidate. It doesn't matter if the cursors don't
-            // actually have this value, since we are about to check them.
-            candidate -= 1;
-        }
-        return Ok(output)
-    }
+    //         // advance to the 'next' file ID as a candidate. It doesn't matter if the cursors don't
+    //         // actually have this value, since we are about to check them.
+    //         candidate -= 1;
+    //     }
+    //     return Ok(output)
+    // }
 
     /// Run a query over the trigram table.
-    /// Setup a hash table as a cache, so that we don't search the same literal repeatedly.
-    pub async fn query(self: &Arc<Self>, query: Query) -> Result<Vec<u64>> {
+    pub async fn query(self: &Arc<Self>, query: Arc<TrigramQuery>) -> Result<Vec<u64>> {
+        use anyhow::anyhow;
+
+        // setup the network of channels
+        const CHANNEL_SIZE: usize = 1000;
+        let mut node_channels = HashMap::<usize, broadcast::Sender<u64>>::new();
+        // while we setup the network keep a copy of the listeners so that all the channels remain valid
+        let mut listeners = HashMap::<Reference, broadcast::Receiver<u64>>::new();
+        let mut trigrams = vec![];
+
+        // create a channel for each node
+        for (index, expression) in &query.expressions {
+            // collect all the active trigrams
+            for dep in expression.references() {
+                if let Reference::Trigram(trigram) = dep {
+                    trigrams.push(*trigram);
+                }
+            }
+
+            // create a channel for the node
+            let (send, recv) = broadcast::channel(CHANNEL_SIZE);
+            node_channels.insert(*index, send);
+            listeners.insert(Reference::Expression(*index), recv);
+        }
+
+        // create channel for each trigram
+        trigrams.sort_unstable();
+        trigrams.dedup();
+        let mut trigram_channels = HashMap::<u32, broadcast::Sender<u64>>::new();
+        for trigram in &trigrams {
+            let (send, recv) = broadcast::channel(CHANNEL_SIZE);
+            trigram_channels.insert(*trigram, send);
+            listeners.insert(Reference::Trigram(*trigram), recv);
+        }
+
+        // grab a listener from the root, when we drop the rest of the listeners this will
+        // be what keeps the reference counts to the other operations alive
+        let mut root = listeners.remove(&query.root).ok_or_else(|| anyhow!("Corrupt query"))?;
+
+        // prepare the listeners for each node
+        let mut node_inputs = HashMap::<usize, Vec<broadcast::Receiver<u64>>>::new();
+        for (index, expression) in &query.expressions {
+            let mut inputs = vec![];
+            for dep in expression.references() {
+                inputs.push(match dep {
+                    Reference::Trigram(tri) => trigram_channels.get(tri).unwrap().subscribe(),
+                    Reference::Expression(index) => node_channels.get(index).unwrap().subscribe(),
+                });
+            }
+            node_inputs.insert(*index, inputs);
+        }
+
+        // spawn the workers for the nodes
+        for (index, expression) in &query.expressions {
+            let inputs = node_inputs.remove(index).unwrap();
+            let channel = node_channels.remove(index).unwrap();
+            match expression {
+                TrigramQueryExpression::Or(_) => tokio::spawn(query_or(channel, inputs)),
+                TrigramQueryExpression::And(_) => tokio::spawn(query_and(channel, inputs)),
+                TrigramQueryExpression::MinOf(count, _) => tokio::spawn(query_min_of(*count, channel, inputs)),
+            };
+        }
+
+        // get the read pool
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut cache = Default::default();
-            this._query(&query, &mut cache)
-        }).await?
-    }
+        let (pool, mut trigram_info) = tokio::task::spawn_blocking(move || {
+            // make sure the file identities don't change during this operation
+            let guard = this.move_lock.lock();
+            if !this.is_running() {
+                return Err(anyhow!("Filter stopping."));
+            }
 
-    /// Actual logic for the 'query' methods
-    fn _query(&self, query: &Query, cache: &mut HashMap<Vec<u8>, Vec<u64>>) -> Result<Vec<u64>> {
-        if !self.is_running() {
-            return Err(anyhow::anyhow!("Filter stopping."));
+            // build the reader pool
+            const POOL_SIZE: usize = 16;
+            let mut pool = vec![];
+            for _ in 0..POOL_SIZE {
+                pool.push(this._open_reader(&guard)?);
+            }
+            let pool = Pool::new(pool);
+
+            // load the information about the trigrams being searched
+            let info = AddressReader::read_set(&this.directory, this.id, trigrams, &guard)?;
+
+            Ok((pool, info))
+        }).await??;
+
+        // sort the trigrams so they spawn from the shortest to longest lists
+        trigram_info.sort_by_key(|row|row.2);
+
+        // launch the trigram readers
+        for (trigram, address, _size) in trigram_info {
+            let channel = trigram_channels.remove(&trigram).unwrap();
+            if let Some(start) = address {
+                let pool = pool.clone();
+                let handle = Handle::current();
+                std::thread::spawn(move || {
+                    trigram_reader(trigram, channel, start, pool, handle);
+                });
+            }
         }
 
-        match query {
-            Query::And(items) => {
-                let mut base = self._query(&items[0], cache)?;
-                for item in &items[1..] {
-                    intersection(&mut base, &self._query(item, cache)?);
-                    if base.is_empty() {
-                        break
-                    }
-                }
-                Ok(base)
-            },
-            Query::Or(items) => {
-                let mut base = vec![];
-                for item in items {
-                    union(&mut base, &self._query(item, cache)?);
-                }
-                Ok(base)
-            },
-            Query::Literal(values) => {
-                match cache.entry(values.clone()) {
-                    Entry::Occupied(entry) => Ok(entry.get().clone()),
-                    Entry::Vacant(entry) => {
-                        let hits = self.read_trigrams(into_trigrams(values))?;
-                        entry.insert(hits.clone());
-                        Ok(hits)
-                    },
-                }
-            },
-            Query::MinOf(count, items) => {
-                let mut hits = HashMap::<u64, u32>::new();
-                for item in items {
-                    for file in self._query(item, cache)? {
-                        match hits.entry(file) {
-                            Entry::Occupied(mut entry) => { *entry.get_mut() += 1; },
-                            Entry::Vacant(entry) => { entry.insert(1); },
-                        }
-                    }
-                }
-                Ok(hits.into_iter().filter_map(|(file, hits)|{
-                    if hits >= *count as u32 {
-                        Some(file)
-                    } else {
-                        None
-                    }
-                }).collect_vec())
-            },
+        // drop the listeners here so root and the ones inside nodes are the only listeners left
+        // this lets the channels advance and lets readers exit when they aren't needed any more
+        listeners.clear();
+
+        // read the file ids
+        let mut output = vec![];
+        while let Some(value) = root.next().await {
+            output.push(value);
         }
+        Ok(output)
     }
 
     pub async fn generation_counter(self: &Arc<Self>) -> Result<u64> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
-            AddressReader::open(&this.directory, this.id)?.read_generation()
+            AddressReader::open(&this.directory, this.id, &this.move_lock.lock())?.read_generation()
         }).await?
     }
 
@@ -646,50 +706,337 @@ impl JournalFilter {
             let metadata = this.write_handle.lock().metadata()?;
             Ok(metadata.modified()?.elapsed()?)
         }).await?
-    }    
+    }
 }
 
-struct TrigramCursor<'a> {
-    host: &'a JournalFilter,
-    current: Vec<u64>,
-    index: usize,
-    next_address: Option<Address>,
-    data_buffer: Vec<u8>,
+async fn query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
+    let mut higher_limit = u64::MAX;
+    loop {
+        // get the highest of the inputs
+        let mut candidate_for_next = None;
+        for input in inputs.iter_mut() {
+            loop {
+                if let Some(&item) = input.peek().await {
+                    // this item has already been sent, move to next
+                    if item >= higher_limit {
+                        input.next().await;
+                        continue
+                    }
+
+                    // consider this item for the next
+                    match candidate_for_next {
+                        Some(candidate) => if candidate < item {
+                            candidate_for_next = Some(item)
+                        },
+                        None => {
+                            candidate_for_next = Some(item)
+                        }
+                    }
+                }
+                break
+            }
+        }
+
+        // if we have run out of items stop
+        higher_limit = match candidate_for_next {
+            Some(value) => value,
+            None => return
+        };
+
+        // send the item discovered, if no one is listening stop
+        if !output.send(higher_limit).await {
+            return
+        }
+    }
 }
 
-impl<'a> TrigramCursor<'a> {
-    fn new(host: &'a JournalFilter, next_address: Option<Address>) -> Self {
+async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
+    let mut candidate = u64::MAX;
+    'outer: loop {
+        for input in inputs.iter_mut() {
+            loop {
+                match input.peek().await {
+                    Some(&value) => match value.cmp(&candidate) {
+                        // front of this stream is further advanced than candidate,
+                        // advance candidate cursor to match this stream and restart search
+                        std::cmp::Ordering::Less => {
+                            candidate = value;
+                            continue 'outer
+                        },
+                        // cursor and stream match, fall through to next stream
+                        std::cmp::Ordering::Equal => {},
+                        // cursor is behind candidate, advance stream and check again
+                        std::cmp::Ordering::Greater => {
+                            input.next().await;
+                            continue
+                        },
+                    },
+                    // if any of our streams have completed, stop
+                    None => {
+                        return
+                    },
+                }
+                break
+            }
+        }
+
+        // if we have reached the end of the iteration over inputs we may have a new id to send,
+        // alternately we have found _nothing_ and the candidate is still at the limit
+        if candidate == u64::MAX {
+            return
+        }
+
+        // send the item discovered, if no one is listening stop
+        if !output.send(candidate).await {
+            return
+        }
+        // advance to the next possible candidate, even if it isn't in the streams, the above
+        // loop will skip this value if the inputs don't have it
+        candidate -= 1;
+    }
+}
+
+async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
+    let mut higher_limit = u64::MAX;
+    loop {
+        if !output.is_connected() {
+            return
+        }
+
+        // get the highest of the inputs
+        let mut candidate_for_next = None;
+        for input in inputs.iter_mut() {
+            loop {
+                if let Some(&item) = input.peek().await {
+                    // this item has already been sent, move to next
+                    if item >= higher_limit {
+                        input.next().await;
+                        continue
+                    }
+
+                    // consider this item for the next
+                    match candidate_for_next {
+                        Some(candidate) => if candidate < item {
+                            candidate_for_next = Some(item)
+                        },
+                        None => {
+                            candidate_for_next = Some(item)
+                        }
+                    }
+                }
+                break
+            }
+        }
+
+        // if we have run out of items stop
+        higher_limit = match candidate_for_next {
+            Some(value) => value,
+            None => return
+        };
+
+        // count if this item has hit the threshold
+        let mut count = 0;
+        for input in inputs.iter_mut() {
+            if let Some(&item) = input.peek().await {
+                if item == higher_limit {
+                    count += 1;
+                }
+            }
+        }
+
+        if count < count_threshold {
+            continue
+        }
+
+        // send the item discovered, if no one is listening stop
+        if !output.send(higher_limit).await {
+            return
+        }
+    }
+}
+
+
+fn trigram_reader(trigram: u32, output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) {
+    match _trigram_reader(trigram, output, start, pool, handle) {
+        Ok(count) => debug!("Reader for {trigram:x} sent {count} items."),
+        Err(err) => error!("Error in {trigram:x} reader: {err}"),
+    }
+}
+
+fn _trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) -> Result<usize> {
+    let mut cursor = TrigramCursor::new(pool, start.0);
+    let mut sent_count = 0;
+    while !cursor.finished {
+        cursor.load_batch()?;
+
+        let sent = handle.block_on(async {
+            while let Some(value) = cursor.next() {
+                if !output.send(value).await {
+                    return false
+                }
+                sent_count += 1;
+            }
+            true
+        });
+
+        if !sent {
+            return Ok(sent_count)
+        }
+    }
+    Ok(sent_count)
+}
+
+/// Reader for getting a single block of cobs data at a given offset
+struct CobsReader {
+    read_buffer: Vec<u8>,
+    address: u64,
+    decoder: cobs::DecoderState,
+    finished: bool,
+    pool: Pool<File>,
+}
+
+impl CobsReader {
+    fn new(address: u64, pool: Pool<File>) -> Self {
         Self {
-            host,
-            next_address,
-            index: 0,
-            data_buffer: vec![],
-            current: vec![]
+            read_buffer: vec![0; READ_SIZE],
+            address,
+            decoder: cobs::DecoderState::Idle,
+            finished: false,
+            pool,
         }
     }
 
-    fn fill(&mut self) -> Result<bool> {
-        if self.index < self.current.len() { return Ok(true) }
-        if let Some(address) = self.next_address {
-            let block = self.host.load_block(address, &mut self.data_buffer)?;
-            self.next_address = block.previous();
-            self.index = 0;
-            self.current.clear();
-            block.decode_into(&mut self.current);
-            return Ok(!self.current.is_empty())
+    fn read(&mut self, output: &mut Vec<u8>) -> Result<bool> {
+        if self.finished { return Ok(false) }
+
+        // Read a chunk of bytes
+        let mut reader = self.pool.get();
+        reader.seek(SeekFrom::Start(self.address));
+        let quantity = reader.read(&mut self.read_buffer)?;
+        self.address += quantity as u64;
+
+        // Read those bytes into the cobs decoder and update our state
+        let mut bytes_read = false;
+        for byte in self.read_buffer.iter().take(quantity) {
+            match self.decoder.feed(*byte) {
+                Ok(cobs::DecodeResult::NoData) => continue,
+                Ok(cobs::DecodeResult::DataComplete) => {
+                    self.finished = true;
+                    break
+                },
+                Ok(cobs::DecodeResult::DataContinue(out)) => {
+                    bytes_read = true;
+                    output.push(out);
+                },
+                Err(_) => anyhow::bail!("Corrupt entry"),
+            }
         }
-        Ok(false)
+        Ok(bytes_read)
+    }
+}
+
+/// Reader for converting raw data into block info and a stream of numbers
+struct BlockReader {
+    cobs_reader: CobsReader,
+    buffer: Vec<u8>,
+    last_value: u64,
+}
+
+impl BlockReader {
+    fn read(pool: Pool<File>, address: u64, output: &mut VecDeque<u64>) -> Result<(Self, u64)> {
+        let mut cobs_reader = CobsReader::new(address, pool);
+
+        let mut buffer = vec![];
+        cobs_reader.read(&mut buffer)?;
+
+        // Load and process header
+        let (offset, offset_len) = try_decode_value(&buffer[0..]).ok_or(anyhow::anyhow!("Corrupt block"))?;
+        let (first_id, id_len) = try_decode_value(&buffer[offset_len..]).ok_or(anyhow::anyhow!("Corrupt block"))?;
+        let new_address = if offset == 0 {
+            offset
+        } else {
+            address - offset
+        };
+        output.push_back(first_id);
+
+        // Read the rest of the data
+        let last_value = Self::read_bytes(offset_len + id_len, first_id, &mut buffer, output);
+
+        // build a struct to continue reading if needed
+        Ok((Self { cobs_reader, last_value, buffer }, new_address))
     }
 
-    fn next(&mut self) -> Result<Option<u64>> {
-        self.fill()?;
-        self.index += 1;
-        Ok(self.current.get(self.index - 1).cloned())
+    fn read_bytes(mut cursor: usize, mut last_value: u64, buffer: &mut Vec<u8>, output: &mut VecDeque<u64>) -> u64 {
+        while let Some((value, bytes_read)) = try_decode_value(&buffer[cursor..]) {
+            last_value -= value;
+            output.push_back(last_value);
+            cursor += bytes_read;
+        }
+
+        if cursor < buffer.len() {
+            let remaining = buffer.len() - cursor;
+            buffer.copy_within(cursor.., 0);
+            buffer.truncate(remaining)
+        } else {
+            buffer.clear();
+        }
+
+        last_value
     }
 
-    fn peek(&mut self) -> Result<Option<u64>> {
-        self.fill()?;
-        Ok(self.current.get(self.index).cloned())
+    fn read_more(&mut self, output: &mut VecDeque<u64>) -> Result<bool> {
+        if !self.cobs_reader.read(&mut self.buffer)? {
+            return Ok(false)
+        }
+        
+        self.last_value = Self::read_bytes(0, self.last_value, &mut self.buffer, output);
+        Ok(true)
+    }
+}
+
+/// Iterate over all the blocks for a given trigram
+struct TrigramCursor {
+    values: VecDeque<u64>,
+    finished: bool,
+    pool: Pool<File>,
+    next_address: u64,
+    block_reader: Option<BlockReader>,
+}
+
+impl TrigramCursor {
+    fn new(pool: Pool<File>, address: u64) -> Self {
+        Self {
+            pool,
+            values: Default::default(),
+            finished: false,
+            next_address: address,
+            block_reader: None,
+        }
+    }
+
+    fn load_batch(&mut self) -> Result<()> {
+        // if we are part way through a block keep going
+        if let Some(reader) = &mut self.block_reader {
+            if reader.read_more(&mut self.values)? {
+                return Ok(())
+            } else {
+                self.block_reader = None;
+            }
+        }
+
+        // if we don't have a reader open the next address if we have one
+        if self.block_reader.is_none() && self.next_address > 0 {
+            let (reader, next_address) = BlockReader::read(self.pool.clone(), self.next_address, &mut self.values)?;
+            self.next_address = next_address;
+            return Ok(())
+        }
+        
+        self.finished = true;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Option<u64> {
+        self.values.pop_front()
     }
 }
 
@@ -770,7 +1117,7 @@ struct AddressReader {
 }
 
 impl AddressReader {
-    fn open(directory: &Path, id: FilterID) -> Result<Self> {
+    fn open(directory: &Path, id: FilterID, _: &parking_lot::MutexGuard<()>) -> Result<Self> {
         let tail_location = directory.join(format!("{id}.tail"));
         let tail = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(tail_location).context("Opening tail file")?;
         Ok(AddressReader{
@@ -779,7 +1126,7 @@ impl AddressReader {
         })
     }
 
-    fn read_set(directory: &Path, id: FilterID, mut trigrams: Vec<u32>) -> Result<Vec<(u32, Option<Address>, Size)>> {
+    fn read_set(directory: &Path, id: FilterID, mut trigrams: Vec<u32>, _: &parking_lot::MutexGuard<()>) -> Result<Vec<(u32, Option<Address>, Size)>> {
         let tail_location = directory.join(format!("{id}.tail"));
         let tail = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(tail_location).context("Opening tail file")?;
         let mut tail = BufReader::with_capacity(1 << 20, tail);
@@ -811,7 +1158,7 @@ impl AddressReader {
         Ok(out)
     }
 
-    fn read_single(directory: &Path, id: FilterID, trigram: u32) -> Result<(Option<Address>, Size)> {
+    fn read_single(directory: &Path, id: FilterID, trigram: u32, _: &parking_lot::MutexGuard<()>) -> Result<(Option<Address>, Size)> {
         let tail_location = directory.join(format!("{id}.tail"));
         let mut tail = std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(tail_location).context("Opening tail file")?;
         tail.seek(SeekFrom::Start(trigram as u64 * TAIL_ROW_SIZE))?;
@@ -913,7 +1260,7 @@ impl AddressBuilder {
         Ok(self.location)
     }
 
-    fn install(mut self, generation: u64) -> Result<()> {
+    fn install(mut self, generation: u64, _: parking_lot::MutexGuard<()>) -> Result<()> {
         self.handle.write_u64::<LittleEndian>(generation);
         let mut handle = self.handle.into_inner()?;
         handle.flush()?;
@@ -944,15 +1291,18 @@ impl Block<'_> {
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use anyhow::{Result, Context};
     use bitvec::vec::BitVec;
     use itertools::Itertools;
+    use parking_lot::Mutex;
     use rand::{Rng, SeedableRng};
 
+    use crate::query::phrases::PhraseQuery;
     use crate::worker::encoding::StreamDecode;
     use crate::worker::journal::AddressReader;
-    use crate::{query::Query, worker::encoding::encode_into_increasing};
+    use crate::{query::TrigramQuery, worker::encoding::encode_into_increasing};
     use crate::types::FilterID;
     use super::JournalFilter;
     use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams, Bits};
@@ -1017,7 +1367,7 @@ mod test {
             println!("Read time: {}; {} each", timestamp.elapsed().as_secs_f64(), timestamp.elapsed().as_secs_f64()/TRIGRAM_RANGE as f64);
         }
 
-        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 1);
+        assert_eq!(AddressReader::open(&location, id, &Mutex::new(()).lock()).unwrap().read_generation().unwrap(), 1);
 
         Ok(())
     }
@@ -1076,12 +1426,12 @@ mod test {
             }
         }
 
-        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 3);
+        assert_eq!(AddressReader::open(&location, id, &Mutex::new(()).lock()).unwrap().read_generation().unwrap(), 3);
 
         {
             let file = JournalFilter::open(location.clone(), id).await?;
             file.defrag().await.unwrap();
-            assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 0);
+            assert_eq!(AddressReader::open(&location, id, &Mutex::new(()).lock()).unwrap().read_generation().unwrap(), 0);
 
             let mut files = trigrams.iter().map(|row|StreamDecode::new(&row.1)).collect_vec();
             let mut output = file.read_all();
@@ -1098,7 +1448,7 @@ mod test {
             }
         }
 
-        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 0);
+        assert_eq!(AddressReader::open(&location, id, &Mutex::new(()).lock()).unwrap().read_generation().unwrap(), 0);
 
         Ok(())
     }
@@ -1163,7 +1513,7 @@ mod test {
             }
         }
         println!("read {:.2}", timer.elapsed().as_secs_f64());
-        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 1);
+        assert_eq!(AddressReader::open(&location, id, &Mutex::new(()).lock()).unwrap().read_generation().unwrap(), 1);
         Ok(())
     }
 
@@ -1215,7 +1565,7 @@ mod test {
             }
         }
         println!("read {}", timer.elapsed().as_secs_f64());
-        assert_eq!(AddressReader::open(&location, id).unwrap().read_generation().unwrap(), 1);
+        assert_eq!(AddressReader::open(&location, id, &Mutex::new(()).lock()).unwrap().read_generation().unwrap(), 1);
         Ok(())
     }
 
@@ -1268,28 +1618,40 @@ mod test {
 
         // run literal query that should only be in this file
         println!("query 1");
-        let query = Query::Literal(b"This shouldn't occur in any files and the odds of a false positive should be low.".to_vec());
-        let hits = file.query(query.clone()).await?;
+        let query = TrigramQuery::build(PhraseQuery::Literal(b"This shouldn't occur in any files and the odds of a false positive should be low.".to_vec()));
+        let hits = file.query(Arc::new(query)).await?;
         assert_eq!(hits, vec![1]);
 
         // run literal query that should not exist anywhere. False positives should also be low given the length.
         println!("query 2");
         let bytes: Vec<u8> = (0..48).map(|_| rand::thread_rng().gen()).collect();
-        let query = Query::Literal(bytes.clone());
-        let hits = file.query(query.clone()).await?;
+        let query = TrigramQuery::build(PhraseQuery::Literal(bytes.clone()));
+        let hits = file.query(Arc::new(query)).await?;
         assert!(hits.is_empty());
 
         // run a query that should hit on everything
         println!("query 3");
-        let query = Query::Or(vec![Query::Literal(b"fn ".to_vec()), Query::Literal(bytes.clone())]);
-        let hits = file.query(query.clone()).await?;
-        assert_eq!(hits, vec![1, 2, 3]);
+        let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"fn ".to_vec()), PhraseQuery::Literal(bytes.clone())]));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![3, 2, 1]);
 
         // run a query that should hit on two of the files
         println!("query 4");
-        let query = Query::Or(vec![Query::Literal(b"JournalFilter".to_vec()), Query::Literal(bytes)]);
-        let hits = file.query(query.clone()).await?;
-        assert_eq!(hits, vec![1, 2]);
+        let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"JournalFilter".to_vec()), PhraseQuery::Literal(bytes.clone())]));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![2, 1]);
+
+        // should hit on all files, but for different reasons
+        println!("query 5");
+        let query = TrigramQuery::build(PhraseQuery::Or(vec![
+            PhraseQuery::Literal(b"JournalFilter".to_vec()), 
+            PhraseQuery::InsensitiveLiteral(b"Get_TrIgrAm_cAchE_diREctOry".to_vec()), 
+            PhraseQuery::Literal(bytes)
+        ]));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![3, 2, 1]);
+
+        
 
         return Ok(())
     }

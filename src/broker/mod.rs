@@ -4,7 +4,6 @@
 pub mod interface;
 pub mod auth;
 mod fetcher;
-mod yara_query;
 mod elastic;
 
 use std::collections::{HashSet, HashMap, hash_map, VecDeque};
@@ -34,7 +33,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::access::AccessControl;
 use crate::broker::elastic::Datastore;
 use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig};
-use crate::query::Query;
+use crate::query::phrases::PhraseQuery;
+use crate::query::{parse_yara_signature, TrigramQuery};
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
 use crate::worker::YaraTask;
@@ -42,7 +42,6 @@ use crate::worker::interface::{UpdateFileInfoRequest, UpdateFileInfoResponse, Cr
 
 use self::auth::Authenticator;
 use self::interface::{SearchRequest, StatusReport, FilterStatus, SearchProgress};
-use self::yara_query::parse_yara_signature;
 
 /// Entry point function to the broker
 pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
@@ -1052,13 +1051,26 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
     }
 
     // Make sure the search is initialized
-    let query: Query = match serde_json::from_str(&status.raw_query) {
+    let query: serde_json::Value = match serde_json::from_str(&status.raw_query) {
         Ok(query) => query,
         Err(err) => {
             core.database.fatal_error(status, format!("Could not load query: {err}")).await?;
             return Ok(())
         }
     };
+
+    let query = if let Some(obj) = query.as_object(){
+        if obj.contains_key("expressions") {
+            serde_json::from_value(query)?
+        } else {
+            let query: PhraseQuery = serde_json::from_value(query)?;
+            TrigramQuery::build(query)
+        }
+    } else {
+        core.database.fatal_error(status, format!("Query was not layed out as json object")).await?;
+        return Ok(())
+    };
+
     let start_group = ExpiryGroup::from(status.start_group);
     let end_group = ExpiryGroup::from(status.end_group);
     let search_view = match core.prepare_access(status.search_classification.as_str()) {

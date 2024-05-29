@@ -65,12 +65,6 @@ impl Capture {
         })}
     }
 
-
-    #[cfg(test)]
-    pub fn print(&self) {
-        println!("{}", self.format())
-    }
-
     /// Print the information captured by the span
     pub fn format(&self) -> String {
         let mut parents = HashSet::new();
@@ -415,9 +409,10 @@ impl ResourceTracker {
 #[tokio::test]
 async fn test_load_cgroup_cpu_usage() {
     let t1 = load_cgroup_cpu_usage().await;
+    let mut set = HashSet::new();
     assert!(t1 > 0);
     for i in 0..100000 {
-        i.to_string();
+        set.insert(i.to_string());
     }
     assert!(load_cgroup_cpu_usage().await > t1);
 }

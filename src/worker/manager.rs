@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
-use crate::query::Query;
+use crate::query::TrigramQuery;
 use crate::storage::BlobStorage;
 use crate::timing::ResourceTracker;
 use crate::types::{ExpiryGroup, FilterID, FileInfo};
@@ -389,24 +389,10 @@ impl WorkerState {
     // }
 
     pub async fn is_ready(&self) -> Result<bool> {
-        // Get the most comprehensive list of filters we can
-        // let mut ids = self.get_filters(&ExpiryGroup::min(), &ExpiryGroup::max()).await?;
-        // let filters = self.filters.read().await;
-        // ids.extend(filters.keys());
-
-        // Make sure they are all ready
-        // for id in ids {
-        //     match filters.get(&id) {
-        //         Some((filter, _, _)) => if !filter.is_ready() {
-        //             return Ok(false);
-        //         }
-        //         None => return Ok(false)
-        //     }
-        // }
         return Ok(true)
     }
 
-    pub async fn query_filter(self: Arc<Self>, id: FilterID, query: Query, access: HashSet<String>, respond: mpsc::Sender<FilterSearchResponse>) {
+    pub async fn query_filter(self: Arc<Self>, id: FilterID, query: Arc<TrigramQuery>, access: HashSet<String>, respond: mpsc::Sender<FilterSearchResponse>) {
         if let Some(filter) = self.filters.read().await.get(&id) {
             match filter.query(query).await {
                 Ok(file_indices) => {

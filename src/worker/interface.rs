@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
-use crate::query::Query;
+use crate::query::TrigramQuery;
 use crate::timing::ResourceReport;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID};
 use crate::worker::YaraTask;
@@ -43,7 +43,7 @@ async fn create_index(state: Data<&Arc<WorkerState>>, request: Json<CreateIndexR
 #[derive(Serialize, Deserialize)]
 pub struct FilterSearchRequest {
     pub expiry_group_range: (ExpiryGroup, ExpiryGroup),
-    pub query: Query,
+    pub query: TrigramQuery,
     pub access: HashSet<String>
 }
 
@@ -96,12 +96,13 @@ async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> imp
         socket.send(Message::Text(message)).await.unwrap();
 
         // Dispatch a query to each of those filters
+        let query = Arc::new(request.query);
         let mut recv = {
             let (send, recv) = mpsc::channel(128);
             // let mut queries = tokio::task::JoinSet::new();
             for filter_id in &filter_ids {
                 let state = state.clone();
-                tokio::spawn(state.query_filter(*filter_id, request.query.clone(), request.access.clone(), send.clone()));
+                tokio::spawn(state.query_filter(*filter_id, query.clone(), request.access.clone(), send.clone()));
             }
             recv
         };

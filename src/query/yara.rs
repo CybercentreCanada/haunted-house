@@ -9,7 +9,8 @@ use boreal_parser::rule::VariableDeclaration;
 use itertools::Itertools;
 
 use crate::error::{Result, ErrorKinds};
-use crate::query::Query;
+use crate::query::phrases::PhraseQuery as Query;
+
 
 /// Struct used internal to this module to capture queries and warnings together
 struct ParsedQuery {
@@ -44,9 +45,8 @@ impl From<&str> for ParsedQuery {
     }
 }
 
-
 /// Convert a yara signature into a filter query
-pub fn parse_yara_signature(signature: &str) -> Result<(Query, Vec<String>)> {
+pub fn yara_signature_to_phrase_query(signature: &str) -> Result<(Query, Vec<String>)> {
     let file = boreal_parser::parse(signature)?;
 
     let mut signature = None;
@@ -70,7 +70,7 @@ pub fn parse_yara_signature(signature: &str) -> Result<(Query, Vec<String>)> {
     res.warnings.sort_unstable();
     res.warnings.dedup();
     match res.query {
-        Some(query) => Ok((query.flatten(), res.warnings)),
+        Some(query) => Ok((query, res.warnings)),
         None => Err(ErrorKinds::YaraRuleError("Could not build filter from rule".to_string())),
     }
 }
@@ -90,26 +90,8 @@ fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
 
     // Apply nocase and add a warning
     if var.modifiers.nocase {
-        patterns.query = match patterns.query {
-            Some(query) => {
-                //
-                let mut forms = vec![
-                    query.map_literals(&to_lowercase),
-                    query.map_literals(&to_uppercase),
-                    query,
-                ];
-
-                forms.sort_unstable();
-                forms.dedup();
-
-                patterns.warnings.push("Case insensitive strings not fully supported.".to_owned());
-                if forms.len() == 1 {
-                    forms.pop()
-                } else {
-                    Some(Query::Or(forms))
-                }
-            },
-            None => None
+        if let Some(query) = &mut patterns.query {
+            query.make_case_insensitive();
         }
     }
 
@@ -120,7 +102,7 @@ fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
 
             // include ascii version
             patterns.query = Some(if var.modifiers.ascii {
-                Query::Or(vec![wide, query])
+                Query::or(vec![wide, query]).unwrap()
             } else {
                 wide
             });
@@ -137,11 +119,7 @@ fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
             }
 
             // include ascii version
-            patterns.query = Some(if parts.len() == 1 {
-                parts.pop().unwrap()
-            } else {
-                Query::Or(parts)
-            });
+            patterns.query = Query::or(parts);
         }
     };
 
@@ -154,18 +132,18 @@ fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
                 *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
             };
 
-            *query = Query::Or(vec![
+            *query = Query::or(vec![
                 query.map_literals(&|bytes|base64_encode(0, bytes, alphabet)),
                 query.map_literals(&|bytes|base64_encode(1, bytes, alphabet)),
                 query.map_literals(&|bytes|base64_encode(2, bytes, alphabet)),
-            ]);
+            ]).unwrap();
 
             if rules.wide {
                 let wide = query.map_literals(&null_pad);
 
                 // include ascii version
                 *query = if rules.ascii {
-                    Query::Or(vec![wide, query.clone()])
+                    Query::or(vec![wide, query.clone()]).unwrap()
                 } else {
                     wide
                 };
@@ -302,7 +280,7 @@ fn parse_strings(values: &Vec<boreal_parser::hex_string::Token>, limit: usize) -
     } else if strings.len() == 1 {
         Ok(Query::Literal(strings.pop().unwrap()).into())
     } else {
-        Ok(Query::Or(strings.into_iter().map(Query::Literal).collect()).into())
+        Ok(Query::or(strings.into_iter().map(Query::Literal).collect()).into())
     }
 }
 
@@ -439,17 +417,18 @@ fn produce_regex(node: &boreal_parser::regex::Node, limit: usize) -> Vec<(bool, 
 
 /// Turn a regex into a filter query where possible
 fn parse_regex(expr: &boreal_parser::regex::Regex) -> Result<ParsedQuery> {
-    let mut warnings = vec![];
-    if expr.case_insensitive {
-        warnings.push("Case insensitive search not supported".to_owned());
-    };
-    let mut parts = produce_regex(&expr.ast, 3).into_iter().map(|(_, x, _)|Query::Literal(x)).collect_vec();
-    let query = if parts.len() <= 1 {
-        parts.pop()
+    // Get the literal segments from the regex
+    let literals = produce_regex(&expr.ast, 3);
+
+    // transform them into query parts
+    let parts = if expr.case_insensitive {
+        literals.into_iter().map(|(_, x, _)|Query::InsensitiveLiteral(x)).collect_vec()
     } else {
-        Some(Query::Or(parts))
+        literals.into_iter().map(|(_, x, _)|Query::Literal(x)).collect_vec()
     };
-    Ok(ParsedQuery { query, warnings })
+
+    // Or over those parts (or use the single value if only one)
+    Ok(ParsedQuery { query: Query::or(parts), warnings: vec![] })
 }
 
 /// Combine the output of branches that are both relevant to the search
@@ -467,7 +446,7 @@ fn combine_or(a: ParsedQuery, b: ParsedQuery) -> Result<ParsedQuery> {
         None => return Ok(ParsedQuery { query: Some(a), warnings }),
     };
 
-    Ok(ParsedQuery { query: Some(Query::Or(vec![a, b])), warnings })
+    Ok(ParsedQuery { query: Query::or(vec![a, b]), warnings })
 }
 
 /// select some variables
@@ -496,7 +475,7 @@ fn select_variables(set: &boreal_parser::expression::VariableSet, strings: &[Var
 }
 
 /// Based on the condition figure out which strings need to be considered
-fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_variable: Option<&VariableDeclaration>) -> Result<ParsedQuery> {
+pub fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_variable: Option<&VariableDeclaration>) -> Result<ParsedQuery> {
     use boreal_parser::expression::ExpressionKind;
     match &expr.expr {
         ExpressionKind::Filesize => Ok(None.into()),
@@ -554,11 +533,7 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
                     parts.push(part);
                 }
             }
-            if parts.len() <= 1 {
-                Ok(ParsedQuery { query: parts.pop(), warnings: collected_warnings })
-            } else {
-                Ok(ParsedQuery { query: Some(Query::And(parts)), warnings: collected_warnings })
-            }
+            Ok(ParsedQuery { query: Query::and(parts), warnings: collected_warnings })
         },
         ExpressionKind::Or(expr) => {
             let mut parts = vec![];
@@ -570,11 +545,7 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
                     parts.push(part);
                 }
             }
-            if parts.len() <= 1 {
-                Ok(ParsedQuery { query: parts.pop(), warnings: collected_warnings })
-            } else {
-                Ok(ParsedQuery { query: Some(Query::Or(parts)), warnings: collected_warnings })
-            }
+            Ok(ParsedQuery { query: Query::or(parts), warnings: collected_warnings })
         },
         ExpressionKind::Boolean(_) => Ok(None.into()),
         ExpressionKind::Bytes(data) => Ok(Query::Literal(data.clone()).into()),
@@ -585,16 +556,18 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
         ExpressionKind::StartsWith { expr: a, prefix: b, case_insensitive } |
         ExpressionKind::EndsWith { expr: a, suffix: b, case_insensitive } => {
             let mut out = combine_or(parse_expression(a, strings, scope_variable)?, parse_expression(b, strings, scope_variable)?)?;
-            if out.query.is_some() && *case_insensitive {
-                out.warnings.push("Case insensitivity not supported".to_owned());
+            if *case_insensitive {
+                if let Some(query) = &mut out.query {
+                    query.make_case_insensitive();
+                }
             }
             Ok(out)
         },
 
         ExpressionKind::IEquals(a, b) => {
             let mut out = combine_or(parse_expression(a, strings, scope_variable)?, parse_expression(b, strings, scope_variable)?)?;
-            if out.query.is_some() {
-                out.warnings.push("Case insensitivity not supported".to_owned());
+            if let Some(query) = &mut out.query {
+                query.make_case_insensitive();
             }
             Ok(out)
         },
@@ -629,12 +602,12 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
             }
 
             match selection {
-                boreal_parser::expression::ForSelection::Any => Ok(ParsedQuery { query: Some(Query::Or(bodies)), warnings }),
-                boreal_parser::expression::ForSelection::All => Ok(ParsedQuery { query: Some(Query::And(bodies)), warnings }),
+                boreal_parser::expression::ForSelection::Any => Ok(ParsedQuery { query: Query::or(bodies), warnings }),
+                boreal_parser::expression::ForSelection::All => Ok(ParsedQuery { query: Query::and(bodies), warnings }),
                 boreal_parser::expression::ForSelection::None => Ok(None.into()),
                 boreal_parser::expression::ForSelection::Expr { expr, as_percent } => {
                     let count = parse_expression_as_count(expr, *as_percent, bodies.len())?;
-                    Ok(ParsedQuery { query: Some(Query::MinOf(count, bodies)), warnings })
+                    Ok(ParsedQuery { query: Query::min_of(count, bodies), warnings })
                 },
             }
         },
@@ -657,12 +630,12 @@ fn parse_expression(expr: &Expression, strings: &[VariableDeclaration], scope_va
             }
 
             match selection {
-                boreal_parser::expression::ForSelection::Any => Ok(ParsedQuery { query: Some(Query::Or(bodies)), warnings }),
-                boreal_parser::expression::ForSelection::All => Ok(ParsedQuery { query: Some(Query::And(bodies)), warnings }),
+                boreal_parser::expression::ForSelection::Any => Ok(ParsedQuery { query: Query::or(bodies), warnings }),
+                boreal_parser::expression::ForSelection::All => Ok(ParsedQuery { query: Query::and(bodies), warnings }),
                 boreal_parser::expression::ForSelection::None => Ok(None.into()),
                 boreal_parser::expression::ForSelection::Expr { expr, as_percent } => {
                     let count = parse_expression_as_count(expr, *as_percent, bodies.len())?;
-                    Ok(ParsedQuery { query: Some(Query::MinOf(count, bodies)), warnings })
+                    Ok(ParsedQuery { query: Query::min_of(count, bodies), warnings })
                 },
             }
         },
@@ -694,13 +667,14 @@ fn parse_expression_as_count(expr: &Expression, percent: bool, size: usize) -> R
 
 #[cfg(test)]
 mod test {
-    use super::parse_yara_signature;
+    use crate::query::yara::yara_signature_to_phrase_query;
+
     use super::Query;
     use super::produce_regex;
 
     #[test]
     fn simple_string() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = "Content_Types"
@@ -716,7 +690,7 @@ mod test {
 
     #[test]
     fn wide_string() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = "Content_Types" wide
@@ -729,7 +703,7 @@ mod test {
         assert!(warnings.is_empty());
         assert_eq!(query, Query::Literal(b"C\0o\0n\0t\0e\0n\0t\0_\0T\0y\0p\0e\0s\0".to_vec()));
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = "Content_Types" wide ascii
@@ -740,15 +714,15 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(b"C\0o\0n\0t\0e\0n\0t\0_\0T\0y\0p\0e\0s\0".to_vec()),
             Query::Literal(b"Content_Types".to_vec()),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
     fn wildcards() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = {43 6f 6e ?? 65 6e 74}
@@ -760,17 +734,17 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(b"Con".to_vec()),
             Query::Literal(b"Cont".to_vec()),
             Query::Literal(b"ent".to_vec()),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
     fn alternation() {
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = {43 6f 6e (74 | 75) 65 6e 74}
@@ -781,12 +755,12 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(b"Content".to_vec()),
             Query::Literal(b"Conuent".to_vec()),
-        ]));
+        ]).unwrap());
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = {43 ((6f | 6f 6e) | 74 65 6e 74 | 44 ??)}
@@ -797,15 +771,15 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(b"Con".to_vec()),
             Query::Literal(b"Ctent".to_vec()),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
     fn xor() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule test_sig {
                 strings:
                     $first = "\x00\x10\xff" xor(0x00-0x03)
@@ -816,17 +790,17 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(vec![0x00, 0x10, 0xff]),
             Query::Literal(vec![0x01, 0x11, 0xfe]),
             Query::Literal(vec![0x02, 0x12, 0xfd]),
             Query::Literal(vec![0x03, 0x13, 0xfc]),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
     fn base64() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule Base64Example1 {
                 strings:
                     $a = "This program cannot" base64
@@ -837,11 +811,11 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(b"RoaXMgcHJvZ3JhbSBjYW5ub3".to_vec()),
             Query::Literal(b"UaGlzIHByb2dyYW0gY2Fubm90".to_vec()),
             Query::Literal(b"VGhpcyBwcm9ncmFtIGNhbm5vd".to_vec()),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
@@ -862,7 +836,7 @@ mod test {
 
     #[test]
     fn for_body() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule Base64Example1 {
                 strings:
                     $a1 = "1111"
@@ -876,25 +850,25 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
-            Query::And(vec![
+        assert_eq!(query, Query::or(vec![
+            Query::and(vec![
                 Query::Literal(b"1111".to_vec()),
                 Query::Literal(b"xx".to_vec()),
-            ]),
-            Query::And(vec![
+            ]).unwrap(),
+            Query::and(vec![
                 Query::Literal(b"2222".to_vec()),
                 Query::Literal(b"xx".to_vec()),
-            ]),
-            Query::And(vec![
+            ]).unwrap(),
+            Query::and(vec![
                 Query::Literal(b"3333".to_vec()),
                 Query::Literal(b"xx".to_vec()),
-            ]),
-        ]));
+            ]).unwrap(),
+        ]).unwrap());
     }
 
     #[test]
     fn n_of() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule Base64Example1 {
                 strings:
                     $a1 = "1111"
@@ -908,14 +882,14 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::MinOf(3, vec![
+        assert_eq!(query, Query::min_of(3, vec![
             Query::Literal(b"1111".to_vec()),
             Query::Literal(b"2222".to_vec()),
             Query::Literal(b"3333".to_vec()),
             Query::Literal(b"xx".to_vec()),
-        ]));
+        ]).unwrap());
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule Base64Example1 {
                 strings:
                     $a1 = "1111"
@@ -929,17 +903,17 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::MinOf(2, vec![
+        assert_eq!(query, Query::min_of(2, vec![
             Query::Literal(b"1111".to_vec()),
             Query::Literal(b"2222".to_vec()),
             Query::Literal(b"3333".to_vec()),
             Query::Literal(b"xx".to_vec()),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
     fn for_at() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule Base64Example1 {
                 strings:
                     $a1 = "1111"
@@ -953,17 +927,17 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::MinOf(2, vec![
+        assert_eq!(query, Query::min_of(2, vec![
             Query::Literal(b"1111".to_vec()),
             Query::Literal(b"2222".to_vec()),
             Query::Literal(b"3333".to_vec()),
             Query::Literal(b"xx".to_vec()),
-        ]));
+        ]).unwrap());
     }
 
     #[test]
     fn test_open_source_rule() {
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule mysql_database_presence
             {
                 meta:
@@ -983,15 +957,15 @@ mod test {
         "#).unwrap();
 
         assert!(warnings.is_empty());
-        assert_eq!(query, Query::Or(vec![
+        assert_eq!(query, Query::or(vec![
             Query::Literal(b"MySql.Data".to_vec()),
             Query::Literal(b"MySql.Data.MySqlClient".to_vec()),
             Query::Literal(b"MySqlCommand".to_vec()),
             Query::Literal(b"MySqlConnection".to_vec()),
             Query::Literal(b"MySqlDataReader".to_vec()),
-        ]));
+        ]).unwrap());
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule Str_Win32_Wininet_Library
             {
 
@@ -1009,14 +983,10 @@ mod test {
             }
         "#).unwrap();
 
-        assert!(warnings.len() == 1);
-        assert_eq!(query, Query::Or(vec![
-            Query::Literal(b"WININET.DLL".to_vec()),
-            Query::Literal(b"WININET.dll".to_vec()),
-            Query::Literal(b"wininet.dll".to_vec()),
-        ]));
+        assert!(warnings.is_empty());
+        assert_eq!(query, Query::InsensitiveLiteral(b"WININET.dll".to_vec()));
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule win_files_operation {
                 meta:
                     author = "x0r"
@@ -1041,13 +1011,10 @@ mod test {
             }
         "#).unwrap();
 
-        assert!(warnings.len() == 1);
-        assert_eq!(query, Query::And(vec![
-            Query::Or(vec![
-                Query::Literal(b"KERNEL32.DLL".to_vec()),
-                Query::Literal(b"kernel32.dll".to_vec()),
-            ]),
-            Query::MinOf(3, vec![
+        assert!(warnings.is_empty());
+        assert_eq!(query, Query::and(vec![
+            Query::InsensitiveLiteral(b"kernel32.dll".to_vec()),
+            Query::min_of(3, vec![
                 Query::Literal(b"CopyFile".to_vec()),
                 Query::Literal(b"CreateFileA".to_vec()),
                 Query::Literal(b"DeleteFileA".to_vec()),
@@ -1058,10 +1025,11 @@ mod test {
                 Query::Literal(b"SetFileAttributesA".to_vec()),
                 Query::Literal(b"SetFilePointer".to_vec()),
                 Query::Literal(b"WriteFile".to_vec()),
-            ])
-        ]));
+                Query::Literal(b"WriteFile".to_vec()),
+            ]).unwrap()
+        ]).unwrap());
 
-        let (query, warnings) = parse_yara_signature(r#"
+        let (query, warnings) = yara_signature_to_phrase_query(r#"
             rule screenshot {
                 meta:
                     author = "x0r"
@@ -1077,21 +1045,17 @@ mod test {
             }
         "#).unwrap();
 
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(query, Query::And(vec![
-            Query::Or(vec![
+        assert!(warnings.is_empty());
+        assert_eq!(query, Query::and(vec![
+            Query::or(vec![
                 Query::Literal(b"BitBlt".to_vec()),
                 Query::Literal(b"GetDC".to_vec()),
-            ]),
-            Query::Or(vec![
-                Query::Literal(b"GDI32.DLL".to_vec()),
-                Query::Literal(b"Gdi32.dll".to_vec()),
-                Query::Literal(b"USER32.DLL".to_vec()),
-                Query::Literal(b"User32.dll".to_vec()),
-                Query::Literal(b"gdi32.dll".to_vec()),
-                Query::Literal(b"user32.dll".to_vec()),
-            ]),
-        ]));
+            ]).unwrap(),
+            Query::or(vec![
+                Query::InsensitiveLiteral(b"Gdi32.dll".to_vec()),
+                Query::InsensitiveLiteral(b"User32.dll".to_vec()),
+            ]).unwrap(),
+        ]).unwrap());
     }
 
 }
