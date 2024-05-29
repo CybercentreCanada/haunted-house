@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use self::phrases::PhraseQuery;
 
 pub fn parse_yara_signature(signature: &str) -> Result<(TrigramQuery, Vec<String>)> {
-    todo!()
+    let (query, warnings) = self::yara::yara_signature_to_phrase_query(signature)?;
+    Ok((TrigramQuery::build(query), warnings))
 }
 
 
@@ -162,30 +163,6 @@ impl TrigramQueryBuilder {
         Reference::Expression(new_id)
     }
 
-    // fn optimize(&mut self) -> HashMap<usize, usize> {
-    //     let mut renames = Default::default();
-
-    //     // clean up any duplicates within or/and clauses
-    //     for expression in self.expressions.values_mut() {
-    //         match expression {
-    //             TrigramQueryExpression::Or(parts) |
-    //             TrigramQueryExpression::And(parts) => {
-    //                 parts.sort_unstable();
-    //                 parts.dedup();
-    //             }
-    //             TrigramQueryExpression::MinOf(_, _) => {},
-    //         }
-    //     }
-
-    //     //
-    //     loop {
-    //         // look 
-            
-    //         todo!("remove duplicates");
-    //     }
-
-    //     renames
-    // }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -199,6 +176,10 @@ impl TrigramQuery {
         let mut builder = TrigramQueryBuilder::new();
 
         let root = builder.insert(input);
+
+        // There is room to do some query optimization here, eg. common component removal.
+        // but I suspect it will have little improvement in total time which is probably IO bound
+        // not limited by the little bit of extra cpu used to do redundant ops in the relations
 
         // let reassignments = builder.optimize();
 
