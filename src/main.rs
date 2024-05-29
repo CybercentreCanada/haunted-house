@@ -23,6 +23,7 @@ mod counters;
 mod broker;
 mod blob_cache;
 mod worker;
+mod pool;
 
 use std::path::PathBuf;
 use std::str::FromStr;
