@@ -684,16 +684,13 @@ impl JournalFilter {
 
             // drop the listeners here so root and the ones inside nodes are the only listeners left
             // this lets the channels advance and lets readers exit when they aren't needed any more
-            println!("drop");
         }
-        println!("out of drop");
 
         // read the file ids
         let mut output = vec![];
         while let Some(value) = root.next().await {
             output.push(value);
         }
-        println!("Root finish");
         Ok(output)
     }
 
@@ -714,15 +711,6 @@ impl JournalFilter {
 }
 
 async fn query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
-    static counter: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let number = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    println!("or start {number}");
-    _query_or(output, inputs).await;
-    let number = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
-    println!("or finish {number}");
-}
-
-async fn _query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
     let mut higher_limit = u64::MAX;
     loop {
         // get the highest of the inputs
@@ -764,18 +752,8 @@ async fn _query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
 }
 
 async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
-    static counter: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let number = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    println!("and start {number} {}", inputs.len());
-    _query_and(output, inputs).await;
-    let number = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
-    println!("and finish {number}");
-}
-
-async fn _query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
     let mut candidate = u64::MAX;
     'outer: loop {
-        println!("and candidate {candidate}");
         for input in inputs.iter_mut() {
             loop {
                 match input.peek().await {
@@ -810,7 +788,6 @@ async fn _query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcas
         }
 
         // send the item discovered, if no one is listening stop
-        println!("and produce {candidate}");
         if !output.send(candidate).await {
             return
         }
@@ -881,16 +858,10 @@ async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, 
 
 
 fn trigram_reader(trigram: u32, output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) {
-    static counter: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let number = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    println!("trigram {trigram:x} reader start {number}");
-
     match _trigram_reader(trigram, output, start, pool, handle) {
         Ok(count) => debug!("Reader for {trigram:x} sent {count} items."),
         Err(err) => error!("Error in {trigram:x} reader: {err}"),
     }
-    let number = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
-    println!("trigram {trigram:x} reader finish {number}");
 }
 
 fn _trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) -> Result<usize> {
