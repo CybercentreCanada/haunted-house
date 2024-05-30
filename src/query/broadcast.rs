@@ -41,7 +41,7 @@ impl<T: Clone> Sender<T> {
             }
 
             if self.broadcast.len() == self.capacity {
-                self.notice.notified().await;
+                _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.notice.notified()).await;
                 continue
             }
 

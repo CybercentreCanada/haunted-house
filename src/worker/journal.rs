@@ -582,114 +582,118 @@ impl JournalFilter {
     /// Run a query over the trigram table.
     pub async fn query(self: &Arc<Self>, query: Arc<TrigramQuery>) -> Result<Vec<u64>> {
         use anyhow::anyhow;
+        let mut root: broadcast::Receiver<u64>;
+        {
+            // setup the network of channels
+            const CHANNEL_SIZE: usize = 1000;
+            let mut node_channels = HashMap::<usize, broadcast::Sender<u64>>::new();
+            // while we setup the network keep a copy of the listeners so that all the channels remain valid
+            let mut listeners = HashMap::<Reference, broadcast::Receiver<u64>>::new();
+            let mut trigrams = vec![];
 
-        // setup the network of channels
-        const CHANNEL_SIZE: usize = 1000;
-        let mut node_channels = HashMap::<usize, broadcast::Sender<u64>>::new();
-        // while we setup the network keep a copy of the listeners so that all the channels remain valid
-        let mut listeners = HashMap::<Reference, broadcast::Receiver<u64>>::new();
-        let mut trigrams = vec![];
+            // create a channel for each node
+            for (index, expression) in &query.expressions {
+                // collect all the active trigrams
+                for dep in expression.references() {
+                    if let Reference::Trigram(trigram) = dep {
+                        trigrams.push(*trigram);
+                    }
+                }
 
-        // create a channel for each node
-        for (index, expression) in &query.expressions {
-            // collect all the active trigrams
-            for dep in expression.references() {
-                if let Reference::Trigram(trigram) = dep {
-                    trigrams.push(*trigram);
+                // create a channel for the node
+                let (send, recv) = broadcast::channel(CHANNEL_SIZE);
+                node_channels.insert(*index, send);
+                listeners.insert(Reference::Expression(*index), recv);
+            }
+
+            // create channel for each trigram
+            trigrams.sort_unstable();
+            trigrams.dedup();
+            let mut trigram_channels = HashMap::<u32, broadcast::Sender<u64>>::new();
+            for trigram in &trigrams {
+                let (send, recv) = broadcast::channel(CHANNEL_SIZE);
+                trigram_channels.insert(*trigram, send);
+                listeners.insert(Reference::Trigram(*trigram), recv);
+            }
+
+            // grab a listener from the root, when we drop the rest of the listeners this will
+            // be what keeps the reference counts to the other operations alive
+            root = listeners.remove(&query.root).ok_or_else(|| anyhow!("Corrupt query"))?;
+
+            // prepare the listeners for each node
+            let mut node_inputs = HashMap::<usize, Vec<broadcast::Receiver<u64>>>::new();
+            for (index, expression) in &query.expressions {
+                let mut inputs = vec![];
+                for dep in expression.references() {
+                    inputs.push(match dep {
+                        Reference::Trigram(tri) => trigram_channels.get(tri).unwrap().subscribe(),
+                        Reference::Expression(index) => node_channels.get(index).unwrap().subscribe(),
+                    });
+                }
+                node_inputs.insert(*index, inputs);
+            }
+
+            // spawn the workers for the nodes
+            for (index, expression) in &query.expressions {
+                let inputs = node_inputs.remove(index).unwrap();
+                let channel = node_channels.remove(index).unwrap();
+                match expression {
+                    TrigramQueryExpression::Or(_) => tokio::spawn(query_or(channel, inputs)),
+                    TrigramQueryExpression::And(_) => tokio::spawn(query_and(channel, inputs)),
+                    TrigramQueryExpression::MinOf(count, _) => tokio::spawn(query_min_of(*count, channel, inputs)),
+                };
+            }
+
+            // get the read pool
+            let this = self.clone();
+            let (pool, mut trigram_info) = tokio::task::spawn_blocking(move || {
+                // make sure the file identities don't change during this operation
+                let guard = this.move_lock.lock();
+                if !this.is_running() {
+                    return Err(anyhow!("Filter stopping."));
+                }
+
+                // build the reader pool
+                const POOL_SIZE: usize = 16;
+                let mut pool = vec![];
+                for _ in 0..POOL_SIZE {
+                    pool.push(this._open_reader(&guard)?);
+                }
+                let pool = Pool::new(pool);
+
+                // load the information about the trigrams being searched
+                let info = AddressReader::read_set(&this.directory, this.id, trigrams, &guard)?;
+
+                Ok((pool, info))
+            }).await??;
+
+            // sort the trigrams so they spawn from the shortest to longest lists
+            trigram_info.sort_by_key(|row|row.2);
+
+            // launch the trigram readers
+            for (trigram, address, _size) in trigram_info {
+                let channel = trigram_channels.remove(&trigram).unwrap();
+                if let Some(start) = address {
+                    let pool = pool.clone();
+                    let handle = Handle::current();
+                    std::thread::spawn(move || {
+                        trigram_reader(trigram, channel, start, pool, handle);
+                    });
                 }
             }
 
-            // create a channel for the node
-            let (send, recv) = broadcast::channel(CHANNEL_SIZE);
-            node_channels.insert(*index, send);
-            listeners.insert(Reference::Expression(*index), recv);
+            // drop the listeners here so root and the ones inside nodes are the only listeners left
+            // this lets the channels advance and lets readers exit when they aren't needed any more
+            println!("drop");
         }
-
-        // create channel for each trigram
-        trigrams.sort_unstable();
-        trigrams.dedup();
-        let mut trigram_channels = HashMap::<u32, broadcast::Sender<u64>>::new();
-        for trigram in &trigrams {
-            let (send, recv) = broadcast::channel(CHANNEL_SIZE);
-            trigram_channels.insert(*trigram, send);
-            listeners.insert(Reference::Trigram(*trigram), recv);
-        }
-
-        // grab a listener from the root, when we drop the rest of the listeners this will
-        // be what keeps the reference counts to the other operations alive
-        let mut root = listeners.remove(&query.root).ok_or_else(|| anyhow!("Corrupt query"))?;
-
-        // prepare the listeners for each node
-        let mut node_inputs = HashMap::<usize, Vec<broadcast::Receiver<u64>>>::new();
-        for (index, expression) in &query.expressions {
-            let mut inputs = vec![];
-            for dep in expression.references() {
-                inputs.push(match dep {
-                    Reference::Trigram(tri) => trigram_channels.get(tri).unwrap().subscribe(),
-                    Reference::Expression(index) => node_channels.get(index).unwrap().subscribe(),
-                });
-            }
-            node_inputs.insert(*index, inputs);
-        }
-
-        // spawn the workers for the nodes
-        for (index, expression) in &query.expressions {
-            let inputs = node_inputs.remove(index).unwrap();
-            let channel = node_channels.remove(index).unwrap();
-            match expression {
-                TrigramQueryExpression::Or(_) => tokio::spawn(query_or(channel, inputs)),
-                TrigramQueryExpression::And(_) => tokio::spawn(query_and(channel, inputs)),
-                TrigramQueryExpression::MinOf(count, _) => tokio::spawn(query_min_of(*count, channel, inputs)),
-            };
-        }
-
-        // get the read pool
-        let this = self.clone();
-        let (pool, mut trigram_info) = tokio::task::spawn_blocking(move || {
-            // make sure the file identities don't change during this operation
-            let guard = this.move_lock.lock();
-            if !this.is_running() {
-                return Err(anyhow!("Filter stopping."));
-            }
-
-            // build the reader pool
-            const POOL_SIZE: usize = 16;
-            let mut pool = vec![];
-            for _ in 0..POOL_SIZE {
-                pool.push(this._open_reader(&guard)?);
-            }
-            let pool = Pool::new(pool);
-
-            // load the information about the trigrams being searched
-            let info = AddressReader::read_set(&this.directory, this.id, trigrams, &guard)?;
-
-            Ok((pool, info))
-        }).await??;
-
-        // sort the trigrams so they spawn from the shortest to longest lists
-        trigram_info.sort_by_key(|row|row.2);
-
-        // launch the trigram readers
-        for (trigram, address, _size) in trigram_info {
-            let channel = trigram_channels.remove(&trigram).unwrap();
-            if let Some(start) = address {
-                let pool = pool.clone();
-                let handle = Handle::current();
-                std::thread::spawn(move || {
-                    trigram_reader(trigram, channel, start, pool, handle);
-                });
-            }
-        }
-
-        // drop the listeners here so root and the ones inside nodes are the only listeners left
-        // this lets the channels advance and lets readers exit when they aren't needed any more
-        listeners.clear();
+        println!("out of drop");
 
         // read the file ids
         let mut output = vec![];
         while let Some(value) = root.next().await {
             output.push(value);
         }
+        println!("Root finish");
         Ok(output)
     }
 
@@ -710,6 +714,15 @@ impl JournalFilter {
 }
 
 async fn query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
+    static counter: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let number = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    println!("or start {number}");
+    _query_or(output, inputs).await;
+    let number = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+    println!("or finish {number}");
+}
+
+async fn _query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
     let mut higher_limit = u64::MAX;
     loop {
         // get the highest of the inputs
@@ -751,8 +764,18 @@ async fn query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast:
 }
 
 async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
+    static counter: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let number = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    println!("and start {number} {}", inputs.len());
+    _query_and(output, inputs).await;
+    let number = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+    println!("and finish {number}");
+}
+
+async fn _query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
     let mut candidate = u64::MAX;
     'outer: loop {
+        println!("and candidate {candidate}");
         for input in inputs.iter_mut() {
             loop {
                 match input.peek().await {
@@ -787,6 +810,7 @@ async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
         }
 
         // send the item discovered, if no one is listening stop
+        println!("and produce {candidate}");
         if !output.send(candidate).await {
             return
         }
@@ -857,10 +881,16 @@ async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, 
 
 
 fn trigram_reader(trigram: u32, output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) {
+    static counter: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let number = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    println!("trigram {trigram:x} reader start {number}");
+
     match _trigram_reader(trigram, output, start, pool, handle) {
         Ok(count) => debug!("Reader for {trigram:x} sent {count} items."),
         Err(err) => error!("Error in {trigram:x} reader: {err}"),
     }
+    let number = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+    println!("trigram {trigram:x} reader finish {number}");
 }
 
 fn _trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) -> Result<usize> {
@@ -913,10 +943,14 @@ impl CobsReader {
         let mut reader = self.pool.get();
         reader.seek(SeekFrom::Start(self.address));
         let quantity = reader.read(&mut self.read_buffer)?;
+        if quantity == 0 {
+            self.finished = true;
+            return Ok(false)
+        }
+
         self.address += quantity as u64;
 
         // Read those bytes into the cobs decoder and update our state
-        let mut bytes_read = false;
         for byte in self.read_buffer.iter().take(quantity) {
             match self.decoder.feed(*byte) {
                 Ok(cobs::DecodeResult::NoData) => continue,
@@ -925,13 +959,12 @@ impl CobsReader {
                     break
                 },
                 Ok(cobs::DecodeResult::DataContinue(out)) => {
-                    bytes_read = true;
                     output.push(out);
                 },
                 Err(_) => anyhow::bail!("Corrupt entry"),
             }
         }
-        Ok(bytes_read)
+        Ok(true)
     }
 }
 
@@ -968,7 +1001,7 @@ impl BlockReader {
 
     fn read_bytes(mut cursor: usize, mut last_value: u64, buffer: &mut Vec<u8>, output: &mut VecDeque<u64>) -> u64 {
         while let Some((value, bytes_read)) = try_decode_value(&buffer[cursor..]) {
-            last_value -= value;
+            last_value -= value + 1;
             output.push_back(last_value);
             cursor += bytes_read;
         }
@@ -1027,6 +1060,7 @@ impl TrigramCursor {
         // if we don't have a reader open the next address if we have one
         if self.block_reader.is_none() && self.next_address > 0 {
             let (reader, next_address) = BlockReader::read(self.pool.clone(), self.next_address, &mut self.values)?;
+            self.block_reader = Some(reader);
             self.next_address = next_address;
             return Ok(())
         }
@@ -1290,7 +1324,7 @@ impl Block<'_> {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
 
     use anyhow::{Result, Context};
@@ -1299,9 +1333,10 @@ mod test {
     use parking_lot::Mutex;
     use rand::{Rng, SeedableRng};
 
+    use crate::pool::Pool;
     use crate::query::phrases::PhraseQuery;
-    use crate::worker::encoding::StreamDecode;
-    use crate::worker::journal::AddressReader;
+    use crate::worker::encoding::{try_decode_value, StreamDecode};
+    use crate::worker::journal::{AddressReader, BlockReader, CobsReader, TrigramCursor};
     use crate::{query::TrigramQuery, worker::encoding::encode_into_increasing};
     use crate::types::FilterID;
     use super::JournalFilter;
@@ -1596,6 +1631,7 @@ mod test {
 
     #[tokio::test]
     async fn simple_queries() -> Result<()> {
+        init();
         // setup data
         let raw_data1 = std::include_bytes!("./journal.rs");
         let raw_data2 = std::include_bytes!("./manager.rs");
@@ -1610,7 +1646,7 @@ mod test {
         let location = tempdir.path().to_path_buf();
         let file = JournalFilter::new(location, id).await?;
         println!("write 1");
-        file.write_batch(vec![(1, trigrams1)]).await?;
+        file.write_batch(vec![(1, trigrams1.clone())]).await?;
         println!("write 2");
         file.write_batch(vec![(2, trigrams2)]).await?;
         println!("write 3");
@@ -1618,7 +1654,8 @@ mod test {
 
         // run literal query that should only be in this file
         println!("query 1");
-        let query = TrigramQuery::build(PhraseQuery::Literal(b"This shouldn't occur in any files and the odds of a false positive should be low.".to_vec()));
+        let rare_phrase = b"This shouldn't occur in any files and the odds of a false positive should be low.";
+        let query = TrigramQuery::build(PhraseQuery::Literal(rare_phrase.to_vec()));
         let hits = file.query(Arc::new(query)).await?;
         assert_eq!(hits, vec![1]);
 
@@ -1651,9 +1688,89 @@ mod test {
         let hits = file.query(Arc::new(query)).await?;
         assert_eq!(hits, vec![3, 2, 1]);
 
-        
+        println!("query 6 - prepare");
+        let mut batch = vec![];
+        let mut indices = vec![];
+        for index in 4..20000 {
+            batch.push((index, trigrams1.clone()));
+            indices.push(index);
+        };
+        indices.reverse();
+        indices.push(1);
+        file.write_batch(batch).await?;
+        println!("query 6 - query");
+        let rare_phrase = b"This shouldn't occur in any files and the odds of a false positive should be low.";
+        let query = TrigramQuery::build(PhraseQuery::Literal(rare_phrase.to_vec()));
+        let hits = file.query(Arc::new(query)).await?;
+        println!("query 6 - finish");
+        assert_eq!(hits, indices);
+
 
         return Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigram_block_reader() -> Result<()> {
+        let data = build_buffer_to_offsets(b"123");
+        let mut batch = vec![];
+        let mut indices = vec![];
+        for index in 1..20000 {
+            batch.push((index, data.clone()));
+            indices.push(index);
+        };
+        indices.reverse();
+        indices.push(1);
+
+        let tempdir = tempfile::tempdir()?;
+        let id = FilterID::from(1);
+        let location = tempdir.path().to_path_buf();
+        let file = JournalFilter::new(location.clone(), id).await?;
+        file.write_batch(batch).await?;
+
+        let (address, size) = AddressReader::read_single(&location, id, 0x313233, &Mutex::new(()).lock())?;
+        let address = address.unwrap();
+        assert_eq!(size.0, 19999);
+
+        let pool = Pool::new(vec![file._open_reader(&Mutex::new(()).lock())?]);
+
+        // test that the cobs reader can do it
+        {
+            let mut reader = CobsReader::new(address.0, pool.clone());
+            let mut output = vec![];
+            while reader.read(&mut output)? {}
+
+            let (offset, offset_len) = try_decode_value(&output[0..]).unwrap();
+            assert_eq!(offset, 0);
+            let (first_id, id_len) = try_decode_value(&output[offset_len..]).unwrap();
+            assert_eq!(first_id, 19999);
+            assert_eq!(&output[(offset_len+id_len)..], &vec![0; 19998]);
+        }
+
+        // test that the block reader can do it
+        {
+            let mut output = VecDeque::new();
+            let (mut reader, next_address) = BlockReader::read(pool.clone(), address.0, &mut output)?;
+            assert_eq!(next_address, 0);
+
+            while reader.read_more(&mut output)? {}
+            assert_eq!(output.len(), 19999);
+            assert!(output.iter().cloned().eq((1..20000).rev()), "{output:?}");
+        }
+        
+        // test that the trigram reader can do it
+        {
+            let mut reader = TrigramCursor::new(pool.clone(), address.0);
+            while !reader.finished {
+                reader.load_batch();
+            }
+            assert_eq!(reader.values.len(), 19999);
+            let mut counter = 19999;
+            while let Some(value) = reader.next() {
+                assert_eq!(counter, value);
+                counter -= 1;
+            }
+        }
+        Ok(())
     }
 
 }

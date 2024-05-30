@@ -37,7 +37,6 @@ impl<T> Pool<T> {
         loop {
             self.inner.signal.wait(&mut items);
 
-            let mut items = self.inner.items.lock();
             if let Some(item) = items.pop() {
                 return Lease {
                     borrowed: Some(item),
