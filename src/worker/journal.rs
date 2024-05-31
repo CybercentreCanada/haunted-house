@@ -777,7 +777,6 @@ async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
     'outer: loop {
         for input in inputs.iter_mut() {
             loop {
-                // println!("Waiting on {:x}", input.label);
                 match input.peek().await {
                     Some(&value) => match value.cmp(&candidate) {
                         // front of this stream is further advanced than candidate,
@@ -810,7 +809,6 @@ async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
         }
 
         // send the item discovered, if no one is listening stop
-        // debug!("and sending {candidate}");
         if !output.send(candidate).await {
             return
         }

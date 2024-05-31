@@ -66,16 +66,30 @@ impl TrigramQueryBuilder {
         self.counter - 1
     }
 
-    fn or(&self, mut values: Vec<Reference>) -> TrigramQueryExpression {
+    fn or(&mut self, mut values: Vec<Reference>) -> Reference {
         values.sort_unstable();
         values.dedup();
-        TrigramQueryExpression::Or(values)
+
+        if values.len() == 1{
+            values.pop().unwrap()
+        } else {
+            let new_id = self.next_id();
+            self.expressions.insert(new_id, TrigramQueryExpression::Or(values));
+            Reference::Expression(new_id)
+        }
     }
 
-    fn and(&self, mut values: Vec<Reference>) -> TrigramQueryExpression {
+    fn and(&mut self, mut values: Vec<Reference>) -> Reference {
         values.sort_unstable();
         values.dedup();
-        TrigramQueryExpression::And(values)
+
+        if values.len() == 1{
+            values.pop().unwrap()
+        } else {
+            let new_id = self.next_id();
+            self.expressions.insert(new_id, TrigramQueryExpression::And(values));
+            Reference::Expression(new_id)
+        }
     }
 
     fn min_of(&self, expected: i32, values: Vec<Reference>) -> TrigramQueryExpression {
@@ -102,9 +116,7 @@ impl TrigramQueryBuilder {
                 for part in parts {
                     expressions.push(self.insert(part));
                 }
-                let new_id = self.next_id();
-                self.expressions.insert(new_id, self.or(expressions));
-                Reference::Expression(new_id)
+                self.or(expressions)
             }
 
             PhraseQuery::And(parts) => {
@@ -112,9 +124,7 @@ impl TrigramQueryBuilder {
                 for part in parts {
                     expressions.push(self.insert(part));
                 }
-                let new_id = self.next_id();
-                self.expressions.insert(new_id, self.and(expressions));
-                Reference::Expression(new_id)
+                self.and(expressions)
             }
 
             PhraseQuery::MinOf(expected, parts) => {
@@ -135,9 +145,7 @@ impl TrigramQueryBuilder {
                     trigram = ((trigram << 8) | byte as u32) & 0xFFFFFF;
                     expressions.push(Reference::Trigram(trigram));
                 }
-                let new_id = self.next_id();
-                self.expressions.insert(new_id, self.and(expressions));
-                Reference::Expression(new_id)
+                self.and(expressions)
             }
 
             PhraseQuery::InsensitiveLiteral(literal) => {
@@ -145,9 +153,7 @@ impl TrigramQueryBuilder {
                 for window in literal.windows(3) {
                     expressions.push(self.insert_case_insensitive(window.try_into().unwrap()));
                 }
-                let new_id = self.next_id();
-                self.expressions.insert(new_id, self.and(expressions));
-                Reference::Expression(new_id)
+                self.and(expressions)
             }
         }
     }
@@ -169,7 +175,7 @@ impl TrigramQueryBuilder {
             return Reference::from_array(lower);
         }
 
-        let mut entries = vec![
+        self.or(vec![
             Reference::from_values(lower[0], lower[1], lower[2]),
             Reference::from_values(lower[0], lower[1], upper[2]),
             Reference::from_values(lower[0], upper[1], lower[2]),
@@ -178,16 +184,7 @@ impl TrigramQueryBuilder {
             Reference::from_values(upper[0], lower[1], upper[2]),
             Reference::from_values(upper[0], upper[1], lower[2]),
             Reference::from_values(upper[0], upper[1], upper[2]),
-        ];
-
-        entries.sort_unstable();
-        entries.dedup();
-
-        let new_id = self.next_id();
-
-        self.expressions.insert(new_id, self.or(entries));
-
-        Reference::Expression(new_id)
+        ])
     }
 
 }
