@@ -241,9 +241,9 @@ pub struct NullCapture {
 
 impl NullCapture {
     /// Create a non-capturing drop in
-    pub fn new() -> Self {
-        Self {index: None}
-    }
+    // pub fn new() -> Self {
+    //     Self {index: None}
+    // }
 
     pub fn new_mark(index: usize) -> Self {
         Self {index: Some(index)}
@@ -302,7 +302,8 @@ async fn load_process_memory(pid: u64) -> u64 {
     0
 }
 
-///
+/// Try to estimate memory usage within a container by checking the memory
+/// usage of all processes we can see
 async fn load_memory() -> u64 {
     let mut total: u64 = 0;
     let mut iter = match tokio::fs::read_dir("/proc/").await {
