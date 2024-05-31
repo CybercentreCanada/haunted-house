@@ -59,17 +59,23 @@ impl WorkerState {
         {
             let today = ExpiryGroup::today();
             let mut filters = new.filters.write().await;
+            let mut loaded = HashSet::new();
+            let mut futures = vec![];
             for (id, expiry) in new.database.get_expiry(&ExpiryGroup::min(), &ExpiryGroup::max()).await? {
                 if expiry < today {
                     to_delete.push(id);
                     continue
                 }
 
-                if filters.contains_key(&id) {
+                if !loaded.insert(id) {
                     error!("Duplicate filter?");
                     continue
                 }
-                let worker = JournalFilter::open(filter_directory.clone(), id).await?;
+                futures.push((id, tokio::spawn(JournalFilter::open(filter_directory.clone(), id))));
+            }
+
+            for (id, future) in futures {
+                let worker = future.await??;
                 tokio::spawn(new.clone().ingest_feeder(id, worker.clone()));
                 filters.insert(id, worker);
             }
