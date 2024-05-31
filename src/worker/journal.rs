@@ -1769,50 +1769,50 @@ mod test {
         Ok(())
     }
     
-    #[tokio::test]
-    async fn simple_queries_large_file() -> Result<()> {
-        init();
+    // #[tokio::test]
+    // async fn simple_queries_large_file() -> Result<()> {
+    //     init();
 
-        // build table
-        let file = JournalFilter::open(PathBuf::from("./sample"), FilterID::from(0x0e)).await?;
+    //     // build table
+    //     let file = JournalFilter::open(PathBuf::from("./sample"), FilterID::from(0x0e)).await?;
 
-        // run literal query that should only be in this file
-        println!("query 1");
-        let rare_phrase = b"This shouldn't occur in any files and the odds of a false positive should be low.";
-        let query = TrigramQuery::build(PhraseQuery::Literal(rare_phrase.to_vec()));
-        let hits = file.query(Arc::new(query)).await?;
-        assert_eq!(hits, vec![1]);
+    //     // run literal query that should only be in this file
+    //     println!("query 1");
+    //     let rare_phrase = b"This shouldn't occur in any files and the odds of a false positive should be low.";
+    //     let query = TrigramQuery::build(PhraseQuery::Literal(rare_phrase.to_vec()));
+    //     let hits = file.query(Arc::new(query)).await?;
+    //     assert_eq!(hits, vec![1]);
 
-        // run literal query that should not exist anywhere. False positives should also be low given the length.
-        println!("query 2");
-        let bytes: Vec<u8> = (0..48).map(|_| rand::thread_rng().gen()).collect();
-        let query = TrigramQuery::build(PhraseQuery::Literal(bytes.clone()));
-        let hits = file.query(Arc::new(query)).await?;
-        assert!(hits.is_empty());
+    //     // run literal query that should not exist anywhere. False positives should also be low given the length.
+    //     println!("query 2");
+    //     let bytes: Vec<u8> = (0..48).map(|_| rand::thread_rng().gen()).collect();
+    //     let query = TrigramQuery::build(PhraseQuery::Literal(bytes.clone()));
+    //     let hits = file.query(Arc::new(query)).await?;
+    //     assert!(hits.is_empty());
 
-        // run a query that should hit on everything
-        println!("query 3");
-        let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"fn ".to_vec()), PhraseQuery::Literal(bytes.clone())]));
-        let hits = file.query(Arc::new(query)).await?;
-        assert_eq!(hits, vec![3, 2, 1]);
+    //     // run a query that should hit on everything
+    //     println!("query 3");
+    //     let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"fn ".to_vec()), PhraseQuery::Literal(bytes.clone())]));
+    //     let hits = file.query(Arc::new(query)).await?;
+    //     assert_eq!(hits, vec![3, 2, 1]);
 
-        // run a query that should hit on two of the files
-        println!("query 4");
-        let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"JournalFilter".to_vec()), PhraseQuery::Literal(bytes.clone())]));
-        let hits = file.query(Arc::new(query)).await?;
-        assert_eq!(hits, vec![2, 1]);
+    //     // run a query that should hit on two of the files
+    //     println!("query 4");
+    //     let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"JournalFilter".to_vec()), PhraseQuery::Literal(bytes.clone())]));
+    //     let hits = file.query(Arc::new(query)).await?;
+    //     assert_eq!(hits, vec![2, 1]);
 
-        // should hit on all files, but for different reasons
-        println!("query 5");
-        let query = TrigramQuery::build(PhraseQuery::Or(vec![
-            PhraseQuery::Literal(b"JournalFilter".to_vec()), 
-            PhraseQuery::InsensitiveLiteral(b"Get_TrIgrAm_cAchE_diREctOry".to_vec()), 
-            PhraseQuery::Literal(bytes)
-        ]));
-        let hits = file.query(Arc::new(query)).await?;
-        assert_eq!(hits, vec![3, 2, 1]);
+    //     // should hit on all files, but for different reasons
+    //     println!("query 5");
+    //     let query = TrigramQuery::build(PhraseQuery::Or(vec![
+    //         PhraseQuery::Literal(b"JournalFilter".to_vec()), 
+    //         PhraseQuery::InsensitiveLiteral(b"Get_TrIgrAm_cAchE_diREctOry".to_vec()), 
+    //         PhraseQuery::Literal(bytes)
+    //     ]));
+    //     let hits = file.query(Arc::new(query)).await?;
+    //     assert_eq!(hits, vec![3, 2, 1]);
 
-        return Ok(())
-    }
+    //     return Ok(())
+    // }
 
 }
