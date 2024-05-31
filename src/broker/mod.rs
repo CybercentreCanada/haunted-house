@@ -1050,27 +1050,8 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
         return Ok(())
     }
 
-    // Make sure the search is initialized
-    let query: serde_json::Value = match serde_json::from_str(&status.raw_query) {
-        Ok(query) => query,
-        Err(err) => {
-            core.database.fatal_error(status, format!("Could not load query: {err}")).await?;
-            return Ok(())
-        }
-    };
-
-    let query = if let Some(obj) = query.as_object(){
-        if obj.contains_key("expressions") {
-            serde_json::from_value(query)?
-        } else {
-            let query: PhraseQuery = serde_json::from_value(query)?;
-            TrigramQuery::build(query)
-        }
-    } else {
-        core.database.fatal_error(status, format!("Query was not layed out as json object")).await?;
-        return Ok(())
-    };
-
+    // Make sure search is initialized
+    let (query, _) = parse_yara_signature(&status.yara_signature)?;
     let start_group = ExpiryGroup::from(status.start_group);
     let end_group = ExpiryGroup::from(status.end_group);
     let search_view = match core.prepare_access(status.search_classification.as_str()) {
