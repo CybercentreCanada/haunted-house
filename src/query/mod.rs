@@ -4,7 +4,7 @@ pub mod broadcast;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use self::phrases::PhraseQuery;
 
@@ -35,7 +35,7 @@ impl Reference {
 pub enum TrigramQueryExpression {
     Or(Vec<Reference>),
     And(Vec<Reference>),
-    MinOf(i32, Vec<Reference>),
+    MinOf(i32, Vec<Reference>, Vec<usize>),
 }
 
 impl TrigramQueryExpression {
@@ -43,7 +43,7 @@ impl TrigramQueryExpression {
         match self {
             TrigramQueryExpression::Or(refs) => refs,
             TrigramQueryExpression::And(refs) => refs,
-            TrigramQueryExpression::MinOf(_, refs) => refs,
+            TrigramQueryExpression::MinOf(_, refs, _) => refs,
         }
     }
 }
@@ -66,6 +66,35 @@ impl TrigramQueryBuilder {
         self.counter - 1
     }
 
+    fn or(&self, mut values: Vec<Reference>) -> TrigramQueryExpression {
+        values.sort_unstable();
+        values.dedup();
+        TrigramQueryExpression::Or(values)
+    }
+
+    fn and(&self, mut values: Vec<Reference>) -> TrigramQueryExpression {
+        values.sort_unstable();
+        values.dedup();
+        TrigramQueryExpression::And(values)
+    }
+
+    fn min_of(&self, expected: i32, values: Vec<Reference>) -> TrigramQueryExpression {
+        let mut counted = HashMap::new();
+        for input in values {
+            *counted.entry(input).or_default() += 1;
+        }
+
+        let mut values = vec![];
+        let mut counts = vec![];
+
+        for (val, count) in counted {
+            values.push(val);
+            counts.push(count);
+        }
+
+        TrigramQueryExpression::MinOf(expected, values, counts)
+    }
+
     fn insert(&mut self, input: PhraseQuery) -> Reference {
         match input {
             PhraseQuery::Or(parts) => {
@@ -74,7 +103,7 @@ impl TrigramQueryBuilder {
                     expressions.push(self.insert(part));
                 }
                 let new_id = self.next_id();
-                self.expressions.insert(new_id, TrigramQueryExpression::Or(expressions));
+                self.expressions.insert(new_id, self.or(expressions));
                 Reference::Expression(new_id)
             }
 
@@ -84,7 +113,7 @@ impl TrigramQueryBuilder {
                     expressions.push(self.insert(part));
                 }
                 let new_id = self.next_id();
-                self.expressions.insert(new_id, TrigramQueryExpression::And(expressions));
+                self.expressions.insert(new_id, self.and(expressions));
                 Reference::Expression(new_id)
             }
 
@@ -94,7 +123,7 @@ impl TrigramQueryBuilder {
                     expressions.push(self.insert(part));
                 }
                 let new_id = self.next_id();
-                self.expressions.insert(new_id, TrigramQueryExpression::MinOf(expected, expressions));
+                self.expressions.insert(new_id, self.min_of(expected, expressions));
 
                 Reference::Expression(new_id)
             }
@@ -107,7 +136,7 @@ impl TrigramQueryBuilder {
                     expressions.push(Reference::Trigram(trigram));
                 }
                 let new_id = self.next_id();
-                self.expressions.insert(new_id, TrigramQueryExpression::And(expressions));
+                self.expressions.insert(new_id, self.and(expressions));
                 Reference::Expression(new_id)
             }
 
@@ -117,7 +146,7 @@ impl TrigramQueryBuilder {
                     expressions.push(self.insert_case_insensitive(window.try_into().unwrap()));
                 }
                 let new_id = self.next_id();
-                self.expressions.insert(new_id, TrigramQueryExpression::And(expressions));
+                self.expressions.insert(new_id, self.and(expressions));
                 Reference::Expression(new_id)
             }
         }
@@ -152,13 +181,11 @@ impl TrigramQueryBuilder {
         ];
 
         entries.sort_unstable();
-
         entries.dedup();
 
         let new_id = self.next_id();
 
-        self.expressions
-            .insert(new_id, TrigramQueryExpression::Or(entries));
+        self.expressions.insert(new_id, self.or(entries));
 
         Reference::Expression(new_id)
     }

@@ -11,11 +11,13 @@ pub fn channel<T: Clone>(depth: usize) -> (Sender<T>, Receiver<T>) {
 
     (
         Sender {
+            label: 0,
             capacity: depth,
             broadcast: sender,
             notice: notify.clone(),
         },
         Receiver {
+            label: 0,
             broadcast: receiver,
             notice: notify,
             next: None,
@@ -24,6 +26,7 @@ pub fn channel<T: Clone>(depth: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 pub struct Sender<T: Clone> {
+    pub label: u32,
     capacity: usize,
     broadcast: tokio::sync::broadcast::Sender<T>,
     notice: Arc<tokio::sync::Notify>,
@@ -51,6 +54,7 @@ impl<T: Clone> Sender<T> {
 
     pub fn subscribe(&self) -> Receiver<T> {
         Receiver { 
+            label: self.label,
             broadcast: self.broadcast.subscribe(), 
             notice: self.notice.clone(),
             next: None
@@ -59,6 +63,7 @@ impl<T: Clone> Sender<T> {
 }
 
 pub struct Receiver<T: Clone> {
+    pub label: u32,
     broadcast: tokio::sync::broadcast::Receiver<T>,
     notice: Arc<tokio::sync::Notify>,
     next: Option<Option<T>>,
@@ -89,5 +94,11 @@ impl<T: Clone> Receiver<T> {
                 }
             })
         }
+    }
+}
+
+impl<T: Clone> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.notice.notify_one()
     }
 }

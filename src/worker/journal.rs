@@ -611,7 +611,9 @@ impl JournalFilter {
             trigrams.dedup();
             let mut trigram_channels = HashMap::<u32, broadcast::Sender<u64>>::new();
             for trigram in &trigrams {
-                let (send, recv) = broadcast::channel(CHANNEL_SIZE);
+                let (mut send, mut recv) = broadcast::channel(CHANNEL_SIZE);
+                send.label = *trigram;
+                recv.label = *trigram;
                 trigram_channels.insert(*trigram, send);
                 listeners.insert(Reference::Trigram(*trigram), recv);
             }
@@ -640,7 +642,7 @@ impl JournalFilter {
                 match expression {
                     TrigramQueryExpression::Or(_) => tokio::spawn(query_or(channel, inputs)),
                     TrigramQueryExpression::And(_) => tokio::spawn(query_and(channel, inputs)),
-                    TrigramQueryExpression::MinOf(count, _) => tokio::spawn(query_min_of(*count, channel, inputs)),
+                    TrigramQueryExpression::MinOf(count, _, weights) => tokio::spawn(query_min_of(*count, channel, inputs, weights.clone())),
                 };
             }
 
@@ -671,15 +673,21 @@ impl JournalFilter {
             trigram_info.sort_by_key(|row|row.2);
 
             // launch the trigram readers
+            let reader_token = Token::new();
             for (trigram, address, _size) in trigram_info {
                 let channel = trigram_channels.remove(&trigram).unwrap();
+                let token = reader_token.clone();
                 if let Some(start) = address {
                     let pool = pool.clone();
                     let handle = Handle::current();
                     std::thread::spawn(move || {
-                        trigram_reader(trigram, channel, start, pool, handle);
+                        trigram_reader(trigram, channel, start, pool, handle, token);
                     });
                 }
+            }
+
+            if !trigram_channels.is_empty() {
+                anyhow::bail!("dangling channels");
             }
 
             // drop the listeners here so root and the ones inside nodes are the only listeners left
@@ -707,6 +715,19 @@ impl JournalFilter {
             let metadata = this.write_handle.lock().metadata()?;
             Ok(metadata.modified()?.elapsed()?)
         }).await?
+    }
+}
+
+#[derive(Clone)]
+struct Token(Arc<()>);
+
+impl Token {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn count(&self) -> usize {
+        Arc::strong_count(&self.0)
     }
 }
 
@@ -756,6 +777,7 @@ async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
     'outer: loop {
         for input in inputs.iter_mut() {
             loop {
+                // println!("Waiting on {:x}", input.label);
                 match input.peek().await {
                     Some(&value) => match value.cmp(&candidate) {
                         // front of this stream is further advanced than candidate,
@@ -788,6 +810,7 @@ async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
         }
 
         // send the item discovered, if no one is listening stop
+        // debug!("and sending {candidate}");
         if !output.send(candidate).await {
             return
         }
@@ -797,7 +820,7 @@ async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast
     }
 }
 
-async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
+async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>, weights: Vec<usize>) {
     let mut higher_limit = u64::MAX;
     loop {
         if !output.is_connected() {
@@ -837,15 +860,15 @@ async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, 
 
         // count if this item has hit the threshold
         let mut count = 0;
-        for input in inputs.iter_mut() {
+        for (index, input) in inputs.iter_mut().enumerate() {
             if let Some(&item) = input.peek().await {
                 if item == higher_limit {
-                    count += 1;
+                    count += weights[index];
                 }
             }
         }
 
-        if count < count_threshold {
+        if (count as i32) < count_threshold {
             continue
         }
 
@@ -857,9 +880,10 @@ async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, 
 }
 
 
-fn trigram_reader(trigram: u32, output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) {
+fn trigram_reader(trigram: u32, output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle, token: Token) {
+    debug!("Starting trigram reader {trigram:x}");
     match _trigram_reader(trigram, output, start, pool, handle) {
-        Ok(count) => debug!("Reader for {trigram:x} sent {count} items."),
+        Ok(count) => debug!("Reader for {trigram:x} sent {count} items. {} trigram readers remaining.", token.count() - 1),
         Err(err) => error!("Error in {trigram:x} reader: {err}"),
     }
 }
@@ -868,8 +892,10 @@ fn _trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Addr
     let mut cursor = TrigramCursor::new(pool, start.0);
     let mut sent_count = 0;
     while !cursor.finished {
+        debug!("{trigram:x} reader loading");
         cursor.load_batch()?;
 
+        debug!("{trigram:x} reader sending");
         let sent = handle.block_on(async {
             while let Some(value) = cursor.next() {
                 if !output.send(value).await {
@@ -1296,6 +1322,7 @@ impl Block<'_> {
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use anyhow::{Result, Context};
@@ -1742,6 +1769,52 @@ mod test {
             }
         }
         Ok(())
+    }
+    
+    #[tokio::test]
+    async fn simple_queries_large_file() -> Result<()> {
+        init();
+
+        // build table
+        let file = JournalFilter::open(PathBuf::from("./sample"), FilterID::from(0x0e)).await?;
+
+        // run literal query that should only be in this file
+        println!("query 1");
+        let rare_phrase = b"This shouldn't occur in any files and the odds of a false positive should be low.";
+        let query = TrigramQuery::build(PhraseQuery::Literal(rare_phrase.to_vec()));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![1]);
+
+        // run literal query that should not exist anywhere. False positives should also be low given the length.
+        println!("query 2");
+        let bytes: Vec<u8> = (0..48).map(|_| rand::thread_rng().gen()).collect();
+        let query = TrigramQuery::build(PhraseQuery::Literal(bytes.clone()));
+        let hits = file.query(Arc::new(query)).await?;
+        assert!(hits.is_empty());
+
+        // run a query that should hit on everything
+        println!("query 3");
+        let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"fn ".to_vec()), PhraseQuery::Literal(bytes.clone())]));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![3, 2, 1]);
+
+        // run a query that should hit on two of the files
+        println!("query 4");
+        let query = TrigramQuery::build(PhraseQuery::Or(vec![PhraseQuery::Literal(b"JournalFilter".to_vec()), PhraseQuery::Literal(bytes.clone())]));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![2, 1]);
+
+        // should hit on all files, but for different reasons
+        println!("query 5");
+        let query = TrigramQuery::build(PhraseQuery::Or(vec![
+            PhraseQuery::Literal(b"JournalFilter".to_vec()), 
+            PhraseQuery::InsensitiveLiteral(b"Get_TrIgrAm_cAchE_diREctOry".to_vec()), 
+            PhraseQuery::Literal(bytes)
+        ]));
+        let hits = file.query(Arc::new(query)).await?;
+        assert_eq!(hits, vec![3, 2, 1]);
+
+        return Ok(())
     }
 
 }
