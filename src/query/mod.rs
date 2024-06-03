@@ -3,6 +3,7 @@ mod yara;
 pub mod broadcast;
 
 use anyhow::Result;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,7 +16,7 @@ pub fn parse_yara_signature(signature: &str) -> Result<(TrigramQuery, Vec<String
 
 
 #[derive(Serialize, Deserialize)]
-#[derive(PartialEq, PartialOrd, Eq, Ord, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Hash, Clone, Copy)]
 pub enum Reference {
     Trigram(u32),
     Expression(usize),
@@ -31,7 +32,7 @@ impl Reference {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TrigramQueryExpression {
     Or(Vec<Reference>),
     And(Vec<Reference>),
@@ -215,5 +216,17 @@ impl TrigramQuery {
             root,
             expressions: builder.expressions,
         }
+    }
+}
+
+impl std::fmt::Debug for TrigramQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("root: {:x?}\n", self.root))?;
+        let mut keys = self.expressions.keys().collect_vec();
+        keys.sort_unstable();
+        for key in keys {
+            f.write_fmt(format_args!("{key:x}: {:x?}\n", self.expressions.get(key).unwrap()))?;
+        }
+        Ok(())
     }
 }

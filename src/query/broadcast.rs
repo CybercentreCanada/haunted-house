@@ -1,25 +1,17 @@
+/// Reproduce a broadcast like interface using unbounded channels.
 
-use std::sync::Arc;
+pub fn channel<T: Clone>(label: u32) -> (Sender<T>, Receiver<T>) {
 
-use log::error;
-use tokio::sync::broadcast::error::RecvError;
-
-pub fn channel<T: Clone>(depth: usize) -> (Sender<T>, Receiver<T>) {
-    let notify = Arc::new(tokio::sync::Notify::new());
-
-    let (sender, receiver) = tokio::sync::broadcast::channel(depth);
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
     (
         Sender {
-            label: 0,
-            capacity: depth,
-            broadcast: sender,
-            notice: notify.clone(),
+            label,
+            outputs: vec![sender],
         },
         Receiver {
-            label: 0,
-            broadcast: receiver,
-            notice: notify,
+            label,
+            input: receiver,
             next: None,
         },
     )
@@ -27,36 +19,30 @@ pub fn channel<T: Clone>(depth: usize) -> (Sender<T>, Receiver<T>) {
 
 pub struct Sender<T: Clone> {
     pub label: u32,
-    capacity: usize,
-    broadcast: tokio::sync::broadcast::Sender<T>,
-    notice: Arc<tokio::sync::Notify>,
+    outputs: Vec<tokio::sync::mpsc::UnboundedSender<T>>,
 }
 
 impl<T: Clone> Sender<T> {
-    pub fn is_connected(&self) -> bool {
-        self.broadcast.receiver_count() > 0
+    pub fn is_connected(&mut self) -> bool {
+        self.outputs.retain(|con|!con.is_closed());
+        !self.outputs.is_empty()
     }
 
-    pub async fn send(&mut self, value: T) -> bool {
-        loop {
-            if !self.is_connected() {
-                return false
-            }
-
-            if self.broadcast.len() == self.capacity {
-                _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.notice.notified()).await;
-                continue
-            }
-
-            return self.broadcast.send(value).is_ok();
+    pub fn send(&mut self, value: T) -> bool {
+        for channel in &self.outputs {
+            _ = channel.send(value.clone());
         }
+
+        self.is_connected()
     }
 
-    pub fn subscribe(&self) -> Receiver<T> {
+    pub fn subscribe(&mut self) -> Receiver<T> {
+        let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+        self.outputs.push(send);
+
         Receiver { 
             label: self.label,
-            broadcast: self.broadcast.subscribe(), 
-            notice: self.notice.clone(),
+            input: recv,
             next: None
         }
     }
@@ -64,8 +50,7 @@ impl<T: Clone> Sender<T> {
 
 pub struct Receiver<T: Clone> {
     pub label: u32,
-    broadcast: tokio::sync::broadcast::Receiver<T>,
-    notice: Arc<tokio::sync::Notify>,
+    input: tokio::sync::mpsc::UnboundedReceiver<T>,
     next: Option<Option<T>>,
 }
 
@@ -80,25 +65,34 @@ impl<T: Clone> Receiver<T> {
         self.next.as_ref().unwrap().as_ref()
     }
 
+    pub async fn skip(&mut self) {
+        if self.next.is_some() {
+            self.next = None;
+            return
+        }
+        self.fetch_next().await;
+        self.next = None;
+    }
+
     async fn fetch_next(&mut self) {
         if self.next.is_none() {
-            self.next = Some(match self.broadcast.recv().await {
-                Ok(value) => { 
-                    self.notice.notify_waiters();
-                    Some(value)
-                },
-                Err(RecvError::Closed) => None,
-                Err(RecvError::Lagged(_)) => {
-                    error!("Safe broadcast acted unsafely");
-                    None
-                }
-            })
+            self.next = Some(self.input.recv().await)
         }
     }
 }
 
-impl<T: Clone> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        self.notice.notify_one()
-    }
+
+#[tokio::test]
+async fn test_drop_delivery() {
+    let mut recv = {
+        let (mut send, recv) = channel(0);
+        assert!(send.send(1));
+        assert!(send.send(2));
+        assert!(send.send(3));
+        recv
+    };
+    assert_eq!(recv.next().await, Some(1));
+    assert_eq!(recv.next().await, Some(2));
+    assert_eq!(recv.next().await, Some(3));
+    assert!(recv.next().await.is_none());
 }

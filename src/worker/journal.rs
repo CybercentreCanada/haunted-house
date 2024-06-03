@@ -601,7 +601,7 @@ impl JournalFilter {
                 }
 
                 // create a channel for the node
-                let (send, recv) = broadcast::channel(CHANNEL_SIZE);
+                let (send, recv) = broadcast::channel(*index as u32);
                 node_channels.insert(*index, send);
                 listeners.insert(Reference::Expression(*index), recv);
             }
@@ -611,9 +611,7 @@ impl JournalFilter {
             trigrams.dedup();
             let mut trigram_channels = HashMap::<u32, broadcast::Sender<u64>>::new();
             for trigram in &trigrams {
-                let (mut send, mut recv) = broadcast::channel(CHANNEL_SIZE);
-                send.label = *trigram;
-                recv.label = *trigram;
+                let (send, recv) = broadcast::channel(*trigram);
                 trigram_channels.insert(*trigram, send);
                 listeners.insert(Reference::Trigram(*trigram), recv);
             }
@@ -628,8 +626,8 @@ impl JournalFilter {
                 let mut inputs = vec![];
                 for dep in expression.references() {
                     inputs.push(match dep {
-                        Reference::Trigram(tri) => trigram_channels.get(tri).unwrap().subscribe(),
-                        Reference::Expression(index) => node_channels.get(index).unwrap().subscribe(),
+                        Reference::Trigram(tri) => trigram_channels.get_mut(tri).unwrap().subscribe(),
+                        Reference::Expression(index) => node_channels.get_mut(index).unwrap().subscribe(),
                     });
                 }
                 node_inputs.insert(*index, inputs);
@@ -669,8 +667,8 @@ impl JournalFilter {
                 Ok((pool, info))
             }).await??;
 
-            // sort the trigrams so they spawn from the shortest to longest lists
-            trigram_info.sort_by_key(|row|row.2);
+            // // sort the trigrams so they spawn from the shortest to longest lists
+            // trigram_info.sort_by_key(|row|row.2);
 
             // launch the trigram readers
             let reader_token = Token::new();
@@ -732,161 +730,184 @@ impl Token {
 }
 
 async fn query_or(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
-    let mut higher_limit = u64::MAX;
-    loop {
+    while output.is_connected() {
         // get the highest of the inputs
         let mut candidate_for_next = None;
         for input in inputs.iter_mut() {
-            loop {
                 if let Some(&item) = input.peek().await {
-                    // this item has already been sent, move to next
-                    if item >= higher_limit {
-                        input.next().await;
-                        continue
-                    }
-
-                    // consider this item for the next
-                    match candidate_for_next {
-                        Some(candidate) => if candidate < item {
-                            candidate_for_next = Some(item)
-                        },
-                        None => {
-                            candidate_for_next = Some(item)
-                        }
-                    }
-                }
-                break
+                candidate_for_next = candidate_for_next.map_or(Some(item), |candidate: u64| Some(candidate.max(item)));
             }
         }
 
-        // if we have run out of items stop
-        higher_limit = match candidate_for_next {
+        // if all the streams are empty we can stop
+        let next_value = match candidate_for_next {
             Some(value) => value,
-            None => return
+            None => return,
         };
 
-        // send the item discovered, if no one is listening stop
-        if !output.send(higher_limit).await {
-            return
+        // pop any streams that are on this value
+        for input in inputs.iter_mut() {
+            if let Some(&item) = input.peek().await {
+                if item == next_value {
+                    input.skip().await;
+                }
+            }
         }
+
+        // send the item discovered
+        output.send(next_value);
     }
 }
 
 async fn query_and(mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>) {
-    let mut candidate = u64::MAX;
-    'outer: loop {
+    'outer: while output.is_connected() {  
+
+        // get the minimum value across all inputs        
+        let mut candidate_for_next = None;
         for input in inputs.iter_mut() {
-            loop {
-                match input.peek().await {
-                    Some(&value) => match value.cmp(&candidate) {
-                        // front of this stream is further advanced than candidate,
-                        // advance candidate cursor to match this stream and restart search
+            if let Some(&item) = input.peek().await {
+                candidate_for_next = match candidate_for_next {
+                    Some(candidate) => Some(item.min(candidate)),
+                    None => Some(item)
+        };
+            } else {
+                // if any stream is empty we can exit
+            return
+        }
+        }
+
+        // if the inputs are empty stop here
+        let candidate = match candidate_for_next {
+            Some(value) => value,
+            None => return,
+        };
+
+        // loop over all the inputs giving them all a chance to advance until they are either equal or past the candidate
+        while output.is_connected() {
+            let mut lower = 0;
+            let mut higher = 0;
+
+        for input in inputs.iter_mut() {
+                if let Some(&item) = input.peek().await {
+                    match item.cmp(&candidate) {
+                        // this stream has moved past the candid
                         std::cmp::Ordering::Less => {
-                            candidate = value;
-                            continue 'outer
+                            lower += 1;
                         },
-                        // cursor and stream match, fall through to next stream
                         std::cmp::Ordering::Equal => {},
-                        // cursor is behind candidate, advance stream and check again
                         std::cmp::Ordering::Greater => {
-                            input.next().await;
-                            continue
+                            input.skip().await;
+                            higher += 1;
                         },
-                    },
-                    // if any of our streams have completed, stop
-                    None => {
+                    }
+                } else {
+                    // if any stream is empty we can exit
                         return
-                    },
                 }
-                break
+        }
+
+            // if any of the streams are still on higher values give them a chance to catch up
+            // do this even if we know this candidate won't be usable
+            if higher > 0 {
+                continue
+        }
+
+            // everything is caught up, but this candidate isn't usable, get a new candidate value
+            if lower > 0 {
+                continue 'outer
+            }
+
+            // everything is equal, we can use this candidate
+            break
+        }
+
+        // pop all streams that are on this value 
+        for input in inputs.iter_mut() {
+                if let Some(&item) = input.peek().await {
+                if item == candidate {
+                    input.skip().await;
+                }
             }
         }
 
-        // if we have reached the end of the iteration over inputs we may have a new id to send,
-        // alternately we have found _nothing_ and the candidate is still at the limit
-        if candidate == u64::MAX {
-            return
-        }
-
-        // send the item discovered, if no one is listening stop
-        if !output.send(candidate).await {
-            return
-        }
-        // advance to the next possible candidate, even if it isn't in the streams, the above
-        // loop will skip this value if the inputs don't have it
-        candidate -= 1;
+        // send the item discovered
+        output.send(candidate);
     }
 }
 
-async fn query_min_of(count_threshold: i32, mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>, weights: Vec<usize>) {
-    let mut higher_limit = u64::MAX;
-    loop {
-        if !output.is_connected() {
-            return
-        }
 
-        // get the highest of the inputs
+async fn query_min_of(count: i32, mut output: broadcast::Sender<u64>, mut inputs: Vec<broadcast::Receiver<u64>>, weights: Vec<usize>) {
+    while output.is_connected() {  
+
+        // get the maximum value across all inputs        
         let mut candidate_for_next = None;
         for input in inputs.iter_mut() {
-            loop {
-                if let Some(&item) = input.peek().await {
-                    // this item has already been sent, move to next
-                    if item >= higher_limit {
-                        input.next().await;
-                        continue
-                    }
-
-                    // consider this item for the next
-                    match candidate_for_next {
-                        Some(candidate) => if candidate < item {
-                            candidate_for_next = Some(item)
-                        },
-                        None => {
-                            candidate_for_next = Some(item)
-                        }
-                    }
-                }
-                break
+            if let Some(&item) = input.peek().await {
+                candidate_for_next = match candidate_for_next {
+                    Some(candidate) => Some(item.max(candidate)),
+                    None => Some(item)
+                };
             }
         }
 
-        // if we have run out of items stop
-        higher_limit = match candidate_for_next {
+        // if the inputs are empty stop here
+        let candidate = match candidate_for_next {
             Some(value) => value,
-            None => return
+            None => return,
         };
 
-        // count if this item has hit the threshold
-        let mut count = 0;
-        for (index, input) in inputs.iter_mut().enumerate() {
+        // loop over all the inputs giving them all a chance to catch up
+        while output.is_connected() {
+            let mut higher = 0;
+
+            for input in inputs.iter_mut() {
             if let Some(&item) = input.peek().await {
-                if item == higher_limit {
-                    count += weights[index];
+                    if item > candidate {
+                        input.skip().await;
+                        higher += 1;
                 }
             }
         }
 
-        if (count as i32) < count_threshold {
+            // if any of the streams are still on higher values give them a chance to catch up
+            // do this even if we know this candidate won't be usable
+            if higher > 0 {
             continue
         }
 
-        // send the item discovered, if no one is listening stop
-        if !output.send(higher_limit).await {
-            return
+            break
+        }
+
+        // pop all streams that are on this value 
+        let mut hits = 0;
+        for (index, input) in inputs.iter_mut().enumerate() {
+            if let Some(&item) = input.peek().await {
+                if item == candidate {
+                    hits += weights[index];
+                    input.skip().await;
+                }
+            }
+        }
+
+        // send the item discovered
+        if hits >= count as usize {  
+            output.send(candidate);
         }
     }
 }
 
 
-fn trigram_reader(trigram: u32, output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle, token: Token) {
+
+fn trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle, token: Token) {
     debug!("Starting trigram reader {trigram:x}");
-    match _trigram_reader(trigram, output, start, pool, handle) {
+    match _trigram_reader(trigram, &mut output, start, pool) {
         Ok(count) => debug!("Reader for {trigram:x} sent {count} items. {} trigram readers remaining.", token.count() - 1),
         Err(err) => error!("Error in {trigram:x} reader: {err}"),
     }
+    // handle.block_on(output.finish());
 }
 
-fn _trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Address, pool: ReadPool, handle: Handle) -> Result<usize> {
+fn _trigram_reader(trigram: u32, output: &mut broadcast::Sender<u64>, start: Address, pool: ReadPool) -> Result<usize> {
     let mut cursor = TrigramCursor::new(pool, start.0);
     let mut sent_count = 0;
     while !cursor.finished {
@@ -894,18 +915,11 @@ fn _trigram_reader(trigram: u32, mut output: broadcast::Sender<u64>, start: Addr
         cursor.load_batch()?;
 
         debug!("{trigram:x} reader sending");
-        let sent = handle.block_on(async {
             while let Some(value) = cursor.next() {
-                if !output.send(value).await {
-                    return false
+            if !output.send(value) {
+                return Ok(sent_count)
                 }
                 sent_count += 1;
-            }
-            true
-        });
-
-        if !sent {
-            return Ok(sent_count)
         }
     }
     Ok(sent_count)
@@ -1330,6 +1344,7 @@ mod test {
     use rand::{Rng, SeedableRng};
 
     use crate::pool::Pool;
+    use crate::query::parse_yara_signature;
     use crate::query::phrases::PhraseQuery;
     use crate::worker::encoding::{try_decode_value, StreamDecode};
     use crate::worker::journal::{AddressReader, BlockReader, CobsReader, TrigramCursor};
