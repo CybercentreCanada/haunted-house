@@ -1,15 +1,7 @@
 
+# Haunted House
 
-# todo
+This repo holds the daemon for providing retrohunt capabilities for assemblyline.
 
-- also check maximum files per filter against the chunk size and chunk index limit
+This module is internal to assemblyline and will likely be merged with other assemblyline code in the future when it is more mature.
 
-## Integration
-- documentation
-
-## Nice to have/performance
-- add config flag to tune filter memory use
-- use more single value structs for better build time error detection
-- join query and of literals into block ands
-- simplify communication with workers, especially reduce/remove job polling
-- retry file downloads and yara jobs
