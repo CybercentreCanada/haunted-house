@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::primitives::ByteStream;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use futures::StreamExt;
@@ -43,8 +42,9 @@ impl Default for BlobStorageConfig {
     fn default() -> Self {
         BlobStorageConfig::Azure(AzureBlobConfig {
             account: "azure-account".to_string(),
-            access_key: "azure-key".to_string(),
+            access_key: "".to_string(),
             container: "retrohunt".to_owned(),
+            use_default_credentials: true,
             use_emulator: false
         })
     }
@@ -69,11 +69,13 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
             let mut subdomain = domain.split(".");
             let mut access_key = "".to_owned();
             let mut use_emulator = false;
+            let mut use_default_credentials = false;
 
             for (key, value) in info.query_pairs() {
                 match key.as_ref() {
                     "access_key" => { access_key = value.to_string(); }
-                    "use_emulator" => { use_emulator = true; }
+                    "use_emulator" => { use_emulator = value.trim().eq_ignore_ascii_case("true"); }
+                    "use_default_credentials" => { use_default_credentials = value.trim().eq_ignore_ascii_case("true")}
                     _ => {}
                 }
             }
@@ -81,6 +83,7 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
             Ok(BlobStorageConfig::Azure(AzureBlobConfig{
                 account: subdomain.next().unwrap().to_owned(),
                 access_key,
+                use_default_credentials,
                 container: info.path().trim_start_matches("/").to_owned(),
                 use_emulator,
             }))
@@ -388,6 +391,8 @@ pub struct AzureBlobConfig {
     pub access_key: String,
     /// Name of the container within storage account
     pub container: String,
+    /// Read the environment to configure credentials
+    pub use_default_credentials: bool,
     /// Whether the blob storage system is being run on the development emulator
     #[serde(default)]
     pub use_emulator: bool,
@@ -424,12 +429,20 @@ impl AzureBlobStore {
         let client_builder = if config.use_emulator {
             ClientBuilder::emulator()
         } else {
-            let storage_credentials = if config.access_key.is_empty() {
-                StorageCredentials::anonymous()
-            } else {
+            use azure_core::auth::TokenCredential;
+            use azure_identity::DefaultAzureCredentialBuilder;
+
+            // Get credentials
+            let credentials: StorageCredentials = if config.use_default_credentials {
+                // Service accounts will by default create the enviromental variables, and use them as params
+                let credentials: Arc<dyn TokenCredential> = Arc::new(DefaultAzureCredentialBuilder::new().build()?);
+                credentials.into()
+            } else if !config.access_key.is_empty() {
                 StorageCredentials::access_key(config.account.clone(), config.access_key.clone())
+            } else {
+                StorageCredentials::anonymous()
             };
-            ClientBuilder::new(config.account.clone(), storage_credentials)
+            ClientBuilder::new(config.account.clone(), credentials)
         };
         Ok(client_builder.container_client(config.container.clone()))
     }
@@ -847,6 +860,8 @@ impl S3BlobStore {
     /// Upload a file, let the library handle streaming read
     #[cfg(test)]
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
+        use aws_sdk_s3::primitives::ByteStream;
+
         self.client
             .put_object()
             .content_type("application/octet-stream")
@@ -908,6 +923,7 @@ mod test {
             access_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_owned(),
             container: "test".to_owned(),
             use_emulator: true,
+            use_default_credentials: false,
         }).await.unwrap()
     }
 
@@ -1088,6 +1104,7 @@ mod test {
             access_key: "PassW0rd".to_owned(), 
             container: "devfiles".to_owned(), 
             use_emulator: false, 
+            use_default_credentials: false,
         }));
     }
 
