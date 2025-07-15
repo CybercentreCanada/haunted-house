@@ -653,11 +653,11 @@ impl Chunk {
 }
 
 #[cfg(test)]
-pub (crate) fn random_trigrams(seed: u64) -> (Box<Bits>, Vec<u8>) {
+pub (crate) fn random_trigrams(seed: u64) -> (bitvec::vec::BitVec, Vec<u8>) {
     use rand::{Rng, SeedableRng};
 
     let mut prng = rand::rngs::SmallRng::seed_from_u64(seed);
-    let mut data = Box::<Bits>::default();
+    let mut data = bitvec::prelude::bitvec![0; 1 << 24];
 
     let raw = data.as_raw_mut_slice();
     for part in raw {
