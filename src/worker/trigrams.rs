@@ -11,7 +11,7 @@ use itertools::Itertools;
 use log::error;
 use tokio::sync::{Semaphore, RwLock};
 use tokio::task::JoinHandle;
-use bitvec::{bitarr, BitArr};
+use bitvec::{bitarr, BitArr, prelude::bitvec};
 use serde::{Serialize, Deserialize, de::Error};
 
 use crate::config::WorkerSettings;
@@ -221,12 +221,11 @@ pub (crate) fn build_buffer(data: &[u8]) -> TrigramSet {
     return output
 }
 
-pub (crate) type Bits = BitArr!(for 1 << 24, in usize, bitvec::order::Lsb0);
 
 #[cfg(test)]
 pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
     // Prepare accumulators
-    let mut mask = Box::<Bits>::default();
+    let mut mask = bitvec![0; (1 << 24)];
 
     let mut index = 2;
     let mut trigram: u32 = (input[0] as u32) << 8 | (input[1] as u32);
@@ -250,7 +249,7 @@ pub (crate) fn build_buffer_to_offsets(input: &[u8]) -> Vec<u8> {
 /// Convert a stream of buffers into a trigram set
 async fn build_file(mut input: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>) -> Result<TrigramFile, ErrorKinds> {
     // Prepare accumulators
-    let mut mask = Box::<Bits>::default();
+    let mut mask = bitvec![0; 1 << 24];
 
     // Read the initial block
     let mut buffer = vec![];

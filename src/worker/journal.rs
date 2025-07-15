@@ -1351,7 +1351,7 @@ mod test {
     use crate::{query::TrigramQuery, worker::encoding::encode_into_increasing};
     use crate::types::FilterID;
     use super::JournalFilter;
-    use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams, Bits};
+    use crate::worker::trigrams::{build_buffer, build_buffer_to_offsets, random_trigrams};
 
     use super::{TRIGRAM_RANGE, IdCollector};
 
@@ -1644,6 +1644,7 @@ mod test {
     async fn simple_queries() -> Result<()> {
         init();
         // setup data
+        println!("setup data");
         let raw_data1 = std::include_bytes!("./journal.rs");
         let raw_data2 = std::include_bytes!("./manager.rs");
         let raw_data3 = std::include_bytes!("./trigrams.rs");
@@ -1652,6 +1653,7 @@ mod test {
         let trigrams3 = build_buffer_to_offsets(raw_data3);
 
         // build table
+        println!("build table");
         let tempdir = tempfile::tempdir()?;
         let id = FilterID::from(1);
         let location = tempdir.path().to_path_buf();
