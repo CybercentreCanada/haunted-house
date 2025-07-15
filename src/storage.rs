@@ -89,15 +89,12 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
             }))
         },
         "s3" => {
-            let auth = info.authority();
-            let (access_key_id, secret_access_key) = match auth.split_once("@") {
-                Some((auth, _)) => 
-                    match auth.split_once(":") {
-                        Some((id, key)) => (Some(id.to_string()), Some(key.to_string())),
-                        None => (None, None),
-                    }
-                None => (None, None)
+            let access_key_id = {
+                let u = info.username();
+                if u.is_empty() { None } else { Some(u.to_string()) }
             };
+            let secret_access_key = info.password().map(|p| p.to_string());
+
             let mut s3_bucket = None;
             let mut use_ssl = true;
             let mut aws_region = "".to_owned();
@@ -118,9 +115,15 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
 
             let endpoint = match info.domain() {
                 Some(domain) => {
-                    let mut endpoint = domain.to_owned();
+                    // The default for the s3 scheme is https, we'll preserve that enforcement, since use_ssl is by default true
+                    let scheme = if use_ssl { "https" } else { "http" };
+                    let mut endpoint = format!("{}://{}", scheme, domain.to_owned());
+
                     if let Some(port) = info.port() {
-                        endpoint += &(":".to_string() + &port.to_string());
+                        // Omit port for default protocol and port specifications
+                        if !(use_ssl && port == 443) && !(!use_ssl && port == 80) {
+                            endpoint += &(":".to_string() + &port.to_string());
+                        }
                     }
                     endpoint += info.path();
                     Some(endpoint)
@@ -129,12 +132,12 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
             };
 
             Ok(BlobStorageConfig::S3(S3Config { 
-                access_key_id, 
+                access_key_id,
                 secret_access_key,
-                endpoint_url: endpoint, 
-                region_name: aws_region, 
-                bucket: s3_bucket, 
-                no_tls_verify: !use_ssl 
+                endpoint_url: endpoint,
+                region_name: aws_region,
+                bucket: s3_bucket,
+                no_tls_verify: !use_ssl
             }))
         },
         other => Err(anyhow::anyhow!("No such storage scheme: {}", other))
