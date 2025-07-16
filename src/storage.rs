@@ -1117,7 +1117,7 @@ mod test {
         assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
             access_key_id: Some("UNAMe".to_owned()), 
             secret_access_key: Some("Passwrd".to_owned()), 
-            endpoint_url: Some("filestore:9000".to_owned()),
+            endpoint_url: Some("http://filestore:9000".to_owned()),
             region_name: "".to_string(), 
             bucket: "al-cache".to_string(), 
             no_tls_verify: true 
@@ -1127,10 +1127,20 @@ mod test {
         assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
             access_key_id: Some("UNAMe".to_owned()), 
             secret_access_key: Some("Passwrd".to_owned()), 
-            endpoint_url: Some("filestore.com:9000/carebear".to_owned()),
+            endpoint_url: Some("http://filestore.com:9000/carebear".to_owned()),
             region_name: "hats".to_string(), 
             bucket: "al-cache".to_string(), 
             no_tls_verify: true 
+        }));
+
+        let config = url_to_other_config(&["s3://UNAMe:Passwrd@filestore.com:443/carebear?s3_bucket=al-cache&aws_region=hats".to_owned()]).unwrap();
+        assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
+            access_key_id: Some("UNAMe".to_owned()), 
+            secret_access_key: Some("Passwrd".to_owned()), 
+            endpoint_url: Some("https://filestore.com/carebear".to_owned()),
+            region_name: "hats".to_string(), 
+            bucket: "al-cache".to_string(), 
+            no_tls_verify: false 
         }));
     }
 
