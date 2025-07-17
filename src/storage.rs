@@ -121,7 +121,7 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
 
                     if let Some(port) = info.port() {
                         // Omit port for default protocol and port specifications
-                        if !(use_ssl && port == 443) && !(!use_ssl && port == 80) {
+                        if !(use_ssl && port == 443 || !use_ssl && port == 80) {
                             endpoint += &(":".to_string() + &port.to_string());
                         }
                     }

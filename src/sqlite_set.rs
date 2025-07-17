@@ -35,9 +35,9 @@ impl<Item: Serialize + DeserializeOwned> SqliteSet<Item> {
             }
 
             if path.is_absolute() {
-                format!("sqlite://{}?mode=rwc", url)
+                format!("sqlite://{url}?mode=rwc")
             } else {
-                format!("sqlite:{}?mode=rwc", url)
+                format!("sqlite:{url}?mode=rwc")
             }
         };
 

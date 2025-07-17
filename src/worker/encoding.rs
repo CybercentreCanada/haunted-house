@@ -40,7 +40,7 @@ pub fn encode_into_increasing(indices: &[u64], buffer: &mut Vec<u8>) {
     }
 }
 
-/// Calculate how many bytes a value will need to be encoded
+// /// Calculate how many bytes a value will need to be encoded
 // pub fn encoded_number_size(value: u64) -> u32 {
 //     value.ilog2()/7 + 1
 // }
@@ -68,7 +68,7 @@ impl<'a> DecreasingEncoder<'a> {
     }
 }
 
-/// (upper bound on) How many additional bytes are needed to add the given value to the given sequence
+// /// (upper bound on) How many additional bytes are needed to add the given value to the given sequence
 // pub fn cost_to_add(values: &[u64], new_value: u64) -> u32 {
 //     match values.last() {
 //         Some(last) => encoded_number_size(new_value - last),

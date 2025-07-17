@@ -597,6 +597,7 @@ pub enum IngestMessage {
 ///    into their existing entry for that file.
 ///  - They are working on this file already, the task should be assigned to them.
 ///  - The file should move on to normal ingestion.
+/// 
 /// The results are collated and each task in the batch is routed appropriately.
 async fn ingest_worker(core: Arc<HouseCore>, mut input: mpsc::UnboundedReceiver<IngestMessage>) {
     loop {

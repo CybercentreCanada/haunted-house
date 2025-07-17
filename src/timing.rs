@@ -240,7 +240,7 @@ pub struct NullCapture {
 }
 
 impl NullCapture {
-    /// Create a non-capturing drop in
+    // /// Create a non-capturing drop in
     // pub fn new() -> Self {
     //     Self {index: None}
     // }

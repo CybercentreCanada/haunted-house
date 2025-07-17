@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
                         load_config(config)?
                     };
                     let config_body = serde_json::to_string_pretty(&config)?;
-                    println!("{}", config_body);
+                    println!("{config_body}");
                 },
                 ConfigMode::Worker => {
                     let config = if default {
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                         load_worker_config(config)?
                     };
                     let config_body = serde_json::to_string_pretty(&config)?;
-                    println!("{}", config_body);
+                    println!("{config_body}", );
                 },
             }
         },

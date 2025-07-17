@@ -681,9 +681,9 @@ impl<Schema: DSType> Collection<Schema> {
 
         // build the url for the operation type
         let mut url = if operation == "index" {
-            self.connection.host.join(&format!("{}/_doc/{key}", index))?
+            self.connection.host.join(&format!("{index}/_doc/{key}"))?
         } else {
-            self.connection.host.join(&format!("{}/_create/{key}", index))?
+            self.connection.host.join(&format!("{index}/_create/{key}"))?
         };
 
         url.query_pairs_mut()
@@ -1455,8 +1455,8 @@ impl std::fmt::Display for ElasticError {
             ElasticError::FailedToCreateIndex(src, target) => f.write_fmt(format_args!("Failed to create index {target} from {src}.")),
             ElasticError::HTTPError{path, code, message} => f.write_fmt(format_args!("http error [{path:?}]: {code} {message}")),
             ElasticError::OtherHttpClient(err) => f.write_fmt(format_args!("Error from http client: {err}")),
-            ElasticError::Url(error) => f.write_fmt(format_args!("URL parse error: {}", error)),
-            ElasticError::Json(error) => f.write_fmt(format_args!("Issue with serialize or deserialize: {}", error)),
+            ElasticError::Url(error) => f.write_fmt(format_args!("URL parse error: {error}")),
+            ElasticError::Json(error) => f.write_fmt(format_args!("Issue with serialize or deserialize: {error}")),
             ElasticError::MalformedResponse => f.write_str("A server response was not formatted as expected"),
             ElasticError::BadKey(key) => f.write_fmt(format_args!("tried to save document with invalid key: {key}")),
             // ElasticError::BadDocumentVersion => f.write_str("An invalid document version string was encountered"),
@@ -1641,7 +1641,7 @@ mod test {
             .full_source(true)
             .size(500)
             .execute().await.unwrap();
-        assert_eq!(search.timed_out, false);
+        assert!(!search.timed_out);
         assert_eq!(search.hits.total.value, 50);
         assert_eq!(search.hits.hits.len(), 50);
         for item in search.hits.hits {
@@ -1657,7 +1657,7 @@ mod test {
             .full_source(true)
             .size(2000)
             .execute().await.unwrap();
-        assert_eq!(search.timed_out, false);
+        assert!(!search.timed_out);
         assert_eq!(search.hits.total.value, 950);
         assert_eq!(search.hits.hits.len(), 950);
         
@@ -1667,7 +1667,7 @@ mod test {
             .size(2000)
             .scan().await.unwrap();
         let mut total = 0;
-        while let Some(_) = search.next().await.unwrap() {
+        while search.next().await.unwrap().is_some() {
             total += 1;
         }
         assert_eq!(total, 950);
@@ -1678,7 +1678,7 @@ mod test {
             .size(20)
             .scan().await.unwrap();
         let mut total = 0;
-        while let Some(_) = search.next().await.unwrap() {
+        while search.next().await.unwrap().is_some() {
             total += 1;
         }
         assert_eq!(total, 1000);

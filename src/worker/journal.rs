@@ -151,7 +151,7 @@ impl JournalFilter {
             if address > 0 {
                 let mut reader = BufReader::new(&mut data);
                 if reader.seek(SeekFrom::Start(address))? != address {
-                    error!("{} data missing", id);
+                    error!("{id} data missing");
                 };
                 let mut buffer = vec![];
                 let size = reader.read_until(0, &mut buffer)?;
@@ -173,7 +173,7 @@ impl JournalFilter {
     }
 
     fn open_reader(directory: &Path, id: FilterID) -> Result<File> {
-        let location = directory.join(format!("{}", id));
+        let location = directory.join(format!("{id}"));
         std::fs::OpenOptions::new().create_new(false).write(false).read(true).open(location).context("Open file to read")
     }
 
@@ -182,7 +182,7 @@ impl JournalFilter {
     }
 
     fn open_writer(directory: &Path, id: FilterID) -> Result<File> {
-        let location = directory.join(format!("{}", id));
+        let location = directory.join(format!("{id}"));
         std::fs::OpenOptions::new().truncate(false).write(true).read(true).open(location).context("Open file to write")
     }
 
@@ -290,13 +290,13 @@ impl JournalFilter {
     }
 
     fn _install_defrag(directory: &Path, id: FilterID, _: parking_lot::MutexGuard<()>) -> Result<()> {
-        let temp_data = directory.join(format!(".{}", id));
-        let temp_tails = directory.join(format!(".{}.tail", id));
+        let temp_data = directory.join(format!(".{id}"));
+        let temp_tails = directory.join(format!(".{id}.tail"));
         if temp_tails.exists() {
             if temp_data.exists() {
-                std::fs::rename(temp_data, directory.join(format!("{}", id)))?;
+                std::fs::rename(temp_data, directory.join(format!("{id}")))?;
             }
-            std::fs::rename(temp_tails, directory.join(format!("{}.tail", id)))?;
+            std::fs::rename(temp_tails, directory.join(format!("{id}.tail")))?;
         } else {
             remove_file(&temp_data)?;
         }
