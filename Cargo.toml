@@ -62,8 +62,8 @@ futures = "0.3"
 poem = { version = "3.0", features = ["anyhow", "websocket", "openssl-tls"] }
 openssl = { version = "0.10" }
 reqwest = { version = "0.12", features = ["json", "native-tls", "stream"] }
-reqwest-middleware = { version = "0.3", features = ["json"] }
-reqwest-retry = "0.5"
+reqwest-middleware = { version = "0.4", features = ["json"] }
+reqwest-retry = "0.7"
 http = "1.1"
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 native-tls = "0.2"
