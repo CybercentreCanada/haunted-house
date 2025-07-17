@@ -13,7 +13,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde", "std"] }
 time = { version = "0.3" }
 rand = { version = "0.8", features = ["small_rng"] }
-itertools = "0.13"
+itertools = "0.14"
 parking_lot = "0.12"
 
 # Environment interfaces
@@ -22,10 +22,10 @@ log = "0.4"
 env_logger = "0.11"
 # gethostname = "0.4"
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.28", features = ["fs"] }
+nix = { version = "0.30", features = ["fs"] }
 
 # Data proccessing and manipulating
-cobs = "0.2"
+cobs = "0.4"
 byteorder = "1.4"
 bitvec = { version = "1", features = ["serde"]}
 yara = { version = "0.30", features= ["vendored"] }
@@ -43,7 +43,7 @@ parse-size = { version = "1", features = ["std"] }
 schemars = { version = "0.8.6", optional = true }
 boreal-parser = "0.5"
 base64 = "0.22"
-strum = { version = "0.26", features = ["derive"] }
+strum = { version = "0.27", features = ["derive"] }
 struct-metadata = { version = "0.1", features = ["serde_json"] }
 
 # Database tools

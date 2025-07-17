@@ -962,6 +962,7 @@ impl CobsReader {
         // Read those bytes into the cobs decoder and update our state
         for byte in self.read_buffer.iter().take(quantity) {
             match self.decoder.feed(*byte) {
+                Ok(cobs::DecodeResult::DataStart) => continue,
                 Ok(cobs::DecodeResult::NoData) => continue,
                 Ok(cobs::DecodeResult::DataComplete) => {
                     self.finished = true;
