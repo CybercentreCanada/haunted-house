@@ -28,7 +28,7 @@ nix = { version = "0.28", features = ["fs"] }
 cobs = "0.2"
 byteorder = "1.4"
 bitvec = { version = "1", features = ["serde"]}
-yara = { version = "0.27", features= ["vendored"] }
+yara = { version = "0.30", features= ["vendored"] }
 # yara-x = {git = "https://github.com/VirusTotal/yara-x.git"}
 
 # Parsing and serialization
