@@ -65,6 +65,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
     let mut recent: BTreeSet<FetchedFile> = Default::default();
+    let maximum_recent = config.concurrent_tasks.saturating_mul(100); 
     let poll_interval_time = Duration::from_secs_f64(config.poll_interval);
     let mut poll_interval = tokio::time::interval(poll_interval_time);
 
@@ -79,6 +80,8 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     // ALL unprocessed file entries must occur after this point. Many PROCESSED
     // entries may also occur after this point.
     let mut checkpoint: DateTime<Utc> = core.get_checkpoint().await?;
+    let mut last_checkpoint_print = checkpoint;
+    info!("Initial file fetcher checkpoint: {checkpoint}");
 
     loop {
         // Update the checkpoint if needed
@@ -94,8 +97,12 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
         }
         if old_checkpoint != checkpoint {
             core.set_checkpoint(checkpoint).await?;
+            if (checkpoint - last_checkpoint_print).num_days() > 0 {
+                last_checkpoint_print = checkpoint;
+                info!("File fetcher checkpoint reached: {checkpoint}");
+            }
         }
-        while recent.len() > 100_000 {
+        while recent.len() > maximum_recent {
             recent.pop_first();
         }
 
@@ -170,7 +177,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             message = control.recv() => {
                 match message {
                     Some(FetchControlMessage::Status(respond)) => {
-                        let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
+                        let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000_000).await?;
 
                         _ = respond.send(FetchStatus {
                             last_minute_searches: search_counter.value() as i64,
