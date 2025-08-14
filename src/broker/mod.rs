@@ -133,7 +133,8 @@ impl HouseCore {
         let (send_ingest, receive_ingest) = mpsc::unbounded_channel();
 
         // setup pool for yara assignments
-        let yara_permits: deadpool::unmanaged::Pool<(WorkerID, WorkerAddress)> = Default::default();
+        let max_permits = config.yara_jobs_per_worker.max(1) * config.workers.len();
+        let yara_permits = deadpool::unmanaged::Pool::<(WorkerID, WorkerAddress)>::new(max_permits);
         for _ in 0..(config.yara_jobs_per_worker.max(1)) {
             for row in config.workers.clone() {
                 if let Err((_, err)) = yara_permits.add(row).await {
@@ -1245,4 +1246,26 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
     let mut searches = core.running_searches.write().await;
     searches.remove(&code);
     return Ok(())
+}
+
+
+#[tokio::test]
+async fn pool_setup() {
+    for max_searches in [1, 5, 50] {
+        for num_workers in [1, 2, 200] {
+            let mut workers = vec![];
+            for id in 0..num_workers {
+                workers.push((WorkerID::from(id.to_string()), WorkerAddress::from(id.to_string().as_str())));
+            }
+            let max_permits = max_searches * workers.len();
+            let yara_permits = deadpool::unmanaged::Pool::<(WorkerID, WorkerAddress)>::new(max_permits);
+            for _ in 0..max_searches {
+                for row in workers.clone() {
+                    if let Err((_, err)) = yara_permits.add(row).await {
+                        panic!("{}", err.to_string())
+                    }
+                }
+            }
+        }
+    }
 }
