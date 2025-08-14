@@ -146,6 +146,7 @@ impl HouseCore {
         // let (quit_trigger, quit_signal) = tokio::sync::watch::channel(false);
 
         // Prepare tls settings for Websockets and HTTP
+        info!("Load TLS configuration");
         let connector = match &config.worker_certificate {
             WorkerTLSConfig::AllowAll => {
                 native_tls::TlsConnector::builder()
@@ -162,6 +163,7 @@ impl HouseCore {
         };
 
         // Prepare our http client
+        info!("Prepare HTTP client");
         let client = reqwest::Client::builder().use_preconfigured_tls(connector.clone()).build()?;
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(std::time::Duration::from_millis(50), std::time::Duration::from_secs(30))
@@ -171,9 +173,10 @@ impl HouseCore {
             .build();
 
         // Load classification system
+        info!("Load classification engine");
         let access_engine = config.classification.init().context("loading classification configuration")?;
 
-        // Build a classification engine
+        // prepare a buffer for file fetcher
         let (fetch_send, fetch_recv) = mpsc::channel(64);
 
         // Create core object
