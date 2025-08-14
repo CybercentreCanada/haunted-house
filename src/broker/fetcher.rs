@@ -65,7 +65,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
     let mut recent: BTreeSet<FetchedFile> = Default::default();
-    let maximum_recent = config.concurrent_tasks.saturating_mul(100); 
+    let maximum_recent = config.concurrent_tasks.saturating_mul(10); 
     let poll_interval_time = Duration::from_secs_f64(config.poll_interval);
     let mut poll_interval = tokio::time::interval(poll_interval_time);
 
@@ -107,7 +107,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
         }
 
         // If there is free space get extra jobs
-        if running.len() < config.concurrent_tasks && last_fetch_time.elapsed() >= poll_interval_time {
+        while running.len() < config.concurrent_tasks && last_fetch_time.elapsed() >= poll_interval_time {
             last_fetch_time = std::time::Instant::now();
 
             // Rather than searching at the current checkpoint we can search from the last seen at the tail
@@ -177,7 +177,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             message = control.recv() => {
                 match message {
                     Some(FetchControlMessage::Status(respond)) => {
-                        let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000_000).await?;
+                        let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
 
                         _ = respond.send(FetchStatus {
                             last_minute_searches: search_counter.value() as i64,
