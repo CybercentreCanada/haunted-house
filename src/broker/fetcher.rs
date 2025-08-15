@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
 
+use crate::broker::elastic::Datastore;
+use crate::counters::WindowCounter;
+
 use super::{HouseCore, FetchStatus, FetchControlMessage};
 
 /// Pull files from an assemblyline system
@@ -51,6 +54,46 @@ struct PendingInfo {
     retries: usize,
 }
 
+fn _search_stream(
+    client: Datastore, 
+    mut seek_point: DateTime<Utc>, 
+    poll_interval: Duration, 
+    batch_size: usize, 
+    search_counter: Arc<parking_lot::Mutex<WindowCounter>>,
+    last_fetch_rows: Arc<std::sync::atomic::AtomicI64>,
+) -> mpsc::Receiver<FetchedFile> {
+    let (channel, output) = mpsc::channel(batch_size * 10);
+    tokio::spawn(async move {
+        loop {
+            // get a batch from elasticsearch
+            search_counter.lock().increment(1);
+            let result = match client.fetch_files(seek_point, batch_size).await {
+                Ok(result) => result,
+                Err(err) => {
+                    error!("Error polling elasticsearch: {err}");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue
+                },
+            };
+            let result_size = result.len();
+            last_fetch_rows.store(result_size as i64, std::sync::atomic::Ordering::Relaxed);
+
+            // send the data to the angent
+            for file in result {
+                seek_point = file.seen;
+                if channel.send(file).await.is_err() {
+                    break
+                }
+            }
+
+            // wait if we aren't getting full batches
+            if result_size < batch_size {
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    });
+    output
+}
 
 /// implementation loop to fetch files from assemblyline
 async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<FetchControlMessage>>>) -> Result<()> {
@@ -70,11 +113,11 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     let mut poll_interval = tokio::time::interval(poll_interval_time);
 
     // metrics collectors
-    let mut search_counter = crate::counters::WindowCounter::new(60);
-    let mut throughput_counter = crate::counters::WindowCounter::new(60);
-    let mut retry_counter = crate::counters::WindowCounter::new(60);
-    let mut last_fetch_time = std::time::Instant::now();
-    let mut last_fetch_rows: i64 = 0;
+    let search_counter = Arc::new(parking_lot::Mutex::new(WindowCounter::new(60)));
+    let mut throughput_counter = WindowCounter::new(60);
+    let mut retry_counter = WindowCounter::new(60);
+    // let mut last_fetch_time = std::time::Instant::now();
+    let last_fetch_rows = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
     // The checkpoint represents the earliest value for the seen.last field where
     // ALL unprocessed file entries must occur after this point. Many PROCESSED
@@ -82,6 +125,8 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     let mut checkpoint: DateTime<Utc> = core.get_checkpoint().await?;
     let mut last_checkpoint_print = checkpoint;
     info!("Initial file fetcher checkpoint: {checkpoint}");
+
+    let mut file_stream = _search_stream(client.clone(), checkpoint, poll_interval_time, config.batch_size, search_counter.clone(), last_fetch_rows.clone());
 
     loop {
         // Update the checkpoint if needed
@@ -107,42 +152,30 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
         }
 
         // If there is free space get extra jobs
-        while running.len() < config.concurrent_tasks && last_fetch_time.elapsed() >= poll_interval_time {
-            last_fetch_time = std::time::Instant::now();
-
-            // Rather than searching at the current checkpoint we can search from the last seen at the tail
-            // of items being processed. If nothing is being processed then the checkpoint is that value by default.
-            let seek_point = match pending.last_key_value() {
-                Some((file, _)) => file.seen,
-                None => checkpoint,
+        while running.len() < config.concurrent_tasks {
+            
+            let file = match file_stream.try_recv() {
+                Ok(file) => file,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => anyhow::bail!("File stream disconnect")
             };
 
-            search_counter.increment(1);
-            let result = client.fetch_files(seek_point, config.batch_size).await?;
-            last_fetch_rows = result.len() as i64;
-            let mut launched = 0;
-
-            for file in result {
-                if recent.contains(&file) {
-                    continue
-                }
-
-                // insert into the set of jobs
-                match pending.entry(file.clone()) {
-                    std::collections::btree_map::Entry::Occupied(_) => {}
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(PendingInfo{finished: false, retries: 0});
-                        let core = core.clone();
-                        launched += 1;
-                        running.spawn(async move {
-                            let resp = core.start_ingest(&file).await;
-                            return (file, resp)
-                        });
-                    }
-                }
+            if recent.contains(&file) {
+                continue
             }
 
-            debug!("Fetched {last_fetch_rows} rows, launched {launched} ingestions");
+            // insert into the set of jobs
+            match pending.entry(file.clone()) {
+                std::collections::btree_map::Entry::Occupied(_) => {}
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingInfo{finished: false, retries: 0});
+                    let core = core.clone();
+                    running.spawn(async move {
+                        let resp = core.start_ingest(&file).await;
+                        return (file, resp)
+                    });
+                }
+            }
         }
 
         // wait for running jobs to finish
@@ -180,13 +213,13 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                         let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
 
                         _ = respond.send(FetchStatus {
-                            last_minute_searches: search_counter.value() as i64,
+                            last_minute_searches: search_counter.lock().value() as i64,
                             last_minute_throughput: throughput_counter.value() as i64,
                             last_minute_retries: retry_counter.value() as i64,
                             checkpoint_data: checkpoint,
                             pending_files: pending,
                             inflight: running.len() as u64,
-                            last_fetch_rows,
+                            last_fetch_rows: last_fetch_rows.load(std::sync::atomic::Ordering::Relaxed),
                         });
                     },
                     None => return Ok(())
