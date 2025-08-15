@@ -185,6 +185,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                             last_minute_retries: retry_counter.value() as i64,
                             checkpoint_data: checkpoint,
                             pending_files: pending,
+                            inflight: running.len() as u64,
                             last_fetch_rows,
                         });
                     },
