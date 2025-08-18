@@ -124,6 +124,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     // entries may also occur after this point.
     let mut checkpoint: DateTime<Utc> = core.get_checkpoint().await?;
     let mut last_checkpoint_print = checkpoint;
+    let mut seek_point = checkpoint;
     info!("Initial file fetcher checkpoint: {checkpoint}");
 
     let mut file_stream = _search_stream(client.clone(), checkpoint, poll_interval_time, config.batch_size, search_counter.clone(), last_fetch_rows.clone());
@@ -163,6 +164,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             if recent.contains(&file) {
                 continue
             }
+            seek_point = seek_point.max(file.seen);
 
             // insert into the set of jobs
             match pending.entry(file.clone()) {
@@ -218,6 +220,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                             last_minute_throughput: throughput_counter.value() as i64,
                             last_minute_retries: retry_counter.value() as i64,
                             checkpoint_data: checkpoint,
+                            read_cursor: seek_point,
                             pending_files: pending,
                             inflight: running.len() as u64,
                             last_fetch_rows: last_fetch_rows.load(std::sync::atomic::Ordering::Relaxed),
