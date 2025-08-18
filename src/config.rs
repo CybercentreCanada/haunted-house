@@ -171,6 +171,8 @@ fn default_yara_jobs_per_worker() -> usize { 2 }
 fn default_yara_batch_size() -> u32 { 100 }
 /// default value for filter_item_limit
 fn default_filter_item_limit() -> u64 { 50_000_000 }
+/// default value for ingest_check_batch_size
+fn default_ingest_check_batch_size() -> usize { 200 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -265,6 +267,9 @@ pub struct BrokerSettings {
     /// Maximum number of files in a single filter file
     #[serde(default="default_filter_item_limit")]
     pub filter_item_limit: u64,
+    /// Number of files used to batch checks for existing files on ingest
+    #[serde(default="default_ingest_check_batch_size")]
+    pub ingest_check_batch_size: usize,
 }
 
 impl Default for BrokerSettings {
@@ -284,6 +289,7 @@ impl Default for BrokerSettings {
             search_hit_limit: default_search_hit_limit(),
             yara_jobs_per_worker: default_yara_jobs_per_worker(),
             yara_batch_size: default_yara_batch_size(),
+            ingest_check_batch_size: default_ingest_check_batch_size(),
             bind_address: Some("localhost:4443".to_owned()),
             tls: None
         }

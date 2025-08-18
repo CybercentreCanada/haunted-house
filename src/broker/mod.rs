@@ -649,7 +649,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 
                 buffer_hashes.remove(&task.info.hash);
                 tasks.insert(task.info.hash.clone(), task);
-                if tasks.len() >= 200 {
+                if tasks.len() >= core.config.ingest_check_batch_size {
                     break;
                 }
             }
