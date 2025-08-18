@@ -176,12 +176,12 @@ impl WorkerState {
     pub async fn get_used_storage(&self) -> Result<u64> {
         let stats = nix::sys::statvfs::statvfs(&self.config.data_path)?;
         let used_blocks = stats.blocks() - stats.blocks_available();
-        Ok((used_blocks as u64) * stats.block_size())
+        Ok(used_blocks * stats.block_size())
     }
 
     pub async fn get_free_storage(&self) -> Result<u64> {
         let stats = nix::sys::statvfs::statvfs(&self.config.data_path)?;
-        let all_free = (stats.blocks_available() as u64) * stats.block_size();
+        let all_free = stats.blocks_available() * stats.block_size();
         Ok(self.config.data_limit.min(all_free))
     }
 

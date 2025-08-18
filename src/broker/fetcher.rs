@@ -80,7 +80,7 @@ fn _search_stream(
 
             // send the data to the angent
             for file in result {
-                seek_point = file.seen;
+                seek_point = seek_point.max(file.seen);
                 if channel.send(file).await.is_err() {
                     break
                 }
@@ -204,8 +204,9 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                         }
                     }
                     entry.get_mut().finished = true;
+                } else {
+                    error!("Unexpected file completed");
                 }
-
             }
             message = control.recv() => {
                 match message {

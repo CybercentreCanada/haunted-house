@@ -582,7 +582,19 @@ pub struct IngestCheckStatus {
     /// How many tasks are currently being checked
     active: usize,
     /// How many tasks have been processed in the last minute
-    last_minute: usize
+    last_minute: usize,
+    /// Outcome counts for the most recent batch
+    previous_batch: IngestCheckBatchStatus,
+}
+
+/// A status snapshot for the check worker
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct IngestCheckBatchStatus {
+    size: usize,
+    existing: usize,
+    in_progress: usize,
+    enqueued: usize,
+    merged_into_queue: usize,
 }
 
 /// A message to the check worker
@@ -626,7 +638,8 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     // The task running the current batch of tasks. This leaves this task
     // free to take in new tasks and respond to status queries.
     // We are using a join set to manage the task, but only launching a single batch at a time
-    let mut check_worker: JoinSet<Result<()>> = JoinSet::new();
+    let mut check_worker: JoinSet<Result<IngestCheckBatchStatus>> = JoinSet::new();
+    let mut previous_batch = IngestCheckBatchStatus::default();
     // How many tasks are in the current batch
     let mut active_batch_size = 0;
     // A counter to track how many tasks we completed in the last minute
@@ -684,7 +697,8 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                         _ = resp.send(IngestCheckStatus {
                             queue: unchecked_buffer.len(),
                             active: active_batch_size,
-                            last_minute: counter.value()
+                            last_minute: counter.value(),
+                            previous_batch: previous_batch.clone(),
                         });
                     },
                 }
@@ -698,10 +712,12 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                 };
 
                 match res {
-                    Ok(Ok(())) => {},
+                    Ok(Ok(status)) => {
+                        previous_batch = status;
+                    },
                     Ok(Err(err)) => {
                         error!("ingest checker error: {err}");
-                    }
+                    },
                     Err(err) => {
                         error!("ingest checker error: {err}");
                     },
@@ -715,8 +731,16 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
 }
 
 /// Check a batch of hashes to see if they are already (or quickly) accommodated by a worker
-async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTask>) -> Result<()> {
+async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTask>) -> Result<IngestCheckBatchStatus> {
     debug!("Ingest Check batch {}", tasks.len());
+    let mut status = IngestCheckBatchStatus {
+        size: tasks.len(),
+        existing: 0,
+        in_progress: 0,
+        enqueued: 0,
+        merged_into_queue: 0,
+    };
+
     // Turn the update tasks into a format for the worker
     let files: Vec<FileInfo> = tasks.values().map(|f|f.info.clone()).collect();
     let payload = UpdateFileInfoRequest {files};
@@ -750,6 +774,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
             if let Some(task) = tasks.remove(&sha) {
                 for response in task.response {
                     _ = response.send(Ok(true));
+                    status.existing += 1;
                 }
             }
         }
@@ -758,6 +783,7 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
         for (sha, filter) in res.pending {
             if let Some(task) = tasks.remove(&sha) {
                 core.send_to_ingest_watcher(&worker, task, filter).await?;
+                status.in_progress += 1;
             }
         }
     }
@@ -770,15 +796,20 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
                 for existing in entry.get_mut().iter_mut() {
                     if existing.info.hash == task.info.hash {
                         existing.merge(task);
+                        status.merged_into_queue += 1;
                         continue 'next_task;
                     }
                 }
+                status.enqueued += 1;
                 entry.get_mut().push_back(task)
             },
-            hash_map::Entry::Vacant(entry) => { entry.insert(VecDeque::from_iter([task])); },
+            hash_map::Entry::Vacant(entry) => { 
+                status.enqueued += 1;
+                entry.insert(VecDeque::from_iter([task])); 
+            },
         }
     }
-    return Ok(())
+    return Ok(status)
 }
 
 
