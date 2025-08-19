@@ -90,15 +90,15 @@ pub struct FetchStatus {
     inflight: u64,
     last_fetch_rows: i64,
     pending_files: u64,
-    // oldest_pending_file: Option<PendingStatus>
+    oldest_pending_file: Option<PendingStatus>
 }
 
-// #[derive(Debug, Serialize, Deserialize)]
-// struct PendingStatus {
-//     file: String, 
-//     finished: bool,
-//     retries: usize,
-// }
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingStatus {
+    file: String, 
+    finished: bool,
+    retries: usize,
+}
 
 /// A message to the fetch worker
 #[derive(Debug)]

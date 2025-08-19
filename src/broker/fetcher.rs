@@ -15,7 +15,7 @@ use tokio::time::Duration;
 use anyhow::Result;
 
 use crate::broker::elastic::Datastore;
-// use crate::broker::PendingStatus;
+use crate::broker::PendingStatus;
 use crate::counters::WindowCounter;
 
 use super::{HouseCore, FetchStatus, FetchControlMessage};
@@ -195,7 +195,14 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = pending.entry(file.clone()) {
                     entry.get_mut().retries += 1;
                     if entry.get().retries <= RETRY_LIMIT {
-                        if let Err(err) = result {
+
+                        let err = match result {
+                            Ok(true) => None,
+                            Ok(false) => Some("File rejected".to_string()),
+                            Err(err) => Some(format!("{err:?}")),
+                        };
+
+                        if let Some(err) = err {
                             retry_counter.increment(1);
                             error!("Error in fetch: {err}");
                             let core = core.clone();
@@ -214,12 +221,12 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             message = control.recv() => {
                 match message {
                     Some(FetchControlMessage::Status(respond)) => {
-                        // let oldest_pending_file = pending.first_entry()
-                        //     .map(|entry| PendingStatus {
-                        //         file: entry.key().sha256.clone(),
-                        //         finished: entry.get().finished,
-                        //         retries: entry.get().retries,
-                        //     });
+                        let oldest_pending_file = pending.first_entry()
+                            .map(|entry| PendingStatus {
+                                file: entry.key().sha256.clone(),
+                                finished: entry.get().finished,
+                                retries: entry.get().retries,
+                            });
                         let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
 
                         _ = respond.send(FetchStatus {
@@ -231,7 +238,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                             pending_files: pending,
                             inflight: running.len() as u64,
                             last_fetch_rows: last_fetch_rows.load(std::sync::atomic::Ordering::Relaxed),
-                            // oldest_pending_file,
+                            oldest_pending_file,
                         });
                     },
                     None => return Ok(())

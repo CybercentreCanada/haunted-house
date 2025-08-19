@@ -165,6 +165,12 @@ impl TrigramCache {
         rejected.remove(&(filter, hash))
     }
 
+    pub async fn reject(&self, filter: FilterID, hash: Sha256) -> Result<()> {
+        self.release(filter, &hash).await?;
+        self.rejected.write().await.insert((filter, hash));
+        Ok(())
+    }
+
     /// Load the content of a file
     pub async fn get(&self, filter: FilterID, hash: &Sha256) -> Result<Vec<u8>> {
         let data = tokio::fs::read(self._path(filter, hash)).await?;

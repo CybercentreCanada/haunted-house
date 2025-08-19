@@ -356,9 +356,16 @@ impl WorkerState {
             let mut trigrams = vec![];
             let mut hashes = vec![];
             for (number, hash) in &batch {
+                let data = match self.trigrams.get(id, hash).await {
+                    Ok(data) => data,
+                    Err(err) => {
+                        error!("ingest feeder, error loading trigrams ({id}, {hash}): {err}");
+                        self.trigrams.reject(id, hash.clone()).await?;
+                        continue
+                    },
+                };
+
                 hashes.push(hash.clone());
-                let data = self.trigrams.get(id, hash).await
-                    .with_context(|| format!("load_trigram({id}, {hash})"))?;
                 trigrams.push((*number, data));
             }
             let time_load_trigrams = stamp.elapsed().as_secs_f64();
