@@ -15,6 +15,7 @@ use tokio::time::Duration;
 use anyhow::Result;
 
 use crate::broker::elastic::Datastore;
+// use crate::broker::PendingStatus;
 use crate::counters::WindowCounter;
 
 use super::{HouseCore, FetchStatus, FetchControlMessage};
@@ -108,7 +109,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
     let mut recent: BTreeSet<FetchedFile> = Default::default();
-    let maximum_recent = config.concurrent_tasks.saturating_mul(10); 
+    let maximum_recent = config.concurrent_tasks;
     let poll_interval_time = Duration::from_secs_f64(config.poll_interval);
     let mut poll_interval = tokio::time::interval(poll_interval_time);
 
@@ -213,6 +214,12 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
             message = control.recv() => {
                 match message {
                     Some(FetchControlMessage::Status(respond)) => {
+                        // let oldest_pending_file = pending.first_entry()
+                        //     .map(|entry| PendingStatus {
+                        //         file: entry.key().sha256.clone(),
+                        //         finished: entry.get().finished,
+                        //         retries: entry.get().retries,
+                        //     });
                         let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
 
                         _ = respond.send(FetchStatus {
@@ -224,6 +231,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                             pending_files: pending,
                             inflight: running.len() as u64,
                             last_fetch_rows: last_fetch_rows.load(std::sync::atomic::Ordering::Relaxed),
+                            // oldest_pending_file,
                         });
                     },
                     None => return Ok(())

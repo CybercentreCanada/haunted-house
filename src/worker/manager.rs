@@ -357,14 +357,15 @@ impl WorkerState {
             let mut hashes = vec![];
             for (number, hash) in &batch {
                 hashes.push(hash.clone());
-                let data = self.trigrams.get(id, hash).await?;
+                let data = self.trigrams.get(id, hash).await
+                    .with_context(|| format!("load_trigram({id}, {hash})"))?;
                 trigrams.push((*number, data));
             }
             let time_load_trigrams = stamp.elapsed().as_secs_f64();
 
             // Ingest the data to the journal
             let stamp = std::time::Instant::now();
-            if !worker.write_batch(trigrams).await? {
+            if !worker.write_batch(trigrams).await.context("write_batch")? {
                 continue
             }
             let time_install = stamp.elapsed().as_secs_f64();
