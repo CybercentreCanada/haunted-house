@@ -783,8 +783,8 @@ async fn _ingest_check(core: Arc<HouseCore>, mut tasks: HashMap<Sha256, IngestTa
             if let Some(task) = tasks.remove(&sha) {
                 for response in task.response {
                     _ = response.send(Ok(true));
-                    status.existing += 1;
                 }
+                status.existing += 1;
             }
         }
 

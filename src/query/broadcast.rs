@@ -1,4 +1,4 @@
-/// Reproduce a broadcast like interface using unbounded channels.
+//! Reproduce a broadcast like interface using unbounded channels.
 
 pub fn channel<T: Clone>(label: u32) -> (Sender<T>, Receiver<T>) {
 
