@@ -173,6 +173,8 @@ fn default_yara_batch_size() -> u32 { 100 }
 fn default_filter_item_limit() -> u64 { 50_000_000 }
 /// default value for ingest_check_batch_size
 fn default_ingest_check_batch_size() -> usize { 200 }
+/// default value for ingest_check_concurrent_batches
+fn default_ingest_check_concurrent_batches() -> usize { 3 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -270,6 +272,9 @@ pub struct BrokerSettings {
     /// Number of files used to batch checks for existing files on ingest
     #[serde(default="default_ingest_check_batch_size")]
     pub ingest_check_batch_size: usize,
+    /// Number of concurrent batches to run checking files for ingestion
+    #[serde(default="default_ingest_check_concurrent_batches")]
+    pub ingest_check_concurrent_batches: usize,
 }
 
 impl Default for BrokerSettings {
@@ -290,6 +295,7 @@ impl Default for BrokerSettings {
             yara_jobs_per_worker: default_yara_jobs_per_worker(),
             yara_batch_size: default_yara_batch_size(),
             ingest_check_batch_size: default_ingest_check_batch_size(),
+            ingest_check_concurrent_batches: default_ingest_check_concurrent_batches(),
             bind_address: Some("localhost:4443".to_owned()),
             tls: None
         }

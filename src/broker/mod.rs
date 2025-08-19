@@ -589,7 +589,7 @@ pub struct IngestCheckStatus {
     /// How many tasks are in the input queue
     queue: usize,
     /// How many tasks are currently being checked
-    active: usize,
+    active: Vec<usize>,
     /// How many tasks have been processed in the last minute
     last_minute: usize,
     /// Outcome counts for the most recent batch
@@ -647,16 +647,16 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
     // The task running the current batch of tasks. This leaves this task
     // free to take in new tasks and respond to status queries.
     // We are using a join set to manage the task, but only launching a single batch at a time
-    let mut check_worker: JoinSet<Result<IngestCheckBatchStatus>> = JoinSet::new();
+    let mut check_workers: JoinSet<Result<IngestCheckBatchStatus>> = JoinSet::new();
     let mut previous_batch = IngestCheckBatchStatus::default();
     // How many tasks are in the current batch
-    let mut active_batch_size = 0;
+    let mut active_batch_sizes = HashMap::<tokio::task::Id, usize>::new();
     // A counter to track how many tasks we completed in the last minute
     let mut counter = crate::counters::WindowCounter::new(60);
 
     loop {
         // Restart the check worker
-        if check_worker.is_empty() && !unchecked_buffer.is_empty() {
+        while check_workers.len() < core.config.ingest_check_concurrent_batches && !unchecked_buffer.is_empty() {
             let today = ExpiryGroup::today();
             let core = core.clone();
             let mut tasks: HashMap<_, _> = Default::default();
@@ -675,8 +675,9 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     break;
                 }
             }
-            active_batch_size = tasks.len();
-            check_worker.spawn(_ingest_check(core, tasks));
+            let active_batch_size = tasks.len();
+            let handle = check_workers.spawn(_ingest_check(core, tasks));
+            active_batch_sizes.insert(handle.id(), active_batch_size);
         }
 
         //
@@ -705,7 +706,7 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
                     IngestMessage::Status(resp) => {
                         _ = resp.send(IngestCheckStatus {
                             queue: unchecked_buffer.len(),
-                            active: active_batch_size,
+                            active: active_batch_sizes.values().copied().collect(),
                             last_minute: counter.value(),
                             previous_batch: previous_batch.clone(),
                         });
@@ -714,26 +715,27 @@ async fn _ingest_worker(core: Arc<HouseCore>, input: &mut mpsc::UnboundedReceive
             }
 
             // If a check worker is running watch for it
-            res = check_worker.join_next(), if !check_worker.is_empty() => {
+            res = check_workers.join_next_with_id(), if !check_workers.is_empty() => {
                 let res = match res {
                     Some(res) => res,
                     None => continue
                 };
 
                 match res {
-                    Ok(Ok(status)) => {
+                    Ok((id, Ok(status))) => {
+                        let finished_batch_size = active_batch_sizes.remove(&id).unwrap_or_default();
+                        counter.increment(finished_batch_size);
                         previous_batch = status;
                     },
-                    Ok(Err(err)) => {
+                    Ok((id, Err(err))) => {
+                        active_batch_sizes.remove(&id);
                         error!("ingest checker error: {err}");
                     },
                     Err(err) => {
+                        active_batch_sizes.remove(&err.id());
                         error!("ingest checker error: {err}");
                     },
                 };
-
-                counter.increment(active_batch_size);
-                active_batch_size = 0;
             }
         }
     }
