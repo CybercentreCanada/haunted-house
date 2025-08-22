@@ -227,7 +227,8 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                                 finished: entry.get().finished,
                                 retries: entry.get().retries,
                             });
-                        let pending = client.count_files(&format!("seen.last: {{{} TO *]", checkpoint.to_rfc3339()), 1_000_000).await?;
+                        let mut pending = client.count_files(&format!("seen.last: {{{} TO *]", seek_point.to_rfc3339()), 1_000_000).await?;
+                        pending += running.len() as u64;
 
                         _ = respond.send(FetchStatus {
                             last_minute_searches: search_counter.lock().value() as i64,
