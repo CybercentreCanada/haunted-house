@@ -65,7 +65,10 @@ fn _search_stream(
 ) -> mpsc::Receiver<FetchedFile> {
     let (channel, output) = mpsc::channel(batch_size * 10);
     tokio::spawn(async move {
-        loop {
+        'outer: loop {
+            // stop searching if this loop isn't feeding data to a working channel
+            if channel.is_closed() { break }
+
             // get a batch from elasticsearch
             search_counter.lock().increment(1);
             let result = match client.fetch_files(seek_point, batch_size).await {
@@ -83,7 +86,7 @@ fn _search_stream(
             for file in result {
                 seek_point = seek_point.max(file.seen);
                 if channel.send(file).await.is_err() {
-                    break
+                    break 'outer
                 }
             }
 
