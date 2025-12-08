@@ -503,14 +503,8 @@ impl FilterSQLWorker {
                 .bind(file.access_string.to_string())
                 .execute(&mut *conn).await?;
 
-            if let Some(size) = self.filter_sizes.write().await.get_mut(&self.id) {
-                *size += 1;
-            };
-
-            match self.filter_pending.write().await.entry(self.id) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(file.hash.clone()); },
-                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(HashSet::from([file.hash.clone()])); },
-            }
+            *self.filter_sizes.write().await.entry(self.id).or_default() += 1;
+            self.filter_pending.write().await.entry(self.id).or_default().insert(file.hash.clone());
         }
 
         conn.commit().await?;
