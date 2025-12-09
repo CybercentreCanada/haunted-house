@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use log::error;
-use poem::web::websocket::{WebSocket, Message};
+use poem::web::websocket::{Message, WebSocket, WebSocketStream};
 use poem::{handler, Route, get, EndpointExt, Server, post, IntoResponse, put};
 use poem::listener::{TcpListener, OpensslTlsConfig, Listener};
 use poem::web::{Data, Json};
@@ -64,55 +64,57 @@ impl std::fmt::Debug for FilterSearchResponse {
     }
 }
 
+async fn _run_filter_search(socket: &mut WebSocketStream, state: Arc<WorkerState>) -> Result<()> {
+    // wait for our filter command
+    let request: FilterSearchRequest = match socket.next().await {
+        Some(Ok(Message::Text(text))) => {
+            serde_json::from_str(&text)?
+        }
+        Some(Ok(_)) => bail!("Unexpected opening message type"),
+        Some(Err(err)) => bail!("Bad filter command: {err:?}"),
+        None => return Ok(()),
+    };
+
+    // Gather the filters related to this query
+    let filter_ids = state.get_filters(&request.expiry_group_range.0, &request.expiry_group_range.1).await?;
+    let message = serde_json::to_string(&FilterSearchResponse::Filters(filter_ids.clone()))?;
+    socket.send(Message::Text(message)).await?;
+
+    // Dispatch a query to each of those filters
+    let query = Arc::new(request.query);
+    let mut recv = {
+        let (send, recv) = mpsc::channel(128);
+        // let mut queries = tokio::task::JoinSet::new();
+        for filter_id in &filter_ids {
+            let state = state.clone();
+            tokio::spawn(state.query_filter(*filter_id, query.clone(), request.access.clone(), send.clone()));
+        }
+        recv
+    };
+
+    // Collect the results
+    while let Some(message) = recv.recv().await {
+        socket.send(Message::Text(match serde_json::to_string(&message) {
+            Ok(message) => message,
+            Err(_) => continue
+        })).await?;
+    }
+    Ok(())
+}
+
 #[handler]
 async fn run_filter_search(ws: WebSocket, state: Data<&Arc<WorkerState>>) -> impl IntoResponse {
     let state = state.clone();
     ws.on_upgrade(|mut socket| async move {
-        // wait for our filter command
-        let request: FilterSearchRequest = match socket.next().await {
-            Some(Ok(Message::Text(text))) => {
-                if let Ok(request) = serde_json::from_str(&text) {
-                    request
-                } else {
-                    return
+        if let Err(err) = _run_filter_search(&mut socket, state).await {
+            let error_string = format!("{err:?}");
+            if let Ok(message) = serde_json::to_string(&FilterSearchResponse::Error(None, error_string.clone())) {
+                if socket.send(Message::Text(message)).await.is_err() {
+                    error!("Could not report error: {error_string}");
                 }
+            } else {
+                error!("Could not report error: {error_string}");
             }
-            Some(Ok(_)) => return,
-            Some(Err(err)) => {
-                error!("Bad filter command: {err}");
-                return
-            }
-            None => return,
-        };
-
-        // Gather the filters related to this query
-        let filter_ids = match state.get_filters(&request.expiry_group_range.0, &request.expiry_group_range.1).await {
-            Ok(filter_ids) => filter_ids,
-            Err(_err) => {
-                return
-            }
-        };
-        let message = serde_json::to_string(&FilterSearchResponse::Filters(filter_ids.clone())).unwrap();
-        socket.send(Message::Text(message)).await.unwrap();
-
-        // Dispatch a query to each of those filters
-        let query = Arc::new(request.query);
-        let mut recv = {
-            let (send, recv) = mpsc::channel(128);
-            // let mut queries = tokio::task::JoinSet::new();
-            for filter_id in &filter_ids {
-                let state = state.clone();
-                tokio::spawn(state.query_filter(*filter_id, query.clone(), request.access.clone(), send.clone()));
-            }
-            recv
-        };
-
-        // Collect the results
-        while let Some(mut message) = recv.recv().await {
-            _ = socket.send(Message::Text(match serde_json::to_string(&message) {
-                Ok(message) => message,
-                Err(_) => continue
-            })).await;
         }
         _ = socket.close().await;
     })

@@ -11,6 +11,7 @@ use itertools::Itertools;
 use crate::error::{Result, ErrorKinds};
 use crate::query::phrases::PhraseQuery as Query;
 
+const DEFAULT_BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Struct used internal to this module to capture queries and warnings together
 pub struct ParsedQuery {
@@ -126,11 +127,7 @@ fn variable_to_query(var: &VariableDeclaration) -> Result<ParsedQuery> {
     // Base64 modifier.
     if let Some(rules) = &var.modifiers.base64 {
         if let Some(query) = &mut patterns.query {
-            let alphabet = if let Some(alphabet) = rules.alphabet {
-                alphabet
-            } else {
-                *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-            };
+            let alphabet = rules.alphabet.unwrap_or(*DEFAULT_BASE64);
 
             *query = Query::or(vec![
                 query.map_literals(&|bytes|base64_encode(0, bytes, alphabet)),
