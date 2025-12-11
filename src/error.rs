@@ -4,8 +4,6 @@ use crate::types::FilterID;
 /// enumeration of all error codes
 #[derive(Debug, PartialEq)]
 pub enum ErrorKinds {
-    /// A requested blob won't fit within the limit specified for a cache
-    BlobTooLargeForCache,
     /// A blob which does not exist was requested.
     BlobNotFound,
     // InvalidHashProduced,

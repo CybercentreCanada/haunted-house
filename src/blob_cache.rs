@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tempfile::NamedTempFile;
 
 use tokio::sync::Notify;
@@ -58,6 +58,8 @@ struct LoadingHandle {
 
 impl BlobCache {
     pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&path).context(format!("Failed to create cache directory: {path:?}"))?;
+
         Ok(Self {
             data: Arc::new(BlockingMutex::new(BlobCacheInner { 
                 open_files: Default::default(), 
@@ -221,8 +223,8 @@ impl LoadingHandle {
         let token = Self::reserve_space(&host, size).await;
         
         // start downloading the file
-        let file = NamedTempFile::new_in(storage_path)?;
-        storage.download(&label, file.path().to_path_buf()).await?;
+        let file = NamedTempFile::new_in(storage_path).context("During file creation")?;
+        storage.download(&label, file.path().to_path_buf()).await.context("During download")?;
 
         Ok(Arc::new(BlobHandle {
             label,
