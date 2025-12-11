@@ -424,7 +424,7 @@ impl WorkerState {
         debug!("yara task {} starting", yara_task.id);
         let mut errors = vec![];
         let filter_handle = {
-            let (file_send, mut file_recv) = mpsc::unbounded_channel::<(FileInfo, BlobHandle)>();
+            let (file_send, mut file_recv) = mpsc::unbounded_channel::<(FileInfo, Arc<BlobHandle>)>();
 
             // Run the interaction with yara in a blocking thread
             let filter_handle = tokio::task::spawn_blocking(move || -> Result<Vec<FileInfo>> {

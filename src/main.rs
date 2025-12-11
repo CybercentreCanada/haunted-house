@@ -103,10 +103,8 @@ fn load_worker_config(path: Option<PathBuf>) -> Result<crate::config::WorkerSett
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "haunted_house=info")
-    }
-    env_logger::init();
+    let log_config = env_logger::Env::new().filter(std::env::var("RUST_LOG").unwrap_or( "haunted_house=info".to_string()));
+    env_logger::init_from_env(log_config);
 
     let args = Args::parse();
     match args.cmd {

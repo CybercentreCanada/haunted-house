@@ -1,6 +1,6 @@
 [package]
 name = "haunted-house"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 default-run = "haunted-house"
 
@@ -9,6 +9,7 @@ default-run = "haunted-house"
 # Language utilities
 lazy_static = "1"
 anyhow = "1"
+thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde", "std"] }
 time = { version = "0.3" }
