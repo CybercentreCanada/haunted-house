@@ -166,7 +166,7 @@ fn default_per_worker_group_duplication() -> u32 { 2 }
 /// default value for search_hit_limit
 fn default_search_hit_limit() -> u64 { 50000 }
 /// default value for yara_jobs_per_worker
-fn default_yara_jobs_per_worker() -> usize { 2 }
+fn default_yara_jobs_per_worker() -> usize { 1 }
 /// default value for yara_batch_size
 fn default_yara_batch_size() -> u32 { 100 }
 /// default value for filter_item_limit
@@ -367,7 +367,7 @@ fn default_extended_segment_size() -> u32 { 2048 }
 /// How many files to ingest into a filter in a single pass
 fn default_ingest_batch_size() -> u32 { 100 }
 /// How many files to download into the trigram cache concurrently
-fn default_parallel_file_downloads() -> usize { 100 }
+fn default_parallel_file_downloads() -> usize { 10 }
 
 /// Settings for the worker server
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -60,6 +60,9 @@ impl BlobCache {
     pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&path).context(format!("Failed to create cache directory: {path:?}"))?;
 
+        // Leave some slack in capacity for delay on operations
+        let capacity = capacity - (1 << 30).min(capacity / 10);
+
         Ok(Self {
             data: Arc::new(BlockingMutex::new(BlobCacheInner { 
                 open_files: Default::default(), 
