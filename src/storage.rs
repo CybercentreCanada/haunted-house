@@ -503,7 +503,7 @@ impl AzureBlobStore {
     pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
         let mut recv = self.stream(label).await?;
         tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::File::options().write(true).open(path)?;
+            let mut file = std::fs::File::options().write(true).create(true).truncate(true).open(path)?;
             while let Some(data) = recv.blocking_recv() {
                 file.write_all(&data?)?;
             }

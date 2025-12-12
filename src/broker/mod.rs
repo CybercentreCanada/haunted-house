@@ -250,9 +250,9 @@ impl HouseCore {
         self.prepare_access(req.search_classification.as_str())?;
 
         let (start_group, end_group) = match req.indices {
-            models::IndexCatagory::Hot => (ExpiryGroup::min(), ExpiryGroup::before_archive()),
+            models::IndexCatagory::Hot => (ExpiryGroup::today(), ExpiryGroup::before_archive()),
             models::IndexCatagory::Archive => (ExpiryGroup::before_archive(), ExpiryGroup::max()),
-            models::IndexCatagory::HotAndArchive => (ExpiryGroup::min(), ExpiryGroup::max()),
+            models::IndexCatagory::HotAndArchive => (ExpiryGroup::today(), ExpiryGroup::max()),
         };
 
         // Create a record for the search

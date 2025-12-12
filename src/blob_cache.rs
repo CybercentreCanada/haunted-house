@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use log::error;
 use tempfile::NamedTempFile;
 
 use tokio::sync::Notify;
@@ -23,6 +24,7 @@ struct BlobCacheInner {
     errors: HashMap<String, String>,
     total_space: u64,
     free_space: u64,
+    reserve_space: u64,
     storage_change: Arc<tokio::sync::Notify>,
     requesting_space: Arc<tokio::sync::Mutex<()>>,
     storage: BlobStorage,
@@ -52,6 +54,16 @@ impl BlobHandle {
     }
 }
 
+fn count_dir(path: &Path) -> Result<usize> {
+    let mut count = 0;
+    let mut listing = std::fs::read_dir(path)?;
+    while let Some(item) = listing.next() {
+        item?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 struct LoadingHandle {
     task: Option<tokio::task::JoinHandle<Result<Arc<BlobHandle>>>>,
 }
@@ -59,9 +71,13 @@ struct LoadingHandle {
 impl BlobCache {
     pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&path).context(format!("Failed to create cache directory: {path:?}"))?;
+        if count_dir(&path)? > 0 {
+            error!("Cache directory is not empty on worker start!");
+        }
 
         // Leave some slack in capacity for delay on operations
-        let capacity = capacity - (1 << 30).min(capacity / 10);
+        let reserve =  (1 << 30).min(capacity / 10);
+        let capacity = capacity - reserve;
 
         Ok(Self {
             data: Arc::new(BlockingMutex::new(BlobCacheInner { 
@@ -70,6 +86,7 @@ impl BlobCache {
                 errors: Default::default(),
                 total_space: capacity,
                 free_space: capacity,
+                reserve_space: reserve,
                 storage_change: Arc::new(Notify::new()),
                 requesting_space: Arc::new(tokio::sync::Mutex::new(())),
                 directory: path,
@@ -82,6 +99,12 @@ impl BlobCache {
     pub fn capacity(&self) -> (u64, u64) {
         let inner = self.data.lock();
         (inner.free_space, inner.total_space)
+    }   
+    
+    #[cfg(test)]
+    pub fn reserve(&self) -> u64 {
+        let inner = self.data.lock();
+        inner.reserve_space
     }   
 
     pub async fn open(&self, label: String) -> Result<Arc<BlobHandle>> {
@@ -229,6 +252,12 @@ impl LoadingHandle {
         let file = NamedTempFile::new_in(storage_path).context("During file creation")?;
         storage.download(&label, file.path().to_path_buf()).await.context("During download")?;
 
+        // validate the size of the downloaded file
+        let metadata = tokio::fs::metadata(file.path()).await?;
+        if metadata.len() != size {
+            anyhow::bail!("Downloaded file [{label}] was not the expected size {} != {}", metadata.len(), size);
+        }
+
         Ok(Arc::new(BlobHandle {
             label,
             file,
@@ -296,6 +325,7 @@ mod test {
     use assertor::{assert_that, VecAssertion};
     use rand::Rng;
 
+    use crate::blob_cache::count_dir;
     use crate::storage::{connect, BlobStorageConfig};
     use super::BlobCache;
 
@@ -313,6 +343,8 @@ mod test {
             path: storage_dir.path().to_owned(),
         }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
+        let reserve = cache.reserve();
+        let cache_size = cache_size - reserve;
 
         let mut rng = rand::thread_rng();
         let sample_size = 128;
@@ -367,12 +399,15 @@ mod test {
         println!("setup environment");
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache_size = 1024;
+        let cache_size = 1024 + 128;
         let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
+        let cache_size = cache_size - cache.reserve();
 
         let mut rng = rand::thread_rng();
         let sample_size = 512;
+
+        assert_eq!(count_dir(cache_dir.path()).unwrap(), 0);
 
         // Add some data
         println!("insert data");
@@ -389,12 +424,14 @@ mod test {
         //
         println!("open {id1}");
         let get1 = tokio::time::timeout(Duration::from_secs(1), cache.open(id1.clone())).await.unwrap().unwrap();
+        assert_eq!(count_dir(cache_dir.path()).unwrap(), 1);
         assert_eq!(get1.read_all().await.unwrap(), data1);
         println!("open {id1} finished");
 
         let get3 = {
             println!("open {id2}");
             let get2 = tokio::time::timeout(Duration::from_secs(1), cache.open(id2.clone())).await.unwrap().unwrap();
+            assert_eq!(count_dir(cache_dir.path()).unwrap(), 2);
             assert_eq!(get2.read_all().await.unwrap(), data2);
             println!("open {id2} finished");
 
@@ -411,16 +448,18 @@ mod test {
             println!("open {id3} again did timeout");
 
             assert_that!(cache.current_open()).contains_exactly(vec![id1.clone(), id2]);
-            assert_eq!(cache.capacity(), (0, cache_size));
+            assert_eq!(cache.capacity(), (cache_size - 2 * sample_size, cache_size));
+            assert_eq!(count_dir(cache_dir.path()).unwrap(), 2);
             get3
         };
         println!("other opens finished");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let get3 = get3.await.unwrap().unwrap();
+        assert_eq!(count_dir(cache_dir.path()).unwrap(), 2);
         println!("open {id3} finish");
         assert_eq!(get3.read_all().await.unwrap(), data3);
         assert_that!(cache.current_open()).contains_exactly(vec![id1, id3]);
-        assert_eq!(cache.capacity(), (0, cache_size));
+        assert_eq!(cache.capacity(), (cache_size - 2 * sample_size, cache_size));
     }
 }
