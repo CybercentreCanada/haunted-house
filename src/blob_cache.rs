@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -19,12 +19,12 @@ pub struct BlobCache {
 }
 
 struct BlobCacheInner {
-    open_files: HashMap<String, Arc<BlobHandle>>,
+    open_files: HashMap<String, Weak<BlobHandle>>,
     loading_files: HashMap<String, Arc<AsyncMutex<LoadingHandle>>>,
     errors: HashMap<String, String>,
     total_space: u64,
     free_space: u64,
-    reserve_space: u64,
+    _reserve_space: u64,
     storage_change: Arc<tokio::sync::Notify>,
     requesting_space: Arc<tokio::sync::Mutex<()>>,
     storage: BlobStorage,
@@ -35,8 +35,7 @@ struct BlobCacheInner {
 pub struct BlobHandle {
     label: String,
     file: NamedTempFile,
-    space_token: StorageToken,
-    loaded: chrono::DateTime<chrono::Utc>
+    _space_token: StorageToken,
 }
 
 impl BlobHandle {
@@ -86,7 +85,7 @@ impl BlobCache {
                 errors: Default::default(),
                 total_space: capacity,
                 free_space: capacity,
-                reserve_space: reserve,
+                _reserve_space: reserve,
                 storage_change: Arc::new(Notify::new()),
                 requesting_space: Arc::new(tokio::sync::Mutex::new(())),
                 directory: path,
@@ -104,7 +103,7 @@ impl BlobCache {
     #[cfg(test)]
     pub fn reserve(&self) -> u64 {
         let inner = self.data.lock();
-        inner.reserve_space
+        inner._reserve_space
     }   
 
     pub async fn open(&self, label: String) -> Result<Arc<BlobHandle>> {
@@ -112,11 +111,17 @@ impl BlobCache {
             let loading = {
                 // check if the file has already been opened
                 let mut inner = self.data.lock();
+                inner.open_files.retain(|_, val| val.strong_count() > 0);
+
                 if let Some(err) = inner.errors.get(&label) {
                     return Err(anyhow::anyhow!("Failed to load file: {err}"))
                 }
                 if let Some(handle) = inner.open_files.get(&label) {
-                    return Ok(handle.clone())
+                    if let Some(handle) = handle.upgrade() {
+                        return Ok(handle.clone())
+                    } else {
+                        inner.open_files.remove(&label);
+                    }
                 }
                 match inner.loading_files.entry(label.clone()) {
                     // join waiting if it is already being opened
@@ -145,7 +150,7 @@ impl BlobCache {
                         Ok(Ok(blob)) => {
                             let mut inner = self.data.lock();
                             inner.loading_files.remove(&label);
-                            inner.open_files.insert(label, blob.clone());
+                            inner.open_files.insert(label, Arc::downgrade(&blob));
                             return Ok(blob)
                         },
                         Ok(Err(err)) => {
@@ -166,49 +171,10 @@ impl BlobCache {
         }
     }
 
-    async fn release_space(&self, size: u64) -> bool {
-        let mut inner = self.data.lock();
-        
-        // loop through held files collecting any that aren't in use, release them starting from the oldest
-        let mut can_free = vec![];
-        for (label, blob) in inner.open_files.iter() {
-            if Arc::strong_count(blob) == 1 {
-                can_free.push((blob.loaded, label.clone()));
-            }
-        }
-        can_free.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-
-        let mut free_space = inner.free_space;
-        let mut dropped = vec![];
-        while free_space < size {
-            match can_free.pop() {
-                Some((_, label)) => {
-                    if let Some(blob) = inner.open_files.remove(&label) {
-                        free_space += blob.space_token.value;
-                        dropped.push(blob);
-                    }
-                },
-                None => {
-                    drop(inner);
-                    return false
-                },
-            }
-        }
-        // force the lock to be released before we drop other variables (here and the return false before)
-        // This is because the drop in the blob handles will try and take this lock and deadlock
-        // if we are still holding it. 
-        drop(inner); 
-        return true
-    }
-
-    #[cfg(test)]
-    pub async fn flush(&self) {
-        self.release_space(u64::MAX).await;
-    }
-
     #[cfg(test)]
     pub fn current_open(&self) -> Vec<String> {
-        let inner = self.data.lock();
+        let mut inner = self.data.lock();
+        inner.open_files.retain(|_, val| val.strong_count() > 0);
         inner.open_files.keys().cloned().collect()
     }
 }
@@ -261,8 +227,7 @@ impl LoadingHandle {
         Ok(Arc::new(BlobHandle {
             label,
             file,
-            space_token: token,
-            loaded: chrono::Utc::now()
+            _space_token: token,
         }))
     }
 
@@ -289,15 +254,13 @@ impl LoadingHandle {
                 }
             }
 
-            // try to find space
-            if !host.release_space(size).await {
-                // wait for a change in storage condition
-                _ = tokio::time::timeout(Duration::from_secs(5), storage_notice.notified()).await;
-            }
+            // wait for a change in storage condition
+            _ = tokio::time::timeout(Duration::from_secs(5), storage_notice.notified()).await;
         }        
     }
 }
 
+#[clippy::has_significant_drop]
 struct StorageToken {
     value: u64,
     host: BlobCache
@@ -359,14 +322,14 @@ mod test {
             let handle = cache.open(id.clone()).await.unwrap();
             assert_eq!(handle.read_all().await.unwrap(), data);
             assert_eq!(cache.capacity(), (cache_size - sample_size, cache_size));
-            cache.flush().await;
+            // cache.flush().await;
             assert_eq!(handle.read_all().await.unwrap(), data);
             assert_eq!(cache.capacity(), (cache_size - sample_size, cache_size));
         }
 
-        assert_eq!(cache.current_open(), vec![id]);
-        assert_eq!(cache.capacity(), (cache_size - sample_size, cache_size));
-        cache.flush().await;
+        // assert_eq!(cache.current_open(), vec![id]);
+        // assert_eq!(cache.capacity(), (cache_size - sample_size, cache_size));
+        // cache.flush().await;
         assert!(cache.current_open().is_empty());
         assert_eq!(cache.capacity(), (cache_size, cache_size));
     }
