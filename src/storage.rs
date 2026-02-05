@@ -692,6 +692,11 @@ impl S3BlobStore {
 
         // configure endpoint
         if let Some(endpoint_url) = config.endpoint_url {
+            let endpoint_url = if endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://") {
+                endpoint_url
+            } else {
+                format!("https://{}", endpoint_url)
+            };
             loader = loader.endpoint_url(endpoint_url);
         }
 
