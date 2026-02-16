@@ -79,7 +79,7 @@ impl Datastore {
             seen: Vec<DateTime<Utc>>,
         }
 
-        let result = self.file.search::<Fields>(&format!("seen.last: [{} TO *]", seek_point.to_rfc3339()))
+        let result = self.file.search::<Fields>(&format!("seen.last: [{} TO now-10m] AND expiry_ts: [now+1d TO *]", seek_point.to_rfc3339()))
             .size(batch_size)
             .full_source(false)
             .sort(json!({"seen.last": "asc"}))
@@ -89,10 +89,10 @@ impl Datastore {
         // read the body of our response
         let mut out = vec![];
         for mut row in result.hits.hits {
-            out.push(FetchedFile { 
-                seen: row.fields.seen.pop().ok_or(ElasticError::MalformedResponse)?, 
-                sha256: row.fields.sha256.pop().ok_or(ElasticError::MalformedResponse)?, 
-                classification: row.fields.classification.pop().ok_or(ElasticError::MalformedResponse)?, 
+            out.push(FetchedFile {
+                seen: row.fields.seen.pop().ok_or(ElasticError::MalformedResponse)?,
+                sha256: row.fields.sha256.pop().ok_or(ElasticError::MalformedResponse)?,
+                classification: row.fields.classification.pop().ok_or(ElasticError::MalformedResponse)?,
                 expiry: row.fields.expiry_ts.pop(),
             })
         }
@@ -149,12 +149,12 @@ impl Datastore {
             let key = format!("{search}_{}", info.hash);
             body += &serde_json::to_string(&json!({"create": {"_index": index, "_id": key, "require_alias": true}}))?;
             body += "\n";
-            body += &serde_json::to_string(&RetrohuntHit{ 
-                key: key.clone(), 
+            body += &serde_json::to_string(&RetrohuntHit{
+                key: key.clone(),
                 classification: ExpandingClassification::new(info.access_string.clone())?,
-                sha256: info.hash.to_string().parse()?, 
-                expiry_ts: info.expiry.as_timestamp(), 
-                search: search.to_owned() 
+                sha256: info.hash.to_string().parse()?,
+                expiry_ts: info.expiry.as_timestamp(),
+                search: search.to_owned()
             })?;
             body += "\n";
             fileinfo.insert(key, info);
@@ -196,14 +196,14 @@ impl Datastore {
                 if let Some(source) = document._source {
                     if let Some(info) = fileinfo.get(&document._id) {
                         body += &serde_json::to_string(&json!({"index": {
-                            "_index": index, 
-                            "_id": document._id, 
-                            "require_alias": true, 
-                            "if_seq_no": document._seq_no, 
+                            "_index": index,
+                            "_id": document._id,
+                            "require_alias": true,
+                            "if_seq_no": document._seq_no,
                             "if_primary_term": document._primary_term
                         }}))?;
                         body += "\n";
-                        body += &serde_json::to_string(&RetrohuntHit{ 
+                        body += &serde_json::to_string(&RetrohuntHit{
                             classification: ExpandingClassification::new(ce.min_classification(source.classification.as_str(), &info.access_string, false)?)?,
                             expiry_ts: match (source.expiry_ts, info.expiry.as_timestamp()) {
                                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -211,9 +211,9 @@ impl Datastore {
                             },
                             key: document._id,
                             sha256: source.sha256,
-                            search: search.to_owned(), 
+                            search: search.to_owned(),
                         })?;
-                        body += "\n";    
+                        body += "\n";
                     }
                 }
             }
@@ -435,7 +435,7 @@ impl Elastic {
     fn get_index_settings(&self, index: Index, archive: bool) -> serde_json::Value {
         default_settings(json!({
             "number_of_shards": index.shards(archive), // self.shards if not archive else self.archive_shards,
-            "number_of_replicas": index.replicas(archive), // self.replicas if not archive else self.archive_replicas    
+            "number_of_replicas": index.replicas(archive), // self.replicas if not archive else self.archive_replicas
         }))
     }
 
@@ -508,13 +508,13 @@ impl Elastic {
 
         // Handle server side http status errors with retry, let other error codes bubble up, decode successful bodies
         let status = response.status();
-        
+
         return if status.is_server_error() {
             let body = response.text().await.unwrap_or(status.to_string());
             error!("Server error in datastore: {body}");
             let delay = MAX_DELAY.min(Duration::from_secs_f64((*attempt as f64).powf(2.0)/5.0));
             tokio::time::sleep(delay).await;
-            return Ok(None)                        
+            return Ok(None)
         } else if status.is_client_error() {
             let path = response.url().path().to_owned();
             let body = response.text().await.unwrap_or(status.to_string());
@@ -532,13 +532,13 @@ impl Elastic {
             // Build and dispatch the request
             let result = self.client.request(method.clone(), url.clone())
                 .send().await;
-            
+
             // Handle connection errors with a retry, let other non http errors bubble up
             match Self::handle_result(attempt, result).await? {
                 Some(response) => return Ok(response),
                 None => continue,
             }
-        }     
+        }
     }
 
     /// start an http request with a json body
@@ -550,13 +550,13 @@ impl Elastic {
             let result = self.client.request(method.clone(), url.clone())
                 .json(body)
                 .send().await;
-            
+
             // Handle connection errors with a retry, let other non http errors bubble up
             match Self::handle_result(attempt, result).await? {
                 Some(response) => return Ok(response),
                 None => continue,
             }
-        }     
+        }
     }
 
     /// start an http request with a binary body
@@ -570,13 +570,13 @@ impl Elastic {
                 .header("Content-Type", "application/x-ndjson")
                 .body(body.to_owned())
                 .send().await;
-            
+
             // Handle connection errors with a retry, let other non http errors bubble up
             match Self::handle_result(attempt, result).await? {
                 Some(response) => return Ok(response),
                 None => continue,
             }
-        }     
+        }
     }
 
     /// This function should completely delete the collection
@@ -614,7 +614,7 @@ pub struct Collection<Schema: DSType> {
     index: Index,
     /// elastic connection information with shared connection pool
     connection: Elastic,
-    /// zero size type marker to keep schema 
+    /// zero size type marker to keep schema
     _type: PhantomData<Schema>,
 }
 
@@ -647,11 +647,11 @@ impl<Schema: DSType> Collection<Schema> {
         Collection { index, connection, _type: Default::default() }
     }
 
-    /// Create a search builder 
+    /// Create a search builder
     pub fn search<'a, Fields: DeserializeOwned + Default>(&self, query: &'a str) -> SearchBuilder<'a, Fields, Schema> {
         SearchBuilder::<Fields, Schema>::new(self.clone(), query)
     }
-    
+
     /// Save a to document to the datastore using the key as its document id.
     /// Return true if the document was saved properly
     pub async fn save(&self, key: &str, data: &Schema, version: impl Into<SaveOperation>) -> Result<bool> {
@@ -739,13 +739,13 @@ impl<Schema: DSType> Collection<Schema> {
                 Err(ElasticError::HTTPError { code: StatusCode::NOT_FOUND, message, path }) => {
                     if Self::is_index_not_found_error(&message) {
                         self.ensure_collection().await?;
-                        continue    
+                        continue
                     }
                     break Err(ElasticError::HTTPError { path, code: StatusCode::NOT_FOUND, message })
                 },
-                Err(err) => break Err(err)    
+                Err(err) => break Err(err)
             }
-        }     
+        }
     }
 
     /// Make an http request with a json body
@@ -757,13 +757,13 @@ impl<Schema: DSType> Collection<Schema> {
                 Err(ElasticError::HTTPError { code: StatusCode::NOT_FOUND, message, path }) => {
                     if Self::is_index_not_found_error(&message) {
                         self.ensure_collection().await?;
-                        continue    
+                        continue
                     }
                     break Err(ElasticError::HTTPError { path, code: StatusCode::NOT_FOUND, message })
                 },
-                Err(err) => break Err(err)    
+                Err(err) => break Err(err)
             }
-        }     
+        }
     }
 
     /// Get indices in this collection as a comma separated list
@@ -823,7 +823,7 @@ impl<Schema: DSType> Collection<Schema> {
         Ok(output)
     }
 
-    /// Fetch a single document and its current version numbers 
+    /// Fetch a single document and its current version numbers
     pub async fn get(&self, id: &str) -> Result<Option<(Schema, (i64, i64))>> {
         //
         for index in self.get_index_list(None)? {
@@ -868,7 +868,7 @@ impl<Schema: DSType> Collection<Schema> {
                     match &err {
                         ElasticError::HTTPError{code: StatusCode::BAD_REQUEST, message, ..} => {
                             if message.contains("resource_already_exists_exception") {
-                                warn!("Tried to create an index template that already exists: {}", alias.to_uppercase());    
+                                warn!("Tried to create an index template that already exists: {}", alias.to_uppercase());
                             } else {
                                 return Err(err).context("put index bad request")
                             }
@@ -883,7 +883,7 @@ impl<Schema: DSType> Collection<Schema> {
                 // self.with_retries(self.datastore.client.indices.put_settings, index=alias, settings=write_block_settings)
                 let settings_url = self.connection.host.join(&format!("{index}/_settings"))?;
                 self.connection.make_request_json(&mut 0, Method::PUT, &settings_url, &json!({"index.blocks.write": true})).await.context("create write block")?;
-        
+
                 // Create a copy on the result index
                 self.connection.safe_index_copy(CopyMethod::Clone, &alias, &index, None, None).await?;
 
@@ -891,7 +891,7 @@ impl<Schema: DSType> Collection<Schema> {
                 // self.with_retries(self.datastore.client.indices.update_aliases, actions=actions)
                 self.connection.make_request_json(&mut 0, reqwest::Method::POST, &self.connection.host.join("_aliases")?, &json!({
                     "actions": [
-                        {"add":  {"index": index, "alias": alias}}, 
+                        {"add":  {"index": index, "alias": alias}},
                         {"remove_index": {"index": alias}}
                     ]
                 })).await?;
@@ -913,28 +913,28 @@ struct MGetResponse<Source, Fields> {
     docs: Vec<GetResponse<Source, Fields>>,
 }
 
-/// Layout of the json response for get 
+/// Layout of the json response for get
 #[derive(Deserialize)]
 #[allow(unused)]
 pub struct GetResponse<Source, Fields> {
-    /// The name of the index the document belongs to. 
+    /// The name of the index the document belongs to.
     pub _index: String,
-    /// The unique identifier for the document. 
+    /// The unique identifier for the document.
     pub _id: String,
-    /// The document version. Incremented each time the document is updated. 
+    /// The document version. Incremented each time the document is updated.
     pub _version: i64,
-    /// The sequence number assigned to the document for the indexing operation. Sequence numbers are used to ensure an older version of a document doesn’t overwrite a newer version. See Optimistic concurrency control. 
+    /// The sequence number assigned to the document for the indexing operation. Sequence numbers are used to ensure an older version of a document doesn’t overwrite a newer version. See Optimistic concurrency control.
     pub _seq_no: i64,
-    /// The primary term assigned to the document for the indexing operation. See Optimistic concurrency control. 
+    /// The primary term assigned to the document for the indexing operation. See Optimistic concurrency control.
     pub _primary_term: i64,
-    /// Indicates whether the document exists: true or false. 
+    /// Indicates whether the document exists: true or false.
     pub found: bool,
-    // The explicit routing, if set. 
+    // The explicit routing, if set.
     // _routing
-    /// If found is true, contains the document data formatted in JSON. Excluded if the _source parameter is set to false or the stored_fields parameter is set to true. 
+    /// If found is true, contains the document data formatted in JSON. Excluded if the _source parameter is set to false or the stored_fields parameter is set to true.
     #[serde(default="default_none")]
     pub _source: Option<Source>,
-    /// If the stored_fields parameter is set to true and found is true, contains the document fields stored in the index. 
+    /// If the stored_fields parameter is set to true and found is true, contains the document fields stored in the index.
     #[serde(default="default_none")]
     pub _fields: Option<Fields>,
 }
@@ -972,7 +972,7 @@ enum SourceParam<'a> {
     Fields(&'a str),
 }
 
-/// Helper struct to build a search query 
+/// Helper struct to build a search query
 pub struct SearchBuilder<'a, FieldType, SourceType: DSType> {
     /// Collection to target with search
     collection: Collection<SourceType>,
@@ -1094,9 +1094,9 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
             if body.timed_out {
                 continue
             }
-    
+
             return Ok(body)
-        }        
+        }
     }
 
     /// Scan over the result set in batches using a PIT to ensure consitency wrt other operations
@@ -1109,7 +1109,7 @@ impl<'a, FieldType: DeserializeOwned + Default, SourceType: DSType> SearchBuilde
             let response: PITResponse = response.json().await?;
             response.id
         };
-        
+
         // Add tie_breaker sort using _shard_doc ID
         self.sort.push(json!({"_shard_doc": "desc"}));
 
@@ -1146,7 +1146,7 @@ struct PITResponse {
 #[derive(Deserialize)]
 #[allow(unused)]
 struct ElasticStatus {
-    /// The name of the cluster. 
+    /// The name of the cluster.
     pub cluster_name: String,
     /// Health status of the cluster, based on the state of its primary and replica shards. Statuses are:
     ///
@@ -1154,31 +1154,31 @@ struct ElasticStatus {
     /// yellow: All primary shards are assigned, but one or more replica shards are unassigned. If a node in the cluster fails, some data could be unavailable until that node is repaired.
     /// red: One or more primary shards are unassigned, so some data is unavailable. This can occur briefly during cluster startup as primary shards are assigned.
     pub status: String,
-    /// (Boolean) If false the response returned within the period of time that is specified by the timeout parameter (30s by default). 
+    /// (Boolean) If false the response returned within the period of time that is specified by the timeout parameter (30s by default).
     pub timed_out: bool,
-    /// (integer) The number of nodes within the cluster. 
+    /// (integer) The number of nodes within the cluster.
     pub number_of_nodes: i64,
-    /// (integer) The number of nodes that are dedicated data nodes. 
+    /// (integer) The number of nodes that are dedicated data nodes.
     pub number_of_data_nodes: i64,
-    /// (integer) The number of active primary shards. 
+    /// (integer) The number of active primary shards.
     pub active_primary_shards: i64,
-    /// (integer) The total number of active primary and replica shards. 
+    /// (integer) The total number of active primary and replica shards.
     pub active_shards: i64,
-    /// (integer) The number of shards that are under relocation. 
+    /// (integer) The number of shards that are under relocation.
     pub relocating_shards: i64,
-    /// (integer) The number of shards that are under initialization. 
+    /// (integer) The number of shards that are under initialization.
     pub initializing_shards: i64,
-    /// (integer) The number of shards that are not allocated. 
+    /// (integer) The number of shards that are not allocated.
     pub unassigned_shards: i64,
-    /// (integer) The number of shards whose allocation has been delayed by the timeout settings. 
+    /// (integer) The number of shards whose allocation has been delayed by the timeout settings.
     pub delayed_unassigned_shards: i64,
-    /// (integer) The number of cluster-level changes that have not yet been executed. 
+    /// (integer) The number of cluster-level changes that have not yet been executed.
     pub number_of_pending_tasks: i64,
-    /// (integer) The number of unfinished fetches. 
+    /// (integer) The number of unfinished fetches.
     pub number_of_in_flight_fetch: i64,
-    /// (integer) The time expressed in milliseconds since the earliest initiated task is waiting for being performed. 
+    /// (integer) The time expressed in milliseconds since the earliest initiated task is waiting for being performed.
     pub task_max_waiting_in_queue_millis: i64,
-    /// (float) The ratio of active shards in the cluster expressed as a percentage. 
+    /// (float) The ratio of active shards in the cluster expressed as a percentage.
     pub active_shards_percent_as_number: f64,
 }
 
@@ -1186,9 +1186,9 @@ struct ElasticStatus {
 #[derive(Deserialize)]
 #[allow(unused)]
 struct BulkResponse {
-    /// How long, in milliseconds, it took to process the bulk request. 
+    /// How long, in milliseconds, it took to process the bulk request.
     pub took: i64,
-    /// If true, one or more of the operations in the bulk request did not complete successfully. 
+    /// If true, one or more of the operations in the bulk request did not complete successfully.
     pub errors: bool,
     /// Contains the result of each operation in the bulk request, in the order they were submitted.
     pub items: Vec<BulkResponseItem>,
@@ -1198,13 +1198,13 @@ struct BulkResponse {
 #[derive(Deserialize)]
 #[serde(rename_all="lowercase")]
 enum BulkResponseItem {
-    /// response to a create operation done via a bulk call 
+    /// response to a create operation done via a bulk call
     Create(BulkResponseItemData),
     /// response to a delete operation done via a bulk call
     Delete(BulkResponseItemData),
     /// response to an index operation done via a bulk call
     Index(BulkResponseItemData),
-    /// response to an update operation done via a bulk call 
+    /// response to an update operation done via a bulk call
     Update(BulkResponseItemData)
 }
 
@@ -1224,16 +1224,16 @@ impl BulkResponseItem {
 #[derive(Deserialize)]
 #[allow(unused)]
 struct BulkResponseItemData {
-    /// Name of the index associated with the operation. If the operation targeted a data stream, this is the backing index into which the document was written. 
+    /// Name of the index associated with the operation. If the operation targeted a data stream, this is the backing index into which the document was written.
     pub _index: String,
-    /// The document ID associated with the operation. 
+    /// The document ID associated with the operation.
     pub _id: String,
     /// The document version associated with the operation. The document version is incremented each time the document is updated.
     /// This parameter is only returned for successful actions.
     #[serde(default)]
     pub _version: Option<i64>,
     /// Result of the operation. Successful values are created, deleted, and updated.
-    /// This parameter is only returned for successful operations.        
+    /// This parameter is only returned for successful operations.
     #[serde(default)]
     pub result: Option<String>,
     /// Contains shard information for the operation.
@@ -1248,7 +1248,7 @@ struct BulkResponseItemData {
     /// This parameter is only returned for successful operations.
     #[serde(default)]
     pub _primary_term: Option<i64>,
-    /// HTTP status code returned for the operation. 
+    /// HTTP status code returned for the operation.
     pub status: u32,
     /// Contains additional information about the failed operation.
     /// The parameter is only returned for failed operations.
@@ -1256,7 +1256,7 @@ struct BulkResponseItemData {
 }
 
 impl BulkResponseItemData {
-    /// check whether this individual operation was successful, can be different for every operation in a bulk call 
+    /// check whether this individual operation was successful, can be different for every operation in a bulk call
     fn is_success(&self) -> bool {
         self.result.is_some()
     }
@@ -1266,11 +1266,11 @@ impl BulkResponseItemData {
 #[derive(Deserialize)]
 #[allow(unused)]
 struct BulkResponseItemShards {
-    /// Number of shards the operation attempted to execute on. 
+    /// Number of shards the operation attempted to execute on.
     pub total: i64,
-    /// Number of shards the operation succeeded on. 
+    /// Number of shards the operation succeeded on.
     pub successful: i64,
-    /// Number of shards the operation attempted to execute on but failed. 
+    /// Number of shards the operation attempted to execute on but failed.
     pub failed: i64,
 }
 
@@ -1278,20 +1278,20 @@ struct BulkResponseItemShards {
 #[derive(Deserialize, Debug)]
 #[allow(unused)]
 struct BulkResponseItemError {
-    /// Error type for the operation. 
+    /// Error type for the operation.
     #[serde(rename="type")]
     pub type_: String,
-    /// Reason for the failed operation. 
+    /// Reason for the failed operation.
     pub reason: String,
-    /// The universally unique identifier (UUID) of the index associated with the failed operation. 
+    /// The universally unique identifier (UUID) of the index associated with the failed operation.
     pub index_uuid: String,
-    /// ID of the shard associated with the failed operation. 
+    /// ID of the shard associated with the failed operation.
     pub shard: Option<String>,
-    /// Name of the index associated with the failed operation. If the operation targeted a data stream, this is the backing index into which the document was attempted to be written. 
+    /// Name of the index associated with the failed operation. If the operation targeted a data stream, this is the backing index into which the document was attempted to be written.
     pub index: String,
 }
 
-/// Cursor over results to a query on a PIT 
+/// Cursor over results to a query on a PIT
 pub struct ScanCursor<FieldType, SourceType> {
     /// connection pool for the elasticsearch server
     client: Elastic,
@@ -1335,7 +1335,7 @@ impl<FieldType: DeserializeOwned + Default, SourceType: DeserializeOwned> ScanCu
         if let Some(after) = &self.search_after {
             self.query_body.insert("search_after".to_owned(), after.clone());
         };
-        
+
         let mut attempt = 0;
         let mut body = loop {
             // Build and dispatch the request
@@ -1408,7 +1408,7 @@ pub struct SearchResultHitTotals {
     pub relation: String,
 }
 
-/// entry returned for a single document matched by a search 
+/// entry returned for a single document matched by a search
 #[derive(Debug, Deserialize)]
 pub struct SearchResultHitItem<FieldType, SourceType> {
     /// index document was returned from (search may be over many indices)
@@ -1417,10 +1417,10 @@ pub struct SearchResultHitItem<FieldType, SourceType> {
     pub _id: String,
     /// score describing the match of this result to the search parameters
     pub _score: Option<f64>,
-    /// the source document (or fields of the source document) requested in the search 
+    /// the source document (or fields of the source document) requested in the search
     #[serde(default="default_source")]
     pub _source: Option<SourceType>,
-    /// entry describing this document's position in the sorting of the result set, useful for pagination 
+    /// entry describing this document's position in the sorting of the result set, useful for pagination
     pub sort: serde_json::Value,
     /// Fields returned by the search from the indexed data (as opposed to source document)
     #[serde(default)]
@@ -1527,7 +1527,7 @@ mod test {
     fn setup_classification() {
         assemblyline_markings::set_default(std::sync::Arc::new(ClassificationParser::new(serde_json::from_str(r#"{"enforce":true,"dynamic_groups":false,"dynamic_groups_type":"all","levels":[{"aliases":["OPEN"],"css":{"color":"default"},"description":"N/A","lvl":1,"name":"LEVEL 0","short_name":"L0"},{"aliases":[],"css":{"color":"default"},"description":"N/A","lvl":5,"name":"LEVEL 1","short_name":"L1"},{"aliases":[],"css":{"color":"default"},"description":"N/A","lvl":15,"name":"LEVEL 2","short_name":"L2"}],"required":[{"aliases":["LEGAL"],"description":"N/A","name":"LEGAL DEPARTMENT","short_name":"LE","require_lvl":null,"is_required_group":false},{"aliases":["ACC"],"description":"N/A","name":"ACCOUNTING","short_name":"AC","require_lvl":null,"is_required_group":false},{"aliases":[],"description":"N/A","name":"ORIGINATOR CONTROLLED","short_name":"ORCON","require_lvl":null,"is_required_group":true},{"aliases":[],"description":"N/A","name":"NO CONTRACTOR ACCESS","short_name":"NOCON","require_lvl":null,"is_required_group":true}],"groups":[{"aliases":[],"auto_select":false,"description":"N/A","name":"GROUP A","short_name":"A","solitary_display_name":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"GROUP B","short_name":"B","solitary_display_name":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"GROUP X","short_name":"X","solitary_display_name":"XX"}],"subgroups":[{"aliases":["R0"],"auto_select":false,"description":"N/A","name":"RESERVE ONE","short_name":"R1","require_group":null,"limited_to_group":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"RESERVE TWO","short_name":"R2","require_group":"X","limited_to_group":null},{"aliases":[],"auto_select":false,"description":"N/A","name":"RESERVE THREE","short_name":"R3","require_group":null,"limited_to_group":"X"}],"restricted":"L2","unrestricted":"L0"}"#).unwrap()).unwrap()))
     }
-    
+
     #[tokio::test]
     async fn list_files() {
         setup_classification();
@@ -1538,33 +1538,33 @@ mod test {
 
         let mut prng = thread_rng();
         for _ in 0..1000 {
-            let file = assemblyline_models::datastore::File { 
-                ascii: Alphanumeric.sample_string(&mut prng, 10), 
-                classification: ExpandingClassification::new("L2//R1".to_owned()).unwrap(), 
-                entropy: 0.0, 
-                expiry_ts: Some(chrono::Utc::now() + chrono::Duration::days(2)), 
-                is_section_image: true, 
+            let file = assemblyline_models::datastore::File {
+                ascii: Alphanumeric.sample_string(&mut prng, 10),
+                classification: ExpandingClassification::new("L2//R1".to_owned()).unwrap(),
+                entropy: 0.0,
+                expiry_ts: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                is_section_image: true,
                 is_supplementary: false,
                 comments: Default::default(),
                 label_categories: Default::default(),
                 labels: Default::default(),
-                hex: Alphanumeric.sample_string(&mut prng, 10), 
-                md5: prng.gen(), 
-                magic: Alphanumeric.sample_string(&mut prng, 10), 
-                mime: None, 
-                seen: Seen { 
-                    count: prng.gen::<u16>() as u64, 
-                    first: chrono::Utc::now(), 
-                    last: chrono::Utc::now() 
-                }, 
-                sha1: prng.gen(), 
-                sha256: prng.gen(), 
-                size: prng.gen::<u16>() as u64, 
-                ssdeep: prng.gen(), 
-                file_type: Alphanumeric.sample_string(&mut prng, 10), 
-                tlsh: None, 
-                from_archive: false, 
-                uri_info: None, 
+                hex: Alphanumeric.sample_string(&mut prng, 10),
+                md5: prng.gen(),
+                magic: Alphanumeric.sample_string(&mut prng, 10),
+                mime: None,
+                seen: Seen {
+                    count: prng.gen::<u16>() as u64,
+                    first: chrono::Utc::now(),
+                    last: chrono::Utc::now() - chrono::Duration::hours(1)
+                },
+                sha1: prng.gen(),
+                sha256: prng.gen(),
+                size: prng.gen::<u16>() as u64,
+                ssdeep: prng.gen(),
+                file_type: Alphanumeric.sample_string(&mut prng, 10),
+                tlsh: None,
+                from_archive: false,
+                uri_info: None,
             };
             ds.file.save(&file.sha256, &file, None).await.unwrap();
         }
@@ -1589,18 +1589,18 @@ mod test {
         ds.connection.wipe(Index::RetrohuntHit, IndexCatagory::Hot).await.unwrap();
         assert!(ds.retrohunt_hit.get("osntehuo.cenuhdon.chu").await.unwrap().is_none());
 
-        // delete old index, we'll recreate wih a bulk operation        
+        // delete old index, we'll recreate wih a bulk operation
         ds.connection.wipe(Index::RetrohuntHit, IndexCatagory::Hot).await.unwrap();
 
         // Load a few random objects into the database
         let mut hits = vec![];
         let mut prng = thread_rng();
         for _ in 0..1000 {
-            hits.push(FileInfo{ 
-                hash: prng.gen(), 
+            hits.push(FileInfo{
+                hash: prng.gen(),
                 access: "and(\"L2\", \"R1\")".parse().unwrap(),
                 access_string: "L2//R1".parse().unwrap(),
-                expiry: ExpiryGroup::today() 
+                expiry: ExpiryGroup::today()
             });
         }
         let mut subset: Vec<FileInfo> = hits[0..50].to_vec();
@@ -1609,10 +1609,10 @@ mod test {
         // Update some of those files
         for hit in &mut subset {
             hit.access = "\"L0\"".parse().unwrap();
-            hit.access_string = "L0".to_owned();      
+            hit.access_string = "L0".to_owned();
         }
         ds.save_hits("search", subset.clone()).await.unwrap();
-        
+
         // count items in elastic
         let search = ds.retrohunt_hit.search::<()>("*:*")
             .size(0)
@@ -1660,7 +1660,7 @@ mod test {
         assert!(!search.timed_out);
         assert_eq!(search.hits.total.value, 950);
         assert_eq!(search.hits.hits.len(), 950);
-        
+
         // Do a scan with PIT that requires a single call
         let mut search = ds.retrohunt_hit.search::<()>("NOT classification: L0")
             .full_source(true)

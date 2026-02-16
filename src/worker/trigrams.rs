@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::iter::Peekable;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use itertools::Itertools;
 use log::error;
 use tokio::sync::{Semaphore, RwLock};
@@ -16,7 +16,7 @@ use serde::{Serialize, Deserialize, de::Error};
 
 use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
-use crate::storage::BlobStorage;
+use crate::storage::MultiStorage;
 use crate::types::{Sha256, FilterID, FileInfo};
 
 use super::encoding::{encode_into_increasing, StreamEncode};
@@ -34,13 +34,13 @@ pub struct TrigramCache {
     /// List of jobs that have been rejected and can't be completed
     rejected: RwLock<HashSet<(FilterID, Sha256)>>,
     /// A storage driver where the target files can be loaded from
-    files: BlobStorage
+    files: MultiStorage
 }
 
 
 impl TrigramCache {
     /// Setup the cache
-    pub async fn new(config: &WorkerSettings, files: BlobStorage) -> Result<Arc<Self>> {
+    pub async fn new(config: &WorkerSettings, files: MultiStorage) -> Result<Arc<Self>> {
         let temp_dir = config.get_trigram_cache_directory().join("temp");
         if temp_dir.exists() {
             tokio::fs::remove_dir_all(&temp_dir).await?;
@@ -92,9 +92,9 @@ impl TrigramCache {
                 let mut not_found_errors = 0;
                 let rejected = loop {
                     if let Err(err) = core._fetch_file(filter, &hash).await {
-                        error!("Fetch file error: {err} [attempt {not_found_errors}]");
+                        error!("Fetch file [{hash}] error: {err:?} [attempt {not_found_errors}]");
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        if ErrorKinds::BlobNotFound == err {
+                        if let Ok(ErrorKinds::BlobNotFound) = err.downcast() {
                             not_found_errors += 1;
                             if not_found_errors < 10 {
                                 continue
@@ -117,12 +117,12 @@ impl TrigramCache {
         return Ok(())
     }
 
-    async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<(), ErrorKinds> {
+    async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
         let _permit = self.permits.acquire().await?;
 
         // Gather the file content
-        let stream = self.files.stream(&hash.hex()).await?;
-        let trigrams = build_file(stream).await?;
+        let stream = self.files.stream(&hash.hex()).await.context("setup stream")?;
+        let trigrams = build_file(stream).await.context("reading stream")?;
 
         // Store the trigrams
         let cache_path = self._path(filter, hash);
@@ -811,7 +811,7 @@ mod test {
     }
 
     #[test]
-    fn file_format_switch() {        
+    fn file_format_switch() {
         let data = TrigramSet::random(10);
         let bytes = postcard::to_allocvec(&data).unwrap();
 

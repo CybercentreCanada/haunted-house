@@ -56,10 +56,10 @@ struct PendingInfo {
 }
 
 fn _search_stream(
-    client: Datastore, 
-    mut seek_point: DateTime<Utc>, 
-    poll_interval: Duration, 
-    batch_size: usize, 
+    client: Datastore,
+    mut seek_point: DateTime<Utc>,
+    poll_interval: Duration,
+    batch_size: usize,
     search_counter: Arc<parking_lot::Mutex<WindowCounter>>,
     last_fetch_rows: Arc<std::sync::atomic::AtomicI64>,
 ) -> mpsc::Receiver<FetchedFile> {
@@ -103,11 +103,11 @@ fn _search_stream(
 async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<FetchControlMessage>>>) -> Result<()> {
     let mut control = control.lock().await;
     info!("Fetch agent starting");
-    
+
     // connect to elasticsearch
     let config = core.config.datastore.clone();
     let client = core.database.clone();
-    
+
     //
     let mut running = tokio::task::JoinSet::<(FetchedFile, Result<bool>)>::new();
     let mut pending: BTreeMap<FetchedFile, PendingInfo> = Default::default();
@@ -158,7 +158,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
 
         // If there is free space get extra jobs
         while running.len() < config.concurrent_tasks {
-            
+
             let file = match file_stream.try_recv() {
                 Ok(file) => file,
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -230,7 +230,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                                 finished: entry.get().finished,
                                 retries: entry.get().retries,
                             });
-                        let mut pending = client.count_files(&format!("seen.last: {{{} TO *]", seek_point.to_rfc3339()), 1_000_000).await?;
+                        let mut pending = client.count_files(&format!("seen.last: {{{} TO now-10m]", seek_point.to_rfc3339()), 1_000_000).await?;
                         pending += running.len() as u64;
 
                         _ = respond.send(FetchStatus {

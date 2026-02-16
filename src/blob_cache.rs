@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use parking_lot::Mutex as BlockingMutex;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::storage::BlobStorage;
+use crate::storage::MultiStorage;
 
 #[derive(Clone)]
 pub struct BlobCache {
@@ -27,7 +27,7 @@ struct BlobCacheInner {
     _reserve_space: u64,
     storage_change: Arc<tokio::sync::Notify>,
     requesting_space: Arc<tokio::sync::Mutex<()>>,
-    storage: BlobStorage,
+    storage: MultiStorage,
     directory: PathBuf,
 }
 
@@ -68,7 +68,7 @@ struct LoadingHandle {
 }
 
 impl BlobCache {
-    pub fn new(storage: BlobStorage, capacity: u64, path: PathBuf) -> Result<Self> {
+    pub fn new(storage: MultiStorage, capacity: u64, path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&path).context(format!("Failed to create cache directory: {path:?}"))?;
         if count_dir(&path)? > 0 {
             error!("Cache directory is not empty on worker start!");
@@ -79,8 +79,8 @@ impl BlobCache {
         let capacity = capacity - reserve;
 
         Ok(Self {
-            data: Arc::new(BlockingMutex::new(BlobCacheInner { 
-                open_files: Default::default(), 
+            data: Arc::new(BlockingMutex::new(BlobCacheInner {
+                open_files: Default::default(),
                 loading_files: Default::default(),
                 errors: Default::default(),
                 total_space: capacity,
@@ -98,13 +98,13 @@ impl BlobCache {
     pub fn capacity(&self) -> (u64, u64) {
         let inner = self.data.lock();
         (inner.free_space, inner.total_space)
-    }   
-    
+    }
+
     #[cfg(test)]
     pub fn reserve(&self) -> u64 {
         let inner = self.data.lock();
         inner._reserve_space
-    }   
+    }
 
     pub async fn open(&self, label: String) -> Result<Arc<BlobHandle>> {
         loop {
@@ -143,7 +143,7 @@ impl BlobCache {
                 None => {
                     tokio::task::yield_now().await;
                     continue
-                }, 
+                },
                 // task hasn't been collected yet, wait for it to finish.
                 Some(task) => {
                     match task.await {
@@ -199,12 +199,12 @@ impl LoadingHandle {
     }
 
     async fn load_file(host: BlobCache, label: String) -> Result<Arc<BlobHandle>> {
-        // get some resources from the cache 
+        // get some resources from the cache
         let (storage, total_storage, storage_path) = {
             let inner = host.data.lock();
             (inner.storage.clone(), inner.total_space, inner.directory.clone())
         };
-        
+
         // figure out how much space we need
         let size = storage.size(&label).await?.ok_or_else(|| anyhow::anyhow!("File does not exist: {label}"))?;
         if size > total_storage {
@@ -213,7 +213,7 @@ impl LoadingHandle {
 
         // reserve space for the file
         let token = Self::reserve_space(&host, size).await;
-        
+
         // start downloading the file
         let file = NamedTempFile::new_in(storage_path).context("During file creation")?;
         storage.download(&label, file.path().to_path_buf()).await.context("During download")?;
@@ -256,7 +256,7 @@ impl LoadingHandle {
 
             // wait for a change in storage condition
             _ = tokio::time::timeout(Duration::from_secs(5), storage_notice.notified()).await;
-        }        
+        }
     }
 }
 
@@ -302,7 +302,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(&BlobStorageConfig::Directory {
+        let storage = connect(BlobStorageConfig::Directory {
             path: storage_dir.path().to_owned(),
         }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
@@ -341,7 +341,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024;
-        let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
+        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
 
         {
@@ -363,7 +363,7 @@ mod test {
         let storage_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_size = 1024 + 128;
-        let storage = connect(&BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
+        let storage = connect(BlobStorageConfig::Directory { path: storage_dir.path().to_owned() }).await.unwrap();
         let cache = BlobCache::new(storage.clone(), cache_size, cache_dir.path().to_owned()).unwrap();
         let cache_size = cache_size - cache.reserve();
 

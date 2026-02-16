@@ -50,18 +50,21 @@ impl Default for BlobStorageConfig {
     }
 }
 
-fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
-    if urls.len() != 1 {
-        return Err(ErrorKinds::FilestoreError("Only one filestore url expected.".to_string()).into())
+fn urls_to_other_config(urls: &[String]) -> Result<Vec<BlobStorageConfig>> {
+    let mut configs = vec![];
+    for url in urls {
+        configs.push(url_to_other_config(url)?);
     }
-    let url = urls[0].clone();
+    Ok(configs)
+}
 
+fn url_to_other_config(url: &str) -> Result<BlobStorageConfig> {
     let info = url::Url::parse(&url)?;
     match info.scheme() {
-        "temp" => { 
+        "temp" => {
             Ok(BlobStorageConfig::TempDir {  })
         },
-        "file" => { 
+        "file" => {
             Ok(BlobStorageConfig::Directory { path: info.path().into() })
         },
         "azure" => {
@@ -131,7 +134,7 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
                 None => None,
             };
 
-            Ok(BlobStorageConfig::S3(S3Config { 
+            Ok(BlobStorageConfig::S3(S3Config {
                 access_key_id,
                 secret_access_key,
                 endpoint_url: endpoint,
@@ -145,29 +148,98 @@ fn url_to_other_config(urls: &[String]) -> Result<BlobStorageConfig> {
 }
 
 /// Setup a blob storage
-pub async fn connect(config: &BlobStorageConfig) -> Result<BlobStorage> {
-    let url_config;
+pub async fn connect(config: BlobStorageConfig) -> Result<MultiStorage> {
     let config = if let BlobStorageConfig::URL(urls) = config {
-        url_config = url_to_other_config(urls)?;
-        &url_config
+        urls_to_other_config(&urls)?
     } else {
-        config
+        vec![config]
     };
 
-    match config {
-        BlobStorageConfig::TempDir { } => {
-            LocalDirectory::new_temp().context("Error setting up local blob store")
-        }
-        BlobStorageConfig::Directory { path } => {
-            Ok(BlobStorage::Local(LocalDirectory::new(path.clone())))
-        },
-        BlobStorageConfig::Azure(azure) =>
-            Ok(BlobStorage::Azure(AzureBlobStore::new(azure.clone()).await?)),
-        BlobStorageConfig::S3(config) =>
-            Ok(BlobStorage::S3(S3BlobStore::new(config.clone()).await?)),
-        BlobStorageConfig::URL(_) => panic!(),
+    let mut storage = vec![];
+    for config in config {
+        let conn = match config {
+            BlobStorageConfig::TempDir { } => {
+                LocalDirectory::new_temp().context("Error setting up local blob store")?
+            }
+            BlobStorageConfig::Directory { path } => {
+                BlobStorage::Local(LocalDirectory::new(path.clone()))
+            },
+            BlobStorageConfig::Azure(azure) => {
+                BlobStorage::Azure(AzureBlobStore::new(azure.clone()).await?)
+            },
+            BlobStorageConfig::S3(config) => {
+                BlobStorage::S3(S3BlobStore::new(config.clone()).await?)
+            },
+            BlobStorageConfig::URL(_) => panic!(),
+        };
+        storage.push(conn);
+    }
+
+    Ok(MultiStorage { backends: storage })
+}
+
+#[derive(Clone)]
+pub struct MultiStorage {
+    backends: Vec<BlobStorage>,
+}
+
+impl From<BlobStorage> for MultiStorage {
+    fn from(value: BlobStorage) -> Self {
+        Self{backends: vec![value]}
     }
 }
+
+impl MultiStorage {
+    /// Fetch the size of a blob
+    pub async fn size(&self, label: &str) -> Result<Option<u64>> {
+        for store in &self.backends {
+            if let Some(size) = store.size(label).await? {
+                return Ok(Some(size))
+            }
+        }
+        Ok(None)
+    }
+
+    /// Download the blob as a stream of chunks
+    pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>> {
+        for store in &self.backends {
+            if store.size(label).await?.is_some() {
+                return Ok(store.stream(label).await?)
+            }
+        }
+        Err(ErrorKinds::BlobNotFound.into())
+    }
+
+    /// Download the blob into a local file
+    pub async fn download(&self, label: &str, path: PathBuf) -> Result<()> {
+        for store in &self.backends {
+            if store.size(label).await?.is_some() {
+                return store.download(label, path.clone()).await
+            }
+        }
+        Err(ErrorKinds::BlobNotFound.into())
+    }
+
+    #[cfg(test)]
+    pub async fn put(&self, label: &str, data: Vec<u8>) -> Result<()> {
+        self.backends[0].put(label, data).await
+    }
+    #[cfg(test)]
+    pub async fn get(&self, label: &str) -> Result<Vec<u8>> {
+        self.backends[0].get(label).await
+    }
+
+    // Delete a blob from storage
+    // pub async fn delete(&self, label: &str) -> Result<()> {
+    //     match self {
+    //         BlobStorage::Local(obj) => obj.delete(label).await,
+    //         BlobStorage::Azure(obj) => obj.delete(label).await,
+    //         BlobStorage::S3(obj) => obj.delete(label).await,
+    //     }
+    // }
+}
+
+
 
 /// A unified type holding a blob store
 #[derive(Clone)]
@@ -189,6 +261,7 @@ impl BlobStorage {
             BlobStorage::S3(obj) => obj.size(label).await,
         }
     }
+
     /// Download the blob as a stream of chunks
     pub async fn stream(&self, label: &str) -> Result<mpsc::Receiver<Result<Vec<u8>, ErrorKinds>>, ErrorKinds> {
         match self {
@@ -625,7 +698,7 @@ impl rustls::client::ServerCertVerifier for NoCertificateVerification {
         _ocsp_response: &[u8],
         _now: std::time::SystemTime,
     ) -> std::prelude::v1::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())    
+        Ok(rustls::client::ServerCertVerified::assertion())
     }
 }
 
@@ -712,7 +785,7 @@ impl S3BlobStore {
                     .with_safe_defaults()
                     .with_root_certificates(root_store.clone())
                     .with_no_client_auth();
-                                    
+
                 tls_config
                     .dangerous()
                     .set_certificate_verifier(Arc::new(NoCertificateVerification{}));
@@ -735,7 +808,7 @@ impl S3BlobStore {
             // this is for a later version of rustls if the aws library actually updates
             // let https_connector = if config.no_tls_verify {
             //     let root_store = rustls::RootCertStore::empty();
-            //     let mut tls_config = rustls::ClientConfig::builder()    
+            //     let mut tls_config = rustls::ClientConfig::builder()
             //         .with_root_certificates(root_store.clone())
             //         .with_no_client_auth();
             //     tls_config
@@ -1101,46 +1174,46 @@ mod test {
 
     #[test]
     fn parse_azure_url() {
-        let config = url_to_other_config(&["azure://assemblylinefilestore.blob.core.windows.net/devfiles?access_key=PassW0rd".to_owned()]).unwrap();
-        assert_eq!(config, BlobStorageConfig::Azure(AzureBlobConfig { 
-            account: "assemblylinefilestore".to_owned(), 
-            access_key: "PassW0rd".to_owned(), 
-            container: "devfiles".to_owned(), 
-            use_emulator: false, 
+        let config = url_to_other_config("azure://assemblylinefilestore.blob.core.windows.net/devfiles?access_key=PassW0rd").unwrap();
+        assert_eq!(config, BlobStorageConfig::Azure(AzureBlobConfig {
+            account: "assemblylinefilestore".to_owned(),
+            access_key: "PassW0rd".to_owned(),
+            container: "devfiles".to_owned(),
+            use_emulator: false,
             use_default_credentials: false,
         }));
     }
 
     #[test]
     fn parse_s3_url() {
-        let config = url_to_other_config(&["s3://UNAMe:Passwrd@filestore:9000?s3_bucket=al-cache&use_ssl=False".to_owned()]).unwrap();
-        assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
-            access_key_id: Some("UNAMe".to_owned()), 
-            secret_access_key: Some("Passwrd".to_owned()), 
+        let config = url_to_other_config("s3://UNAMe:Passwrd@filestore:9000?s3_bucket=al-cache&use_ssl=False").unwrap();
+        assert_eq!(config, BlobStorageConfig::S3(S3Config{
+            access_key_id: Some("UNAMe".to_owned()),
+            secret_access_key: Some("Passwrd".to_owned()),
             endpoint_url: Some("http://filestore:9000".to_owned()),
-            region_name: "".to_string(), 
-            bucket: "al-cache".to_string(), 
-            no_tls_verify: true 
+            region_name: "".to_string(),
+            bucket: "al-cache".to_string(),
+            no_tls_verify: true
         }));
 
-        let config = url_to_other_config(&["s3://UNAMe:Passwrd@filestore.com:9000/carebear?s3_bucket=al-cache&use_ssl=False&aws_region=hats".to_owned()]).unwrap();
-        assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
-            access_key_id: Some("UNAMe".to_owned()), 
-            secret_access_key: Some("Passwrd".to_owned()), 
+        let config = url_to_other_config("s3://UNAMe:Passwrd@filestore.com:9000/carebear?s3_bucket=al-cache&use_ssl=False&aws_region=hats").unwrap();
+        assert_eq!(config, BlobStorageConfig::S3(S3Config{
+            access_key_id: Some("UNAMe".to_owned()),
+            secret_access_key: Some("Passwrd".to_owned()),
             endpoint_url: Some("http://filestore.com:9000/carebear".to_owned()),
-            region_name: "hats".to_string(), 
-            bucket: "al-cache".to_string(), 
-            no_tls_verify: true 
+            region_name: "hats".to_string(),
+            bucket: "al-cache".to_string(),
+            no_tls_verify: true
         }));
 
-        let config = url_to_other_config(&["s3://UNAMe:Passwrd@filestore.com:443/carebear?s3_bucket=al-cache&aws_region=hats".to_owned()]).unwrap();
-        assert_eq!(config, BlobStorageConfig::S3(S3Config{ 
-            access_key_id: Some("UNAMe".to_owned()), 
-            secret_access_key: Some("Passwrd".to_owned()), 
+        let config = url_to_other_config("s3://UNAMe:Passwrd@filestore.com:443/carebear?s3_bucket=al-cache&aws_region=hats").unwrap();
+        assert_eq!(config, BlobStorageConfig::S3(S3Config{
+            access_key_id: Some("UNAMe".to_owned()),
+            secret_access_key: Some("Passwrd".to_owned()),
             endpoint_url: Some("https://filestore.com/carebear".to_owned()),
-            region_name: "hats".to_string(), 
-            bucket: "al-cache".to_string(), 
-            no_tls_verify: false 
+            region_name: "hats".to_string(),
+            bucket: "al-cache".to_string(),
+            no_tls_verify: false
         }));
     }
 

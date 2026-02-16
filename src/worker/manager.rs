@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
 use crate::query::TrigramQuery;
-use crate::storage::BlobStorage;
+use crate::storage::MultiStorage;
 use crate::timing::ResourceTracker;
 use crate::types::{ExpiryGroup, FilterID, FileInfo};
 
@@ -24,7 +24,7 @@ pub struct WorkerState {
     pub database: Database,
     pub running: watch::Receiver<bool>,
     pub filters: RwLock<HashMap<FilterID, Arc<JournalFilter>>>,
-    pub file_storage: BlobStorage,
+    pub file_storage: MultiStorage,
     pub file_cache: BlobCache,
     pub trigrams: Arc<TrigramCache>,
     pub config: WorkerSettings,
@@ -36,7 +36,7 @@ pub struct WorkerState {
 
 impl WorkerState {
 
-    pub async fn new(database: Database, file_storage: BlobStorage, file_cache: BlobCache, config: WorkerSettings, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
+    pub async fn new(database: Database, file_storage: MultiStorage, file_cache: BlobCache, config: WorkerSettings, running: watch::Receiver<bool>) -> Result<Arc<Self>> {
 
         let trigrams = TrigramCache::new(&config, file_storage.clone()).await.context("setting up trigram cache")?;
 
@@ -96,7 +96,7 @@ impl WorkerState {
             for (_, worker) in filters.iter() {
                 let worker = worker.clone();
                 futures.push(tokio::spawn(async move {
-                    worker.stop().await; 
+                    worker.stop().await;
                 }));
             }
         }
@@ -285,12 +285,12 @@ impl WorkerState {
             }
         }
     }
-    
-    /// Get the number of fragments we are willing to accept as a function of 
+
+    /// Get the number of fragments we are willing to accept as a function of
     /// how long its been since this index was written to.
     /// This curve has 100 at 2 hours.
     /// as the time decreases the number of generations climbs to infinity, we don't want to defrag an active index
-    /// as the time increases the number of generations drops so that at a day of inactivity it will defrag 
+    /// as the time increases the number of generations drops so that at a day of inactivity it will defrag
     /// any with 4 or more generations, at around 4 days of inactivity defraging will be run for
     /// ANY fragmentation at all
     fn defrag_limit(since_last_write: std::time::Duration) -> u64 {

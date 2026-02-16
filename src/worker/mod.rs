@@ -29,7 +29,7 @@ pub struct YaraTask {
 pub async fn main(config: crate::config::WorkerSettings) -> Result<()> {
     // Setup the storage
     info!("Connect to file storage");
-    let file_storage = crate::storage::connect(&config.files).await?;
+    let file_storage = crate::storage::connect(config.files.clone()).await?;
 
     // Get cache
     info!("Setup caches");
@@ -96,7 +96,7 @@ pub async fn main(config: crate::config::WorkerSettings) -> Result<()> {
 
     info!("Waiting for data flush...");
     data.stop().await;
-    
+
     return Ok(())
 }
 
