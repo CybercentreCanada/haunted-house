@@ -398,6 +398,8 @@ pub struct WorkerSettings {
     /// Free space threshold below which the garbage collector proactively
     /// evicts the oldest filters. Set this higher than data_reserve so that
     /// cleanup happens before the worker starts rejecting work.
+    /// Set to 0 to disable eviction entirely — the worker will fill up and
+    /// stop accepting new items until filters expire naturally.
     #[serde(default="default_eviction_threshold", deserialize_with="deserialize_size", serialize_with="serialize_size")]
     pub eviction_threshold: u64,
     /// Default size for initial data segments in the filter files

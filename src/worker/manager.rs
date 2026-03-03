@@ -129,12 +129,15 @@ impl WorkerState {
                 self.delete_index(filter).await?;
             }
 
-            // Proactive eviction: free space is below eviction_threshold but the
-            // worker is still accepting work. Clean up oldest filters now to avoid
-            // hitting the hard data_reserve limit later.
-            // Emergency eviction: free space is below data_reserve, the broker has
-            // already stopped sending files. Delete as fast as possible.
-            if self.check_eviction_needed().await? {
+            // Eviction of non-expired filters to reclaim space.
+            // Disabled when eviction_threshold is 0 — the worker will fill up
+            // and stop accepting work (original behaviour).
+            // Proactive: free space below eviction_threshold, worker still accepting
+            //   work. Clean up oldest filters at the regular midnight pass.
+            // Emergency: free space below data_reserve, broker has stopped sending.
+            //   Recheck every 60s until pressure clears.
+            let eviction_enabled = self.config.eviction_threshold > 0;
+            if eviction_enabled && self.check_eviction_needed().await? {
                 let under_pressure = self.check_storage_pressure().await?;
                 if under_pressure {
                     warn!("Emergency eviction: free space below data_reserve, evicting oldest filters");
@@ -157,9 +160,9 @@ impl WorkerState {
                 }
             }
 
-            // Emergency: still under hard pressure after eviction, recheck in 60s.
-            // Otherwise sleep until midnight for the next regular GC pass.
-            let sleep_duration = if self.check_storage_pressure().await? {
+            // When eviction is enabled and the worker is still under hard pressure,
+            // recheck in 60s. Otherwise sleep until midnight for the next GC pass.
+            let sleep_duration = if eviction_enabled && self.check_storage_pressure().await? {
                 warn!("Storage pressure persists after eviction pass");
                 std::time::Duration::from_secs(60)
             } else {
