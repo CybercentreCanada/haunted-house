@@ -129,25 +129,36 @@ impl WorkerState {
                 self.delete_index(filter).await?;
             }
 
-            // If still under storage pressure, evict oldest non-expired filters
-            if self.check_storage_pressure().await? {
-                warn!("Storage pressure detected after expiry cleanup, evicting oldest filters");
+            // Proactive eviction: free space is below eviction_threshold but the
+            // worker is still accepting work. Clean up oldest filters now to avoid
+            // hitting the hard data_reserve limit later.
+            // Emergency eviction: free space is below data_reserve, the broker has
+            // already stopped sending files. Delete as fast as possible.
+            if self.check_eviction_needed().await? {
+                let under_pressure = self.check_storage_pressure().await?;
+                if under_pressure {
+                    warn!("Emergency eviction: free space below data_reserve, evicting oldest filters");
+                } else {
+                    info!("Proactive eviction: free space below eviction_threshold, cleaning oldest filters");
+                }
+
                 let mut filters = self.database.get_expiry(
                     &ExpiryGroup::today(), &ExpiryGroup::max()
                 ).await?;
                 filters.sort_by_key(|(_, expiry)| *expiry);
 
                 for (id, expiry) in filters {
-                    if !self.check_storage_pressure().await? {
-                        info!("Storage pressure relieved after eviction");
+                    if !self.check_eviction_needed().await? {
+                        info!("Eviction complete, free space above eviction_threshold");
                         break;
                     }
-                    warn!("Evicting filter {id} (expiry group: {}) due to storage pressure", expiry.as_u32());
+                    warn!("Evicting filter {id} (expiry group: {})", expiry.as_u32());
                     self.delete_index(id).await?;
                 }
             }
 
-            // Under pressure: check again in 60s. Otherwise sleep until midnight.
+            // Emergency: still under hard pressure after eviction, recheck in 60s.
+            // Otherwise sleep until midnight for the next regular GC pass.
             let sleep_duration = if self.check_storage_pressure().await? {
                 warn!("Storage pressure persists after eviction pass");
                 std::time::Duration::from_secs(60)
@@ -194,6 +205,10 @@ impl WorkerState {
 
     pub async fn check_storage_pressure(&self) -> Result<bool> {
         return Ok(self.get_free_storage().await? < self.config.data_reserve)
+    }
+
+    pub async fn check_eviction_needed(&self) -> Result<bool> {
+        return Ok(self.get_free_storage().await? < self.config.eviction_threshold)
     }
 
     pub async fn get_used_storage(&self) -> Result<u64> {
