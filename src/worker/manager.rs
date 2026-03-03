@@ -2,7 +2,7 @@ use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use chrono::DurationRound;
-use log::{debug, info, error};
+use log::{debug, info, warn, error};
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
@@ -124,15 +124,38 @@ impl WorkerState {
     async fn _garbage_collector(&self) -> Result<()> {
         let day: chrono::Duration = chrono::Duration::days(1);
         loop {
-            // get all filters
+            // Delete filters that have passed their expiry date
             for filter in self.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::yesterday()).await? {
                 self.delete_index(filter).await?;
             }
 
-            // wait for next run
-            let tomorrow = chrono::Utc::now().duration_trunc(day)? + day;
-            let delay = tomorrow - chrono::Utc::now();
-            tokio::time::sleep(delay.to_std()?).await;
+            // If still under storage pressure, evict oldest non-expired filters
+            if self.check_storage_pressure().await? {
+                warn!("Storage pressure detected after expiry cleanup, evicting oldest filters");
+                let mut filters = self.database.get_expiry(
+                    &ExpiryGroup::today(), &ExpiryGroup::max()
+                ).await?;
+                filters.sort_by_key(|(_, expiry)| *expiry);
+
+                for (id, expiry) in filters {
+                    if !self.check_storage_pressure().await? {
+                        info!("Storage pressure relieved after eviction");
+                        break;
+                    }
+                    warn!("Evicting filter {id} (expiry group: {}) due to storage pressure", expiry.as_u32());
+                    self.delete_index(id).await?;
+                }
+            }
+
+            // Under pressure: check again in 60s. Otherwise sleep until midnight.
+            let sleep_duration = if self.check_storage_pressure().await? {
+                warn!("Storage pressure persists after eviction pass");
+                std::time::Duration::from_secs(60)
+            } else {
+                let tomorrow = chrono::Utc::now().duration_trunc(day)? + day;
+                (tomorrow - chrono::Utc::now()).to_std()?
+            };
+            tokio::time::sleep(sleep_duration).await;
         }
     }
 
