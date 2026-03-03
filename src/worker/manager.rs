@@ -2,7 +2,7 @@ use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use chrono::DurationRound;
-use log::{debug, info, error};
+use log::{debug, info, warn, error};
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
@@ -124,15 +124,52 @@ impl WorkerState {
     async fn _garbage_collector(&self) -> Result<()> {
         let day: chrono::Duration = chrono::Duration::days(1);
         loop {
-            // get all filters
+            // Delete filters that have passed their expiry date
             for filter in self.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::yesterday()).await? {
                 self.delete_index(filter).await?;
             }
 
-            // wait for next run
-            let tomorrow = chrono::Utc::now().duration_trunc(day)? + day;
-            let delay = tomorrow - chrono::Utc::now();
-            tokio::time::sleep(delay.to_std()?).await;
+            // Eviction of non-expired filters to reclaim space.
+            // Disabled when eviction_threshold is 0 — the worker will fill up
+            // and stop accepting work (original behaviour).
+            // Proactive: free space below eviction_threshold, worker still accepting
+            //   work. Clean up oldest filters at the regular midnight pass.
+            // Emergency: free space below data_reserve, broker has stopped sending.
+            //   Recheck every 60s until pressure clears.
+            let eviction_enabled = self.config.eviction_threshold > 0;
+            if eviction_enabled && self.check_eviction_needed().await? {
+                let under_pressure = self.check_storage_pressure().await?;
+                if under_pressure {
+                    warn!("Emergency eviction: free space below data_reserve, evicting oldest filters");
+                } else {
+                    info!("Proactive eviction: free space below eviction_threshold, cleaning oldest filters");
+                }
+
+                let mut filters = self.database.get_expiry(
+                    &ExpiryGroup::today(), &ExpiryGroup::max()
+                ).await?;
+                filters.sort_by_key(|(_, expiry)| *expiry);
+
+                for (id, expiry) in filters {
+                    if !self.check_eviction_needed().await? {
+                        info!("Eviction complete, free space above eviction_threshold");
+                        break;
+                    }
+                    warn!("Evicting filter {id} (expiry group: {})", expiry.as_u32());
+                    self.delete_index(id).await?;
+                }
+            }
+
+            // When eviction is enabled and the worker is still under hard pressure,
+            // recheck in 60s. Otherwise sleep until midnight for the next GC pass.
+            let sleep_duration = if eviction_enabled && self.check_storage_pressure().await? {
+                warn!("Storage pressure persists after eviction pass");
+                std::time::Duration::from_secs(60)
+            } else {
+                let tomorrow = chrono::Utc::now().duration_trunc(day)? + day;
+                (tomorrow - chrono::Utc::now()).to_std()?
+            };
+            tokio::time::sleep(sleep_duration).await;
         }
     }
 
@@ -171,6 +208,10 @@ impl WorkerState {
 
     pub async fn check_storage_pressure(&self) -> Result<bool> {
         return Ok(self.get_free_storage().await? < self.config.data_reserve)
+    }
+
+    pub async fn check_eviction_needed(&self) -> Result<bool> {
+        return Ok(self.get_free_storage().await? < self.config.eviction_threshold)
     }
 
     pub async fn get_used_storage(&self) -> Result<u64> {

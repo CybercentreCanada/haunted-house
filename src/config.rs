@@ -360,6 +360,10 @@ fn default_data_path() -> PathBuf { PathBuf::from("/data/") }
 fn default_data_limit() -> u64 { 1 << 40 }
 /// Number of bytes that will be reserved from the soft cap for transient purposes.
 fn default_data_reserve() -> u64 { 100 << 30 }
+/// Free space threshold below which the garbage collector will proactively
+/// evict the oldest filters. Should be larger than data_reserve so that
+/// orderly cleanup happens before the worker starts rejecting ingest requests.
+fn default_eviction_threshold() -> u64 { 200 << 30 }
 /// The default size for the initial segments of the filter files
 fn default_initial_segment_size() -> u32 { 128 }
 /// The default size for extended segments for the filter files
@@ -387,8 +391,17 @@ pub struct WorkerSettings {
     /// The worker should stop accepting new items when the size gets near this.
     #[serde(deserialize_with="deserialize_size", serialize_with="serialize_size")]
     pub data_limit: u64,
-    /// How much space (bytes) should be reserved for transient storage
+    /// How much space (bytes) should be reserved for transient storage.
+    /// When free space drops below this the worker signals storage pressure
+    /// and the broker stops sending new files.
     pub data_reserve: u64,
+    /// Free space threshold below which the garbage collector proactively
+    /// evicts the oldest filters. Set this higher than data_reserve so that
+    /// cleanup happens before the worker starts rejecting work.
+    /// Set to 0 to disable eviction entirely — the worker will fill up and
+    /// stop accepting new items until filters expire naturally.
+    #[serde(default="default_eviction_threshold", deserialize_with="deserialize_size", serialize_with="serialize_size")]
+    pub eviction_threshold: u64,
     /// Default size for initial data segments in the filter files
     pub initial_segment_size: u32,
     /// Default size for extended segments in the filter files
@@ -413,6 +426,7 @@ impl Default for WorkerSettings {
             data_limit: default_data_limit(),
             classification: Default::default(),
             data_reserve: default_data_reserve(),
+            eviction_threshold: default_eviction_threshold(),
             initial_segment_size: default_initial_segment_size(),
             extended_segment_size: default_extended_segment_size(),
             ingest_batch_size: default_ingest_batch_size(),
